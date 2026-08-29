@@ -1,73 +1,43 @@
-# React + TypeScript + Vite
+# Bambuddy Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The Bambuddy frontend is a React + TypeScript + Vite single-page administration UI. It is built into the repository-level `static/` directory and served by the FastAPI application; it is not deployed as an independent frontend service.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+From the repository root:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```powershell
+npm --prefix .\frontend ci
+npm --prefix .\frontend run lint
+npm --prefix .\frontend run test:run
+npm --prefix .\frontend run build
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+For local API-backed development, start the backend from the repository root:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```powershell
+$env:DATA_DIR = "$PWD\data"
+.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+npm --prefix .\frontend run dev
 ```
+
+## BCA surfaces
+
+The embedded Bambuddy Create Agent UI lives in these pages:
+
+| Route | Component | Purpose |
+|---|---|---|
+| `/creator` | `pages/CreatorPage.tsx` | Agent conversation, concept-image selection, workflow canvas, artifact download, calibration, and task handoff. |
+| `/tasks` | `pages/TaskListPage.tsx` | BCA model tasks, sliced-file attachment, printer selection, and native queue handoff. |
+| `/creator/settings` | `pages/CreatorSettingsPage.tsx` | Non-secret Creator Service settings and provider configured state. |
+
+Creator image previews use an authenticated Blob fetch rather than a raw `<img>` source, so they work when Bambuddy authentication is enabled. Do not replace them with unauthenticated provider or artifact URLs.
+
+## Design and contracts
+
+- Keep BCA navigation integrated in `components/Layout.tsx`; do not create a second shell.
+- Keep artifact downloads behind controlled BCA routes.
+- BCA task files remain model 3MFs until root uploads a validated sliced `.gcode.3mf`.
+- Keep API types and frontend state in sync with `backend/app/services/creator_integration.py` and the `creator.py` / `bca_tasks.py` routes.
+
+See the bilingual developer [README](../README.md) / [English README](../README.en.md), [architecture](../BCA_ARCHITECTURE.md), and [engineering guide](../AGENTS.md) for the workflow and non-negotiable gates.

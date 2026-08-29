@@ -90,16 +90,13 @@ docker compose pull && docker compose up -d
 
 ## Daily Beta Builds
 
-Beta builds with the latest fixes are pushed regularly to the same beta version tag:
+Published image tags follow the current application version. Check the release registry before pulling a specific tag:
 
 ```bash
-# Pull the current beta
-docker pull maziggy/bambuddy:0.2.2b1
+docker pull maziggy/bambuddy:1.2.5.3
 ```
 
-Use [Watchtower](https://watchtower.nickfedor.com) (image `nickfedor/watchtower`) to automatically update when new daily builds are pushed.
-
-> **Note:** Beta builds use version tags like `0.2.2b1` — they are never tagged as `latest`. Your stable installation won't auto-update to a beta unless you explicitly pull a beta tag.
+Use [Watchtower](https://watchtower.nickfedor.com) (image `nickfedor/watchtower`) only when your deployment policy allows unattended image updates. Do not rely on the historic `0.2.2b1` beta tag.
 
 ## Supported Printers
 

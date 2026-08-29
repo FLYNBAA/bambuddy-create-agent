@@ -16,6 +16,7 @@ Creator session
   → Bambuddy LibraryFile
   → Bambuddy PrintQueueItem
   → FTPS + MQTT project_file
+```
 
 The creator output is never queued directly. A printable file must contain both `Metadata/plate_N.gcode` and `Metadata/slice_info.config`; BCA validates these before accepting the root-supplied sliced file.
 

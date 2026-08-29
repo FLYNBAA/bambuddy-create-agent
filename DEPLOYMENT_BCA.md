@@ -65,7 +65,9 @@ DATA_DIR/bca-tasks/  calibration artifacts awaiting a sliced file
 DATA_DIR/archive/    Bambuddy archives and Library files
 ```
 
-Back up `DATA_DIR` together with external secret-manager configuration. Never rely on provider signed URLs as artifacts: BCA persists validated files before exposing them.
+Back up `DATA_DIR`, the deployment secret configuration, **and the native Bambuddy database** as one recovery point. For SQLite, include the database file and any required WAL sidecars consistently. For PostgreSQL, take a complete PostgreSQL dump of the configured `DATABASE_URL` database.
+
+`bca_tasks` and persisted `bca_creator_*` service settings live in the native Bambuddy database, including when `DATABASE_URL` points to external PostgreSQL. Restoring only `DATA_DIR` loses task rows and configuration; restoring only the database loses creator artifacts. Restore the matching database snapshot and `DATA_DIR` together. Provider signed URLs are never backup artifacts: BCA persists validated files before exposing them.
 
 ## Queue contract
 
@@ -109,7 +111,7 @@ After a human explicitly approves only the billed GPT Image request and the runn
 
 The runner deliberately stops after the four-image paid request is accepted. It does not submit Hunyuan or Meshy work, so it cannot accidentally spend 3D or multi-color credits.
 
-For a separately approved image and Hunyuan chain, use the full runner:
+For a separately approved full chain, use the full runner. It performs image and Hunyuan stages, then also submits Meshy multi-color work only when analysis is `healthy`:
 
 ```powershell
 .\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
@@ -133,7 +135,6 @@ If a non-healthy report stops a full run, do not repeat GPT Image or Hunyuan. Af
 
 ## References
 
-- Bilingual operator overview: [`README_BCA.md`](README_BCA.md)
-- Engineering contract: [`AGENTS.md`](AGENTS.md)
+- Bilingual developer README: [`README.md`](README.md) / [`README.en.md`](README.en.md)
 - Architecture: [`BCA_ARCHITECTURE.md`](BCA_ARCHITECTURE.md)
 - Non-secret variable template: [`.env.bca.example`](.env.bca.example)
