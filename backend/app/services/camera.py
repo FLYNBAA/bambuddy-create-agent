@@ -1,0 +1,988 @@
+"""Camera capture service for Bambu Lab printers.
+
+Supports two camera protocols:
+- RTSP: Used by X1, X1C, X1E, X2D, H2C, H2D, H2DPRO, H2S, P2S (port 322)
+- Chamber Image: Used by A1, A1MINI, P1P, P1S (port 6000, custom binary protocol)
+"""
+
+import asyncio
+import functools
+import logging
+import os
+import shutil
+import ssl
+import struct
+import subprocess
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from backend.app.core.logging_filters import redact_url_credentials
+
+logger = logging.getLogger(__name__)
+
+# JPEG markers
+JPEG_START = b"\xff\xd8"
+JPEG_END = b"\xff\xd9"
+
+# Cache the ffmpeg path after first lookup
+_ffmpeg_path: str | None = None
+
+# Cached result of rtsp_socket_timeout_flag(); see that function for context.
+_rtsp_socket_timeout_flag: str | None = None
+
+# Track PIDs of ffmpeg processes spawned for one-shot frame capture (snapshot).
+# The cleanup task in routes/camera.py checks this set to avoid killing active captures.
+_active_capture_pids: set[int] = set()
+
+# In-flight one-shot captures, keyed by printer IP (#2705).
+#
+# Bambu firmware allows exactly one camera connection, and the existing guards
+# (is_stream_active / try_get_active_buffered_frame, #1271 + #1348) only stop a
+# capturer from competing with the fan-out BROADCASTER. They do nothing for
+# capturer-vs-capturer with no viewer attached, where every consumer correctly
+# concludes it isn't competing with a viewer and then collides with the others.
+# Eight paths reach capture_camera_frame_bytes() independently — Obico polling,
+# /camera/snapshot, the finish-photo moment and its disk-writing sibling, plate
+# detection, the camera test and the diagnose tool — so the single-flight lives
+# at the bottom of the stack and needs no call-site changes.
+#
+# Keyed by IP rather than printer_id because IP is what the firmware's one-
+# connection limit applies to: two printer rows pointing at the same address
+# still share one camera. (This function never sees a printer_id anyway.) The
+# key deliberately excludes the timeout, or callers that disagree about it —
+# and they all do, from 10s to 30s — would never coalesce, which is exactly
+# the Obico-vs-snapshot pair from the report.
+_inflight_captures: dict[str, asyncio.Task[bytes | None]] = {}
+
+
+def get_ffmpeg_path() -> str | None:
+    """Find the ffmpeg executable path.
+
+    Uses shutil.which first, then checks common installation locations
+    for systems where PATH may be limited (e.g., systemd services).
+    """
+    global _ffmpeg_path
+
+    if _ffmpeg_path is not None:
+        return _ffmpeg_path
+
+    # Try PATH first
+    ffmpeg_path = shutil.which("ffmpeg")
+
+    # If not found via PATH, check common installation locations
+    if ffmpeg_path is None:
+        common_paths = [
+            "/usr/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/opt/homebrew/bin/ffmpeg",  # macOS Homebrew
+            "/snap/bin/ffmpeg",  # Ubuntu Snap
+            "C:\\ffmpeg\\bin\\ffmpeg.exe",  # Windows common
+        ]
+        for path in common_paths:
+            if Path(path).exists():
+                ffmpeg_path = path
+                break
+
+    _ffmpeg_path = ffmpeg_path
+    if ffmpeg_path:
+        logger.info("Found ffmpeg at: %s", ffmpeg_path)
+    else:
+        logger.warning("ffmpeg not found in PATH or common locations")
+
+    return ffmpeg_path
+
+
+def rtsp_socket_timeout_flag() -> str:
+    """Return the ffmpeg argv flag (without the leading dash) that sets the
+    RTSP demuxer's client-side TCP socket I/O timeout, in microseconds.
+
+    ffmpeg has shipped three different option arrangements for this over
+    time, and Bambuddy supports the full range:
+
+    - **Modern ffmpeg (5.x / 6.x / 7.x)** — Debian 13, Ubuntu 24.04, current
+      Homebrew, etc. ``-timeout`` is the socket I/O timeout (microseconds);
+      ``-stimeout`` was REMOVED.
+    - **Transitional ffmpeg (~late-4.x, some 5.x builds)** — Ubuntu 22.04's
+      shipped version is one of these. ``-timeout`` was deprecated and
+      *repurposed* to mean the RTSP listen-mode incoming-connection
+      timeout — and any non-zero value implies ``-listen``, which makes
+      ffmpeg bind the localhost proxy port and fail with EADDRINUSE
+      (#1504). ``-stimeout`` was the replacement socket I/O timeout in
+      that window.
+    - **Old ffmpeg (early 4.x and earlier)** — ``-timeout`` is socket I/O
+      timeout (the original meaning, before the deprecation churn).
+
+    We probe ``-h demuxer=rtsp`` once and cache: if ``-stimeout`` is
+    advertised, prefer it (covers the transitional window and stays
+    correct on the older builds that still accept it as an alias); else
+    fall back to ``-timeout`` (correct on modern and pre-deprecation
+    ffmpeg). The result is cached for the process lifetime — ffmpeg
+    isn't going to swap mid-run.
+
+    Returns the option name without the leading dash, e.g. ``"timeout"``
+    or ``"stimeout"``. Callers must prepend ``-`` themselves so a string
+    formatting bug can't pass an empty flag.
+    """
+    global _rtsp_socket_timeout_flag
+
+    if _rtsp_socket_timeout_flag is not None:
+        return _rtsp_socket_timeout_flag
+
+    ffmpeg = get_ffmpeg_path()
+    chosen = "timeout"  # safe default for modern ffmpeg
+    if ffmpeg:
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-h", "demuxer=rtsp"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            help_text = (result.stdout or "") + (result.stderr or "")
+            # Help lines list each option as `-<name> ` (trailing space) — match
+            # that exact form so we don't accidentally hit a substring elsewhere.
+            if "-stimeout " in help_text:
+                chosen = "stimeout"
+        except (OSError, subprocess.SubprocessError) as exc:
+            # If probing fails, keep the modern-ffmpeg default. Worst case
+            # is the EADDRINUSE regression returns for transitional-ffmpeg
+            # users — same as before this function existed.
+            logger.warning("Could not probe ffmpeg RTSP timeout flag, defaulting to -timeout: %s", exc)
+
+    _rtsp_socket_timeout_flag = chosen
+    logger.info("RTSP socket I/O timeout flag: -%s", chosen)
+    return chosen
+
+
+def supports_rtsp(model: str | None) -> bool:
+    """Check if printer model supports RTSP camera streaming.
+
+    RTSP supported: X1, X1C, X1E, X2D, H2C, H2D, H2DPRO, H2S, P2S
+    Chamber image only: A1, A1MINI, P1P, P1S
+
+    Note: Model can be either display name (e.g., "P2S") or internal code (e.g., "N7").
+    Internal codes from MQTT/SSDP:
+      - BL-P001: X1/X1C
+      - C13: X1E
+      - N6: X2D
+      - O1D: H2D
+      - O1C, O1C2: H2C
+      - O1S: H2S
+      - O1E, O2D: H2D Pro
+      - N7: P2S
+    """
+    if model:
+        model_upper = model.upper()
+        # Display names: X1, X1C, X1E, X2D, H2C, H2D, H2DPRO, H2S, P2S
+        if model_upper.startswith(("X1", "X2", "H2", "P2")):
+            return True
+        # Internal codes for RTSP models
+        if model_upper in ("BL-P001", "C13", "N6", "O1D", "O1C", "O1C2", "O1S", "O1E", "O2D", "N7"):
+            return True
+    # A1/P1 and unknown models use chamber image protocol
+    return False
+
+
+def get_camera_port(model: str | None) -> int:
+    """Get the camera port based on printer model.
+
+    X1/X2/H2/P2 series use RTSP on port 322.
+    A1/P1 series use chamber image protocol on port 6000.
+    """
+    if supports_rtsp(model):
+        return 322
+    return 6000
+
+
+def rewrite_rtsp_request_url(data: bytes, proxy_url: bytes, real_url: bytes) -> bytes:
+    """Rewrite RTSP request-line URLs, leaving other lines (e.g. Authorization) intact.
+
+    RTSP request lines have the form ``METHOD <url> RTSP/1.0\\r\\n``.
+    Only those lines are modified so that Digest auth headers (which embed
+    the original URL and a cryptographic hash) are not broken.
+    """
+    rtsp_marker = b" RTSP/1.0"
+    if rtsp_marker not in data:
+        return data
+    lines = data.split(b"\r\n")
+    for i, line in enumerate(lines):
+        if line.endswith(rtsp_marker):
+            lines[i] = line.replace(proxy_url, real_url)
+            break
+    return b"\r\n".join(lines)
+
+
+async def create_tls_proxy(target_host: str, target_port: int) -> tuple[int, "asyncio.Server"]:
+    """Create a local TCP→TLS proxy for RTSP streams.
+
+    Bambu printers use RTSPS (RTSP over TLS) with self-signed certificates.
+    The Debian ffmpeg package uses GnuTLS, whose hardened defaults reject
+    certain TLS behaviors (renegotiation, legacy ciphers) that some printer
+    firmwares (notably P2S) rely on.  This causes streams to drop after a
+    few seconds.
+
+    This proxy terminates TLS using Python's ssl module (OpenSSL), which is
+    more permissive, and exposes a plain TCP port that ffmpeg connects to
+    with ``rtsp://`` instead of ``rtsps://``.
+
+    RTSP embeds URLs in protocol messages (DESCRIBE, SETUP, PLAY).  The proxy
+    rewrites ``127.0.0.1:<proxy_port>`` → ``<target_host>:<target_port>`` in
+    client→server data so the printer recognises the stream path.
+
+    Returns ``(local_port, server)``.  Caller must close the server when done.
+    """
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    # Filled in after the server socket is created (handler only runs after).
+    _local_port: list[int] = [0]
+
+    async def _handle(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
+        tls_writer = None
+        try:
+            tls_reader, tls_writer = await asyncio.wait_for(
+                asyncio.open_connection(target_host, target_port, ssl=ssl_ctx),
+                timeout=10.0,
+            )
+
+            # URL patterns for RTSP request-line rewriting.
+            proxy_url = f"rtsp://127.0.0.1:{_local_port[0]}".encode()
+            real_url = f"rtsps://{target_host}:{target_port}".encode()
+
+            # Note on the broad except below: dst.write() raises RuntimeError
+            # under uvloop when the underlying handle has already been torn
+            # down (uvloop.loop.UVHandle._ensure_alive). asyncio's default
+            # selector loop reports the same situation as ConnectionResetError
+            # / OSError, so a tuple that doesn't include RuntimeError leaks the
+            # uvloop variant up to asyncio's unhandled-exception logger
+            # ("Unhandled exception in client_connected_cb"). The forwarders
+            # are intentionally fire-and-forget on tear-down — once either
+            # peer drops, both halves of the proxy should exit quietly.
+
+            async def _fwd_to_server(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
+                """Forward client→server, rewriting RTSP request-line URLs only."""
+                try:
+                    while True:
+                        data = await src.read(65536)
+                        if not data:
+                            break
+                        data = rewrite_rtsp_request_url(data, proxy_url, real_url)
+                        dst.write(data)
+                        await dst.drain()
+                except (ConnectionError, OSError, asyncio.CancelledError, RuntimeError):
+                    pass
+                finally:
+                    if not dst.is_closing():
+                        try:
+                            dst.close()
+                        except OSError:
+                            pass
+
+            async def _fwd_to_client(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
+                """Forward server→client unchanged."""
+                try:
+                    while True:
+                        data = await src.read(65536)
+                        if not data:
+                            break
+                        dst.write(data)
+                        await dst.drain()
+                except (ConnectionError, OSError, asyncio.CancelledError, RuntimeError):
+                    pass
+                finally:
+                    if not dst.is_closing():
+                        try:
+                            dst.close()
+                        except OSError:
+                            pass
+
+            await asyncio.gather(
+                _fwd_to_server(client_reader, tls_writer),
+                _fwd_to_client(tls_reader, client_writer),
+            )
+        except (ConnectionError, OSError, TimeoutError) as e:
+            logger.debug("TLS proxy connection to %s:%s failed: %s", target_host, target_port, e)
+        finally:
+            for w in (client_writer, tls_writer):
+                if w and not w.is_closing():
+                    try:
+                        w.close()
+                    except OSError:
+                        pass
+
+    server = await asyncio.start_server(_handle, "127.0.0.1", 0)
+    _local_port[0] = server.sockets[0].getsockname()[1]
+    logger.debug("TLS proxy for %s:%s listening on 127.0.0.1:%s", target_host, target_port, _local_port[0])
+    return _local_port[0], server
+
+
+def is_chamber_image_model(model: str | None) -> bool:
+    """Check if printer uses chamber image protocol instead of RTSP.
+
+    A1, A1MINI, P1P, P1S use the chamber image protocol on port 6000.
+    """
+    return not supports_rtsp(model)
+
+
+def build_camera_url(ip_address: str, access_code: str, model: str | None) -> str:
+    """Build the RTSPS URL for the printer camera (RTSP models only)."""
+    port = get_camera_port(model)
+    return f"rtsps://bblp:{access_code}@{ip_address}:{port}/streaming/live/1"
+
+
+def _create_chamber_auth_payload(access_code: str) -> bytes:
+    """Create the 80-byte authentication payload for chamber image protocol.
+
+    Format:
+    - Bytes 0-3: 0x40 0x00 0x00 0x00 (magic)
+    - Bytes 4-7: 0x00 0x30 0x00 0x00 (command)
+    - Bytes 8-15: zeros (padding)
+    - Bytes 16-47: username "bblp" (32 bytes, null-padded)
+    - Bytes 48-79: access code (32 bytes, null-padded)
+    """
+    username = b"bblp"
+    access_code_bytes = access_code.encode("utf-8")
+
+    # Build the 80-byte payload
+    payload = struct.pack(
+        "<II8s32s32s",
+        0x40,  # Magic header
+        0x3000,  # Command
+        b"\x00" * 8,  # Padding
+        username.ljust(32, b"\x00"),  # Username padded to 32 bytes
+        access_code_bytes.ljust(32, b"\x00"),  # Access code padded to 32 bytes
+    )
+    return payload
+
+
+def _create_ssl_context() -> ssl.SSLContext:
+    """Create an SSL context for chamber image connection.
+
+    Bambu printers use self-signed certificates, so we disable verification.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+async def read_chamber_image_frame(
+    ip_address: str,
+    access_code: str,
+    timeout: float = 10.0,
+) -> bytes | None:
+    """Read a single JPEG frame from the chamber image protocol.
+
+    This is used by A1/P1 printers which don't support RTSP.
+
+    Args:
+        ip_address: Printer IP address
+        access_code: Printer access code
+        timeout: Connection timeout in seconds
+
+    Returns:
+        JPEG image data or None if failed
+    """
+    port = 6000
+    ssl_context = _create_ssl_context()
+
+    try:
+        # Connect with SSL
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip_address, port, ssl=ssl_context),
+            timeout=timeout,
+        )
+
+        try:
+            # Send authentication payload
+            auth_payload = _create_chamber_auth_payload(access_code)
+            writer.write(auth_payload)
+            await writer.drain()
+
+            # Read the 16-byte header
+            header = await asyncio.wait_for(reader.readexactly(16), timeout=timeout)
+            if len(header) < 16:
+                logger.error("Chamber image: incomplete header received")
+                return None
+
+            # Parse payload size from header (little-endian uint32 at offset 0)
+            payload_size = struct.unpack("<I", header[0:4])[0]
+
+            if payload_size == 0 or payload_size > 10_000_000:  # Sanity check: max 10MB
+                logger.error("Chamber image: invalid payload size %s", payload_size)
+                return None
+
+            # Read the JPEG data
+            jpeg_data = await asyncio.wait_for(
+                reader.readexactly(payload_size),
+                timeout=timeout,
+            )
+
+            # Validate JPEG markers
+            if not jpeg_data.startswith(JPEG_START):
+                logger.error("Chamber image: data is not a valid JPEG (missing start marker)")
+                return None
+
+            if not jpeg_data.endswith(JPEG_END):
+                logger.warning("Chamber image: JPEG missing end marker, may be truncated")
+
+            logger.debug("Chamber image: received %s bytes", len(jpeg_data))
+            return jpeg_data
+
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass  # Socket already closed; cleanup is best-effort
+
+    except TimeoutError:
+        logger.error("Chamber image: connection timeout to %s:%s", ip_address, port)
+        return None
+    except ConnectionRefusedError:
+        logger.error("Chamber image: connection refused by %s:%s", ip_address, port)
+        return None
+    except Exception as e:
+        logger.exception("Chamber image: error connecting to %s:%s: %s", ip_address, port, e)
+        return None
+
+
+async def generate_chamber_image_stream(
+    ip_address: str,
+    access_code: str,
+    fps: int = 5,
+) -> asyncio.StreamReader | None:
+    """Create a persistent connection for streaming chamber images.
+
+    Returns a connected reader or None if connection failed.
+    """
+    port = 6000
+    ssl_context = _create_ssl_context()
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip_address, port, ssl=ssl_context),
+            timeout=10.0,
+        )
+
+        # Send authentication payload
+        auth_payload = _create_chamber_auth_payload(access_code)
+        writer.write(auth_payload)
+        await writer.drain()
+
+        logger.info("Chamber image: connected to %s:%s", ip_address, port)
+        return reader, writer
+
+    except Exception as e:
+        logger.error("Chamber image: failed to connect to %s:%s: %s", ip_address, port, e)
+        return None
+
+
+async def read_next_chamber_frame(reader: asyncio.StreamReader, timeout: float = 10.0) -> bytes | None:
+    """Read the next JPEG frame from an established chamber image connection."""
+    try:
+        # Read the 16-byte header
+        header = await asyncio.wait_for(reader.readexactly(16), timeout=timeout)
+
+        # Parse payload size from header (little-endian uint32 at offset 0)
+        payload_size = struct.unpack("<I", header[0:4])[0]
+
+        if payload_size == 0 or payload_size > 10_000_000:
+            logger.error("Chamber image: invalid payload size %s", payload_size)
+            return None
+
+        # Read the JPEG data
+        jpeg_data = await asyncio.wait_for(
+            reader.readexactly(payload_size),
+            timeout=timeout,
+        )
+
+        return jpeg_data
+
+    except asyncio.IncompleteReadError:
+        logger.warning("Chamber image: connection closed by printer")
+        return None
+    except TimeoutError:
+        logger.warning("Chamber image: read timeout")
+        return None
+    except Exception as e:
+        logger.error("Chamber image: error reading frame: %s", e)
+        return None
+
+
+async def capture_camera_frame(
+    ip_address: str,
+    access_code: str,
+    model: str | None,
+    output_path: Path,
+    timeout: int = 30,
+) -> bool:
+    """Capture a single frame from the printer's camera stream and save to disk.
+
+    Uses capture_camera_frame_bytes() internally for protocol selection,
+    then writes the result to the specified output path.
+
+    Args:
+        ip_address: Printer IP address
+        access_code: Printer access code
+        model: Printer model (X1, H2D, P1, A1, etc.)
+        output_path: Path where to save the captured image
+        timeout: Timeout in seconds for the capture operation
+
+    Returns:
+        True if capture was successful, False otherwise
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    jpeg_data = await capture_camera_frame_bytes(ip_address, access_code, model, timeout)
+    if jpeg_data:
+        try:
+            with open(output_path, "wb") as f:
+                f.write(jpeg_data)
+            logger.info("Saved camera frame to: %s", output_path)
+            return True
+        except OSError as e:
+            logger.error("Failed to write camera frame: %s", e)
+            return False
+    return False
+
+
+def capture_in_flight(ip_address: str) -> bool:
+    """Return True iff a one-shot capture for this IP is running right now.
+
+    For callers that need to know whether they will JOIN someone else's
+    capture rather than perform their own — currently only the diagnose tool,
+    which reports on what it measured and so must not present a coalesced
+    frame as proof that it opened its own connection (see camera_diagnose).
+
+    Ordinary consumers should ignore this: they want "a recent frame", and
+    capture_camera_frame_bytes() already does the right thing for them.
+    """
+    task = _inflight_captures.get(ip_address)
+    return task is not None and not task.done()
+
+
+def _discard_inflight_capture(ip_address: str, task: asyncio.Task) -> None:
+    """Done-callback: drop the finished task from the in-flight registry.
+
+    Guarded on identity so a slow task that finishes after a newer capture
+    has registered can't evict its successor.
+
+    Also retrieves the exception, if any. The leader normally awaits the task
+    and would surface it, but a leader whose own caller was cancelled leaves
+    nobody to collect it — and an unretrieved task exception is logged by
+    asyncio as a warning with a traceback at an arbitrary later point.
+    """
+    if _inflight_captures.get(ip_address) is task:
+        del _inflight_captures[ip_address]
+    if not task.cancelled() and task.exception() is not None:
+        logger.debug("In-flight camera capture for %s ended in an exception", ip_address)
+
+
+async def capture_camera_frame_bytes(
+    ip_address: str,
+    access_code: str,
+    model: str | None,
+    timeout: int = 15,
+) -> bytes | None:
+    """Capture a single frame and return as JPEG bytes (no disk write).
+
+    Concurrent callers for the same printer share one capture (#2705): the
+    first opens the connection, everyone arriving while it is in flight awaits
+    the same result. Every consumer here wants "a recent frame" rather than
+    "a frame captured at exactly my timestamp", so handing identical bytes to
+    simultaneous callers is correct — and it is the only way to honour the
+    firmware's one-connection limit without serialising captures behind a lock
+    (which would just turn a collision into a queue).
+
+    This coalesces; it does not cache. A call that arrives after the previous
+    capture finished always captures fresh. Two consumers of these frames —
+    plate detection and the finish-photo path — decide things about a running
+    print from them, and a stale frame there is worse than a slow one: the
+    whole of #1397 was a finish photo taken seconds late showing the bed
+    already lowered.
+
+    Args:
+        ip_address: Printer IP address
+        access_code: Printer access code
+        model: Printer model (X1, H2D, P1, A1, etc.)
+        timeout: Timeout in seconds for the capture operation. Applies to this
+            caller's own wait, including when it joins another caller's
+            capture — the call sites disagree about the value (10s for plate
+            detection, 20s for Obico), and a follower must not silently
+            inherit the leader's deadline in either direction.
+
+    Returns:
+        JPEG bytes if capture was successful, None otherwise
+    """
+    # A follower whose leader fails takes a turn of its own rather than
+    # inheriting a failure it never had a chance to avoid — by then the leader
+    # has finished, so there is no socket left to compete with. Bounded at two
+    # rounds: if the capture we joined AND its replacement both failed, a third
+    # connection won't help, and this caller has already spent its patience.
+    for _ in range(2):
+        leader = _inflight_captures.get(ip_address)
+        if leader is None or leader.done():
+            break
+        try:
+            frame = await asyncio.wait_for(asyncio.shield(leader), timeout=timeout)
+        except TimeoutError:
+            # shield() keeps the capture running for whoever else is still
+            # waiting on it — giving up is this caller's decision alone.
+            logger.warning(
+                "Gave up waiting %ss on the in-flight camera capture for %s",
+                timeout,
+                ip_address,
+            )
+            return None
+        except asyncio.CancelledError:
+            # Distinguish "the capture I joined was cancelled" from "I was
+            # cancelled". Only the former is ours to recover from.
+            if not leader.cancelled():
+                raise
+            logger.info("In-flight camera capture for %s was cancelled; capturing our own", ip_address)
+            continue
+        if frame is not None:
+            logger.info(
+                "Reusing in-flight camera capture for %s: %s bytes (no second connection opened)",
+                ip_address,
+                len(frame),
+            )
+            return frame
+        logger.info("In-flight camera capture for %s failed; capturing our own", ip_address)
+    else:
+        return None
+
+    task = asyncio.create_task(_capture_camera_frame_bytes_uncoalesced(ip_address, access_code, model, timeout))
+    _inflight_captures[ip_address] = task
+    task.add_done_callback(functools.partial(_discard_inflight_capture, ip_address))
+    # No wait_for here: this caller IS the capture, and the implementation
+    # already enforces `timeout` internally where it can also kill the ffmpeg
+    # process. A second deadline on top would abandon the subprocess instead.
+    # shield() so that a cancelled leader (a client navigating away mid-
+    # snapshot is routine) doesn't take the capture down with it — the
+    # followers already waiting on it still get their frame.
+    return await asyncio.shield(task)
+
+
+async def _capture_camera_frame_bytes_uncoalesced(
+    ip_address: str,
+    access_code: str,
+    model: str | None,
+    timeout: int = 15,
+) -> bytes | None:
+    """Open a connection and capture one frame. See capture_camera_frame_bytes.
+
+    Callers want that wrapper, not this: it opens a socket unconditionally,
+    which is the collision #2705 is about.
+    """
+    # Chamber image models: A1/P1 - returns bytes directly
+    if is_chamber_image_model(model):
+        logger.info("Capturing camera frame bytes from %s using chamber image protocol (model: %s)", ip_address, model)
+        return await read_chamber_image_frame(ip_address, access_code, timeout=float(timeout))
+
+    # RTSP models: X1/H2/P2 - use ffmpeg piping to stdout
+    # TLS proxy avoids GnuTLS compatibility issues with some printer firmwares
+    port = get_camera_port(model)
+    proxy_port, proxy_server = await create_tls_proxy(ip_address, port)
+    camera_url = f"rtsp://bblp:{access_code}@127.0.0.1:{proxy_port}/streaming/live/1"
+
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        proxy_server.close()
+        await proxy_server.wait_closed()
+        logger.error("ffmpeg not found for camera frame capture")
+        return None
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-rtsp_transport",
+        "tcp",
+        "-rtsp_flags",
+        "prefer_tcp",
+        "-i",
+        camera_url,
+        "-frames:v",
+        "1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-q:v",
+        "2",
+        "-",
+    ]
+
+    logger.info("Capturing camera frame bytes from %s using RTSP (model: %s)", ip_address, model)
+
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        _active_capture_pids.add(process.pid)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.error("Camera frame bytes capture timed out after %ss", timeout)
+            return None
+
+        if process.returncode == 0 and stdout and len(stdout) >= 100:
+            logger.info("Successfully captured camera frame bytes: %s bytes", len(stdout))
+            return stdout
+        else:
+            # ffmpeg echoes the RTSP input URL, which carries the access code.
+            stderr_text = redact_url_credentials(stderr.decode()) if stderr else "Unknown error"
+            logger.error("ffmpeg frame bytes capture failed (code %s): %s", process.returncode, stderr_text[:200])
+            return None
+
+    except FileNotFoundError:
+        logger.error("ffmpeg not found for camera frame capture")
+        return None
+    except Exception as e:
+        logger.exception("Camera frame bytes capture failed: %s", e)
+        return None
+    finally:
+        if process is not None:
+            _active_capture_pids.discard(process.pid)
+        proxy_server.close()
+        await proxy_server.wait_closed()
+
+
+async def extract_video_last_frame(video_path: Path, output_path: Path) -> bool:
+    """Extract the last frame of `video_path` as JPEG at `output_path`.
+
+    Used to source finish photos from a Bambu timelapse. The Bambu firmware
+    stops timelapse recording AFTER the toolhead parks but BEFORE the bed-drop
+    end-gcode runs, so the last frame frames the finished print correctly.
+    A live camera grab at `gcode_state=FINISH` captures the bed already
+    lowered (#1397).
+
+    Implementation: ``-update 1`` writes each decoded frame to the same
+    output file (overwriting), so the file left on disk after ffmpeg
+    finishes is the LAST frame. This works regardless of how short the
+    video is — a small print's timelapse can be sub-second / sub-30 frames
+    (one frame per layer-change capture), and the earlier ``-sseof -1.0``
+    approach failed there because the seek went before the start of the
+    file and ffmpeg silently returned frame 0 (empty bed at print start).
+    Decoding every frame is fine: Bambu timelapses are short by
+    construction (<1 minute even on hours-long prints).
+
+    Returns False on missing ffmpeg, missing video, subprocess failure or
+    timeout. Never raises.
+    """
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        logger.warning("Cannot extract video last frame: ffmpeg not available")
+        return False
+
+    if not video_path.exists() or video_path.stat().st_size == 0:
+        logger.warning("Cannot extract last frame: %s missing or empty", video_path)
+        return False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(video_path),
+        "-q:v",
+        "2",
+        "-update",
+        "1",
+        str(output_path),
+    ]
+
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=15.0)
+        if process.returncode != 0:
+            logger.warning(
+                "ffmpeg failed extracting last frame from %s: %s",
+                video_path,
+                stderr.decode(errors="replace")[:500],
+            )
+            return False
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            logger.warning("ffmpeg produced no output for %s", video_path)
+            return False
+        return True
+    except asyncio.TimeoutError:
+        logger.warning("ffmpeg timed out extracting last frame from %s", video_path)
+        if process is not None:
+            try:
+                process.kill()
+                await process.wait()
+            except ProcessLookupError:
+                pass  # Already exited
+        return False
+    except OSError as e:
+        logger.warning("ffmpeg subprocess error for %s: %s", video_path, e)
+        return False
+
+
+def apply_camera_rotation(image_data: bytes, rotation: int, logger: logging.Logger) -> bytes:
+    """Apply a camera_rotation value (degrees clockwise) to a captured JPEG.
+
+    Shared by every capture path that saves a still image (notification
+    snapshots, finish photos, layer-timelapse frames) - previously only
+    wired into the notification-snapshot path, which left finish photos
+    and timelapse videos upside-down whenever camera_rotation was set.
+
+    Returns *image_data* itself (identity, not a copy) when there is nothing
+    to do or the rotate fails; callers that write to disk use that to skip a
+    pointless rewrite.
+    """
+    if not rotation:
+        return image_data
+
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.open(BytesIO(image_data))
+        # PIL rotate is counter-clockwise, so negate for clockwise rotation
+        img = img.rotate(-rotation, expand=True)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        rotated = buf.getvalue()
+        # Debug, not info: layer-timelapse calls this once per layer, so a tall
+        # print would otherwise put hundreds of lines in the log for something
+        # the surrounding capture already reports at debug level.
+        logger.debug("Applied %d° camera rotation: %s → %s bytes", rotation, len(image_data), len(rotated))
+        return rotated
+    except Exception as e:
+        logger.warning("Failed to apply camera rotation: %s", e)
+        return image_data
+
+
+async def apply_camera_rotation_to_file(path: Path, rotation: int, logger: logging.Logger) -> None:
+    """Rotate a JPEG that has already been written to disk, in place.
+
+    Two finish-photo sources never hold the frame as bytes - ``ffmpeg`` writes
+    the file for them, and they return only a filename - so they can't use
+    ``apply_camera_rotation`` directly. Best-effort: any failure leaves the
+    unrotated file in place, which is what the caller had before.
+    """
+    if not rotation:
+        return
+
+    try:
+        data = await asyncio.to_thread(path.read_bytes)
+        rotated = await asyncio.to_thread(apply_camera_rotation, data, rotation, logger)
+        if rotated is data:
+            # Nothing was done (the rotate failed and returned its input) -
+            # rewriting the same bytes would only risk truncating a good file.
+            return
+        await asyncio.to_thread(path.write_bytes, rotated)
+    except Exception as e:
+        logger.warning("Failed to rotate %s in place: %s", path.name, e)
+
+
+async def capture_finish_photo(
+    printer_id: int,
+    ip_address: str,
+    access_code: str,
+    model: str | None,
+    archive_dir: Path,
+    rotation: int = 0,
+) -> str | None:
+    """Capture a finish photo and save it to the archive's photos folder.
+
+    Args:
+        printer_id: ID of the printer
+        ip_address: Printer IP address
+        access_code: Printer access code
+        model: Printer model
+        archive_dir: Directory of the archive (where the 3MF is stored)
+        rotation: Printer's configured camera_rotation (degrees clockwise).
+            ffmpeg writes the file directly here, so the rotation is applied
+            to it afterwards rather than to bytes in hand.
+
+    Returns:
+        Filename of the captured photo, or None if capture failed
+    """
+    # Create photos subdirectory
+    photos_dir = archive_dir / "photos"
+    photos_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"finish_{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
+    output_path = (
+        photos_dir / filename
+    )  # SEC-PATH-OK: filename = f"finish_{timestamp}_{uuid.uuid4().hex[:8]}.jpg" generated above
+
+    success = await capture_camera_frame(
+        ip_address=ip_address,
+        access_code=access_code,
+        model=model,
+        output_path=output_path,
+        timeout=30,
+    )
+
+    if success:
+        await apply_camera_rotation_to_file(output_path, rotation, logger)
+        logger.info("Finish photo saved: %s", filename)
+        return filename
+    else:
+        logger.warning("Failed to capture finish photo for printer %s", printer_id)
+        return None
+
+
+async def test_camera_connection(
+    ip_address: str,
+    access_code: str,
+    model: str | None,
+) -> dict:
+    """Test if the camera stream is accessible.
+
+    Returns dict with success status and any error message.
+    """
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    test_path = Path(tmp_name)
+    test_path.chmod(0o600)
+
+    try:
+        success = await capture_camera_frame(
+            ip_address=ip_address,
+            access_code=access_code,
+            model=model,
+            output_path=test_path,
+            timeout=15,
+        )
+
+        if success:
+            return {"success": True, "message": "Camera connection successful"}
+        else:
+            return {
+                "success": False,
+                "error": (
+                    "Failed to capture frame from camera. "
+                    "Ensure the printer is powered on, camera is enabled, and Developer Mode is active. "
+                    "If running in Docker, try 'network_mode: host' in docker-compose.yml."
+                ),
+            }
+    finally:
+        # Clean up test file
+        if test_path.exists():
+            test_path.unlink()

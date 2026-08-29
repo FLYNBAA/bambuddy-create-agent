@@ -1,0 +1,485 @@
+from datetime import datetime
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, BeforeValidator, Field, PlainSerializer, model_validator
+
+from backend.app.utils.printer_models import MAX_CHAMBER_TEMP_C
+
+
+# Custom serializer to ensure UTC datetimes have Z suffix
+def serialize_utc_datetime(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    # Add Z suffix to indicate UTC
+    return dt.isoformat() + "Z"
+
+
+UTCDatetime = Annotated[datetime | None, PlainSerializer(serialize_utc_datetime)]
+
+
+def _coerce_tristate(v: object) -> object:
+    """Map legacy on/off booleans onto the tri-state calibration options.
+
+    bed_levelling / flow_cali / nozzle_offset_cali were plain booleans before we
+    added BambuStudio's third "auto" state (skip if recently done). Rows and API
+    payloads created under the old scheme carry bool / 0-1 int / "true"/"false";
+    coerce them so old clients and un-migrated rows still validate. getValueInt
+    parity: off=0, on=1, auto=2.
+    """
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, int):
+        return {0: "off", 1: "on", 2: "auto"}.get(v, "auto")
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in ("true", "1"):
+            return "on"
+        if low in ("false", "0"):
+            return "off"
+    return v
+
+
+# Tri-state calibration option: "auto" (printer decides / skip if recent),
+# "on" (force every print), "off" (never). Mirrors BambuStudio's ops_auto.
+TriState = Annotated[Literal["off", "on", "auto"], BeforeValidator(_coerce_tristate)]
+
+
+class QueueVariantCreate(BaseModel):
+    """One candidate file for a cross-model queue item (#671).
+
+    Per-file rather than per-item because the settings genuinely differ between
+    candidates: an H2C slice is dual-nozzle and will not share slot count, AMS
+    mapping or nozzle mapping with the H2S slice of the same model.
+
+    ``target_model`` is normally omitted and read from the file's own
+    ``sliced_for_model``; supply it only for a legacy 3MF that declares none.
+    """
+
+    library_file_id: int
+    target_model: str | None = None
+    plate_id: int | None = None
+    ams_mapping: list[int] | None = None
+    nozzle_mapping: list[int] | None = None
+    # Which rack position each filament group prints from (#1784), as
+    # {group_id: 1-based position}. The operator's pick, re-checked against the
+    # live rack at dispatch; null means "assign them for me".
+    nozzle_rack_choice: dict[int, int] | None = None
+    filament_overrides: list[dict] | None = None
+
+
+class PrintQueueItemCreate(BaseModel):
+    printer_id: int | None = None  # None = unassigned, user assigns later
+    target_model: str | None = None  # Target printer model (mutually exclusive with printer_id)
+    target_location: str | None = None  # Target location filter (only used with target_model)
+    required_filament_types: list[str] | None = None  # Required filament types for model-based assignment
+    filament_overrides: list[dict] | None = None  # Filament overrides for model-based assignment
+    # Either archive_id OR library_file_id must be provided
+    archive_id: int | None = None
+    library_file_id: int | None = None
+    scheduled_time: datetime | None = None  # None = ASAP (next when idle)
+    require_previous_success: bool = False
+    auto_off_after: bool = False  # Power off printer after print completes
+    manual_start: bool = False  # Requires manual trigger to start (staged)
+    insert_at_top: bool = False  # Insert ahead of other pending items in the same queue scope
+    insert_position: int | None = None  # 1-indexed insertion position for priority queueing
+    # Persistent "Print Anyway" acknowledgement (#1698-followup). When set,
+    # PrintModal already showed the deficit warning and the user confirmed,
+    # so the scheduler does not re-flag this item on the next tick.
+    skip_filament_check: bool = False
+    # AMS mapping: list of global tray IDs for each filament slot
+    # Format: [5, -1, 2, -1] where position = slot_id-1, value = global tray ID (-1 = unused)
+    ams_mapping: list[int] | None = None
+    # Plate ID for multi-plate 3MF files (1-indexed, None = auto-detect/plate 1)
+    plate_id: int | None = None
+    # Print options. bed_levelling / flow_cali / nozzle_offset_cali are tri-state
+    # (off/on/auto), defaulting to "auto" to match BambuStudio. vibration_cali /
+    # layer_inspect / timelapse stay on/off (BambuStudio exposes no auto for them).
+    bed_levelling: TriState = "auto"
+    flow_cali: TriState = "auto"
+    vibration_cali: bool = True
+    layer_inspect: bool = False
+    timelapse: bool = False
+    use_ams: bool = True
+    # Nozzle offset calibration — dual-nozzle printers only (#1682). The MQTT
+    # layer ignores the value on single-nozzle printers so the wire stays "skip".
+    nozzle_offset_cali: TriState = "auto"
+    # Preheat / heat-soak per-item override (#1468). 'inherit' uses the global
+    # preheat_enabled setting; 'on' / 'off' force the decision. The chamber
+    # target falls through: this override → max(filament-map[loaded tray]) → 0.
+    preheat_override: Literal["inherit", "on", "off"] = "inherit"
+    preheat_chamber_target_override: int | None = Field(default=None, ge=0, le=MAX_CHAMBER_TEMP_C)
+    # Auto-print G-code injection
+    gcode_injection: bool = False
+    # Batch: create multiple copies (creates a batch if > 1)
+    quantity: int = 1
+    # Existing batch to add this item into. When set, the item's batch_id is
+    # populated on insert so the queue UI groups it with its siblings. Used by
+    # the multi-plate auto-batch flow and by the "Group as batch" action.
+    batch_id: int | None = None
+    # Project to associate the resulting archive with
+    project_id: int | None = None
+    cost_center_id: int | None = None
+    estimated_cost: float | None = None
+    # Which rack position each filament group prints from (#1784), as
+    # {group_id: 1-based position}. The operator's pick, re-checked against the
+    # live rack at dispatch; null means "assign them for me".
+    nozzle_rack_choice: dict[int, int] | None = None
+    # Direct printer-card uploads are temporary library files. The scheduler
+    # deletes them after creating the durable archive copy.
+    cleanup_library_after_dispatch: bool = False
+    # Cross-model alternatives (#671): several sliced files, one job, whichever
+    # printer frees up first. Mutually exclusive with printer_id (a specific
+    # printer defeats the purpose) and with archive_id/library_file_id (the
+    # candidates ARE the files). The scheduler resolves one onto the row at
+    # dispatch, after which the item is an ordinary single-file job.
+    variants: list[QueueVariantCreate] | None = None
+
+
+class PrintQueueItemUpdate(BaseModel):
+    printer_id: int | None = None
+    target_model: str | None = None  # Target printer model (mutually exclusive with printer_id)
+    target_location: str | None = None  # Target location filter (only used with target_model)
+    filament_overrides: list[dict] | None = None  # Filament overrides for model-based assignment
+    position: int | None = None
+    scheduled_time: datetime | None = None
+    require_previous_success: bool | None = None
+    auto_off_after: bool | None = None
+    manual_start: bool | None = None
+    ams_mapping: list[int] | None = None
+    plate_id: int | None = None
+    # Print options
+    bed_levelling: TriState | None = None
+    flow_cali: TriState | None = None
+    vibration_cali: bool | None = None
+    layer_inspect: bool | None = None
+    timelapse: bool | None = None
+    use_ams: bool | None = None
+    nozzle_offset_cali: TriState | None = None
+    preheat_override: Literal["inherit", "on", "off"] | None = None
+    preheat_chamber_target_override: int | None = Field(default=None, ge=0, le=MAX_CHAMBER_TEMP_C)
+    # Auto-print G-code injection
+    gcode_injection: bool | None = None
+    cost_center_id: int | None = None
+    estimated_cost: float | None = None
+    # H2C dual-nozzle-rack slicer pick (#1780). list[int] per-filament
+    # physical nozzle position IDs from BambuStudio's project_file MQTT
+    # body; sent back to the printer verbatim on dispatch.
+    nozzle_mapping: list[int] | None = None
+    # Which rack position each filament group prints from (#1784), as
+    # {group_id: 1-based position}. The operator's pick, re-checked against the
+    # live rack at dispatch; null means "assign them for me".
+    nozzle_rack_choice: dict[int, int] | None = None
+
+
+class QueueVariantSummary(BaseModel):
+    """One candidate on a cross-model queue item, for display (#671)."""
+
+    library_file_id: int
+    filename: str
+    target_model: str
+    position: int
+
+
+class PrintQueueItemResponse(BaseModel):
+    id: int
+    printer_id: int | None  # None = unassigned
+    target_model: str | None = None  # Target printer model for model-based assignment
+    target_location: str | None = None  # Target location filter for model-based assignment
+    required_filament_types: list[str] | None = None  # Required filament types for model-based assignment
+    filament_overrides: list[dict] | None = None  # Filament overrides for model-based assignment
+    waiting_reason: str | None = None  # Why a model-based job hasn't started yet
+    archive_id: int | None  # None if library_file_id is set (archive created at print start)
+    library_file_id: int | None  # For queue items from library files
+    cost_center_id: int | None = None
+    estimated_cost: float | None = None
+    position: int
+    scheduled_time: UTCDatetime
+    require_previous_success: bool
+    auto_off_after: bool
+    manual_start: bool
+    # True when the dispatch scheduler last evaluated this item and the
+    # assigned spool could not satisfy at least one slot's required grams
+    # (#1496). Display-only — the ▶ click recomputes deficit against live
+    # spool state.
+    filament_short: bool = False
+    # User has acknowledged "Print Anyway" — scheduler skips the deficit check
+    # for this item (#1698-followup).
+    skip_filament_check: bool = False
+    ams_mapping: list[int] | None = None
+    plate_id: int | None = None  # Plate ID for multi-plate 3MF files
+    # Print options
+    bed_levelling: TriState = "auto"
+    flow_cali: TriState = "auto"
+    vibration_cali: bool = True
+    layer_inspect: bool = False
+    timelapse: bool = False
+    use_ams: bool = True
+    nozzle_offset_cali: TriState = "auto"
+    preheat_override: Literal["inherit", "on", "off"] = "inherit"
+    preheat_chamber_target_override: int | None = None
+    status: Literal["pending", "printing", "completed", "failed", "skipped", "cancelled"]
+    started_at: UTCDatetime
+    completed_at: UTCDatetime
+    error_message: str | None
+    created_at: UTCDatetime
+
+    # Nested info for UI (populated in route)
+    archive_name: str | None = None
+    archive_thumbnail: str | None = None
+    # True when the linked archive has been soft-deleted (its files are gone
+    # from disk). In that case the *archive_name* / *archive_thumbnail* /
+    # downstream metadata fields are intentionally left None so the frontend
+    # doesn't 404-storm the now-missing thumbnail / plates / plate-thumbnail
+    # endpoints (#1348 follow-up). Frontends can render a "source deleted"
+    # badge based on this flag.
+    archive_deleted: bool = False
+    library_file_name: str | None = None  # Name of library file (if library_file_id is set)
+    library_file_thumbnail: str | None = None  # Thumbnail of library file
+    printer_name: str | None = None
+    print_time_seconds: int | None = None  # Estimated print time from archive or library file
+    filament_used_grams: float | None = None  # Estimated print weight from archive or library file
+    filament_type: str | None = None  # e.g. "PLA", "PETG" (from archive/library file)
+    filament_color: str | None = None  # e.g. "#FFFFFF" (from archive/library file)
+    layer_height: float | None = None  # e.g. 0.2 (from archive/library file)
+    nozzle_diameter: float | None = None  # e.g. 0.4 (from archive/library file)
+    sliced_for_model: str | None = None  # e.g. "P1S" (from archive/library file)
+    # Build plate type (e.g. "Textured PEI Plate") so the user knows which
+    # plate to mount on the printer (#1281). Per-plate accurate on multi-plate
+    # 3MFs: when `plate_id` is set, the value is the matching plate's
+    # `curr_bed_type` rather than the archive-level first-plate default.
+    bed_type: str | None = None
+    # True when the source archive carries the slicer's own live-resolved
+    # AMS-slot pick (extra_data.slicer_ams_mapping) *and* it was resolved
+    # against this row's own printer — the only case where dispatch actually
+    # reuses that exact physical spool instead of the scheduler re-deriving one
+    # from the file's static type/color.
+    archive_has_slicer_ams_mapping: bool = False
+
+    # User tracking (Issue #206)
+    created_by_id: int | None = None
+    created_by_username: str | None = None
+
+    # Batch grouping
+    batch_id: int | None = None
+    batch_name: str | None = None
+
+    # Cross-model alternatives (#671), in priority order. Empty for every
+    # ordinary item. Present until dispatch resolves one onto the row, after
+    # which library_file_id / target_model name the candidate that actually ran.
+    variants: list[QueueVariantSummary] = []
+
+    # Shortest-job-first scheduling
+    been_jumped: bool = False
+
+    # Auto-print G-code injection
+    gcode_injection: bool = False
+    cleanup_library_after_dispatch: bool = False
+
+    # H2C dual-nozzle-rack slicer pick (#1780). Surface for any future
+    # "edit print → choose nozzle" UI; null on every model except O1C2
+    # uploads from BambuStudio.
+    nozzle_mapping: list[int] | None = None
+    # Which rack position each filament group prints from (#1784), as
+    # {group_id: 1-based position}. The operator's pick, re-checked against the
+    # live rack at dispatch; null means "assign them for me".
+    nozzle_rack_choice: dict[int, int] | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class PrintQueueReorderItem(BaseModel):
+    id: int
+    position: int
+
+
+class PrintQueueReorder(BaseModel):
+    items: list[PrintQueueReorderItem]
+
+    @model_validator(mode="after")
+    def _validate_positions_unique(self) -> "PrintQueueReorder":
+        """Reject reorder requests with duplicate positions in the payload
+        (#1625-followup).
+
+        The /reorder route is the drag-drop renumber path on the queue UI;
+        a well-behaved client sends a contiguous renumbering of a single
+        printer's pending queue. A buggy client that sends two items at
+        the same position would leave the queue in an inconsistent state
+        (scheduler's ORDER BY (printer_id, position) ties get broken by
+        physical row order). Fail closed at the schema boundary so the
+        bug is caught before any DB mutation.
+
+        Uniqueness is enforced WITHIN THE PAYLOAD only — cross-printer
+        reorders that intentionally share positions across different
+        printer queues are a non-goal of the drag-drop UI, so this is the
+        right scope.
+        """
+        positions = [it.position for it in self.items]
+        if len(positions) != len(set(positions)):
+            duplicates = sorted({p for p in positions if positions.count(p) > 1})
+            raise ValueError(f"Duplicate positions in reorder request: {duplicates}")
+        return self
+
+
+class PrintQueueBulkUpdate(BaseModel):
+    """Bulk update multiple queue items with the same values."""
+
+    item_ids: list[int]
+    # Fields to update (all optional - only set fields are applied)
+    printer_id: int | None = None
+    scheduled_time: datetime | None = None
+    require_previous_success: bool | None = None
+    auto_off_after: bool | None = None
+    manual_start: bool | None = None
+    # Print options
+    bed_levelling: TriState | None = None
+    flow_cali: TriState | None = None
+    vibration_cali: bool | None = None
+    layer_inspect: bool | None = None
+    timelapse: bool | None = None
+    use_ams: bool | None = None
+    nozzle_offset_cali: TriState | None = None
+    preheat_override: Literal["inherit", "on", "off"] | None = None
+    preheat_chamber_target_override: int | None = Field(default=None, ge=0, le=MAX_CHAMBER_TEMP_C)
+    # Auto-print G-code injection
+    gcode_injection: bool | None = None
+    cost_center_id: int | None = None
+    estimated_cost: float | None = None
+
+
+class PrintQueueBulkUpdateResponse(BaseModel):
+    """Response for bulk update operation."""
+
+    updated_count: int
+    skipped_count: int  # Items that were not pending
+    message: str
+
+
+class PrintBatchPlateTarget(BaseModel):
+    """How many runs of one plate an order wants (#342).
+
+    ``plate_id`` is the plate index inside the source 3MF, or null for a
+    single-plate file — matching ``PrintQueueItem.plate_id``. A target of 0 is
+    legal and means "this plate is not required (yet)".
+    """
+
+    plate_id: int | None = None
+    plate_name: str | None = None
+    quantity_target: int = Field(default=1, ge=0, le=999)
+    sort_order: int = 0
+
+
+class PrintBatchCreate(BaseModel):
+    """Create a batch, either empty (multi-plate pre-batch flow) or by
+    assigning existing pending queue items into it (manual "Group as batch")."""
+
+    name: str
+    archive_id: int | None = None
+    library_file_id: int | None = None
+    # Existing pending queue items to assign to this batch. None / empty for
+    # the empty-batch flow (client passes the returned id on subsequent
+    # addToQueue calls).
+    item_ids: list[int] | None = None
+    # Per-plate targets. Omitted entirely by the pre-#342 flows, which produce
+    # a batch that reports progress but owes nothing.
+    plates: list[PrintBatchPlateTarget] | None = None
+    # Planning metadata. Projects own the heavier fields (BOM, attachments,
+    # tags); these two are the ones that are useless without a Project to
+    # hang them on, so the order carries them directly.
+    project_id: int | None = None
+    due_date: datetime | None = None
+    notes: str | None = None
+
+
+class PrintBatchUpdate(BaseModel):
+    """Edit an order's header or its per-plate targets while it runs.
+
+    Every field is optional; ``plates`` replaces the full target set when
+    given, so a plate omitted from the list has its target row removed.
+    """
+
+    name: str | None = None
+    status: Literal["active", "cancelled"] | None = None
+    plates: list[PrintBatchPlateTarget] | None = None
+    project_id: int | None = None
+    due_date: datetime | None = None
+    notes: str | None = None
+
+
+class PrintBatchDispatchRequest(BaseModel):
+    """Create queue items for the runs an order still owes."""
+
+    # Restrict to one plate. Null is a legitimate plate_id (single-plate file),
+    # so the caller opts in explicitly rather than us inferring from null.
+    plate_id: int | None = None
+    only_plate: bool = False
+    # Cap on how many items to create across all plates. None = everything owed.
+    limit: int | None = Field(default=None, ge=1, le=999)
+
+
+class PrintBatchUngroupResponse(BaseModel):
+    """Response after ungrouping a batch."""
+
+    ungrouped_count: int
+    message: str
+
+
+class PrintBatchPlateProgress(BaseModel):
+    """Per-plate progress within a batch."""
+
+    plate_id: int | None = None
+    plate_name: str | None = None
+    quantity_target: int = 0
+    dispatched: int = 0
+    remaining: int = 0
+    pending_count: int = 0
+    printing_count: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    cancelled_count: int = 0
+    skipped_count: int = 0
+    # Measured from finished runs, never estimated from the file. Null until
+    # at least one run of this plate has produced a cost.
+    actual_cost: float | None = None
+    estimated_remaining_cost: float | None = None
+    filament_used_grams: float | None = None
+    print_time_seconds: int = 0
+
+
+class PrintBatchResponse(BaseModel):
+    """Response for a print batch with progress stats."""
+
+    id: int
+    name: str
+    archive_id: int | None = None
+    library_file_id: int | None = None
+    quantity: int
+    status: str
+    created_at: UTCDatetime
+    completed_at: UTCDatetime | None = None
+    created_by_id: int | None = None
+    created_by_username: str | None = None
+    project_id: int | None = None
+    due_date: UTCDatetime | None = None
+    notes: str | None = None
+    # Derived counts
+    pending_count: int = 0
+    printing_count: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    cancelled_count: int = 0
+    skipped_count: int = 0
+    # Planning roll-up. has_targets is false for batches created before
+    # per-plate targets existed: they report progress but owe nothing, and the
+    # dispatch endpoint is a no-op for them.
+    has_targets: bool = False
+    target_count: int = 0
+    remaining_count: int = 0
+    actual_cost: float | None = None
+    estimated_remaining_cost: float | None = None
+    filament_used_grams: float | None = None
+    print_time_seconds: int = 0
+    plates: list[PrintBatchPlateProgress] = []
+
+    class Config:
+        from_attributes = True

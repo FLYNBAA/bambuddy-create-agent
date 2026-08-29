@@ -1,0 +1,11 @@
+# Windows Docker Desktop test override. Use together with docker-compose.yml.
+# Linux production retains host networking from the base compose file.
+services:
+  bambuddy:
+    # Compose reset removes Linux host networking and restores the default bridge network.
+    network_mode: !reset null
+    ports:
+      - "${BCA_DOCKER_PORT:-8012}:8000"
+    environment:
+      # Bridge networking cannot use SSDP reliably. Add printers by LAN IP.
+      - VIRTUAL_PRINTER_PASV_ADDRESS=host.docker.internal

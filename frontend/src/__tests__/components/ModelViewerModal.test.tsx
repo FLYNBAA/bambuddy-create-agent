@@ -1,0 +1,719 @@
+/**
+ * Tests for the ModelViewerModal component.
+ * Tests fullscreen toggle, plate selector, object counts, and tab switching.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { screen, fireEvent, waitFor } from '@testing-library/react';
+import { render } from '../utils';
+import { ModelViewerModal } from '../../components/ModelViewerModal';
+import { setStreamToken } from '../../api/client';
+import { openInSlicer } from '../../utils/slicer';
+import { http, HttpResponse } from 'msw';
+import { server } from '../mocks/server';
+
+// Mock ModelViewer to avoid WebGL/Three.js issues in tests
+vi.mock('../../components/ModelViewer', () => ({
+  ModelViewer: ({ className }: { className?: string }) => (
+    <div data-testid="model-viewer" className={className}>
+      Model Viewer Mock
+    </div>
+  ),
+}));
+
+// Only the protocol-handler launch is stubbed — it would navigate the jsdom
+// window. Everything else in the module is a pure predicate, so keep the real
+// implementations: re-declaring them here would let the file-type rule these
+// tests assert on drift away from the one the component actually runs.
+vi.mock('../../utils/slicer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/slicer')>()),
+  openInSlicer: vi.fn(),
+}));
+
+const mockCapabilities = {
+  has_model: true,
+  has_gcode: true,
+  has_source: false,
+  build_volume: { x: 256, y: 256, z: 256 },
+  filament_colors: ['#00ae42'],
+};
+
+const mockPlatesResponse = {
+  is_multi_plate: true,
+  plates: [
+    {
+      index: 1,
+      name: 'Plate 1',
+      has_thumbnail: true,
+      thumbnail_url: '/api/v1/archives/1/plates/1/thumbnail',
+      print_time_seconds: 3600,
+      filament_used_grams: 50.5,
+      object_count: 3,
+      objects: ['Cube', 'Sphere', 'Cylinder'],
+      filaments: [{ color: '#00ae42', type: 'PLA', name: 'Bambu PLA Basic' }],
+    },
+    {
+      index: 2,
+      name: 'Plate 2',
+      has_thumbnail: true,
+      thumbnail_url: '/api/v1/archives/1/plates/2/thumbnail',
+      print_time_seconds: 1800,
+      filament_used_grams: 25.0,
+      object_count: 2,
+      objects: ['Base', 'Cover'],
+      filaments: [{ color: '#ff0000', type: 'PLA', name: 'Red PLA' }],
+    },
+  ],
+};
+
+const mockSinglePlateResponse = {
+  is_multi_plate: false,
+  plates: [
+    {
+      index: 1,
+      name: null,
+      has_thumbnail: false,
+      thumbnail_url: null,
+      print_time_seconds: 7200,
+      filament_used_grams: 100.0,
+      object_count: 5,
+      objects: ['Model 1', 'Model 2', 'Model 3', 'Model 4', 'Model 5'],
+      filaments: [],
+    },
+  ],
+};
+
+describe('ModelViewerModal', () => {
+  const mockOnClose = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server.use(
+      http.get('/api/v1/archives/:id/capabilities', () => {
+        return HttpResponse.json(mockCapabilities);
+      }),
+      http.get('/api/v1/archives/:id/plates', () => {
+        return HttpResponse.json(mockPlatesResponse);
+      })
+    );
+  });
+
+  describe('rendering', () => {
+    it('renders the modal with title', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model.3mf"
+          onClose={mockOnClose}
+        />
+      );
+
+      expect(screen.getByText('Test Model.3mf')).toBeInTheDocument();
+    });
+
+    it('renders Open in Slicer button', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in Slicer')).toBeInTheDocument();
+      });
+    });
+
+    it('shows loading spinner while fetching capabilities', () => {
+      server.use(
+        http.get('/api/v1/archives/:id/capabilities', async () => {
+          await new Promise((r) => setTimeout(r, 100));
+          return HttpResponse.json(mockCapabilities);
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      const loader = document.querySelector('.animate-spin');
+      expect(loader).toBeInTheDocument();
+    });
+  });
+
+  describe('tabs', () => {
+    it('renders the 3D Model tab and no G-code tab', async () => {
+      // G-code has its own full-page viewer; the modal is model-only.
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('3D Model')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('G-code Preview')).not.toBeInTheDocument();
+    });
+
+    it('shows not available label when model is not available', async () => {
+      server.use(
+        http.get('/api/v1/archives/:id/capabilities', () => {
+          return HttpResponse.json({
+            ...mockCapabilities,
+            has_model: false,
+          });
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('(not available)')).toBeInTheDocument();
+      });
+    });
+
+  });
+
+  describe('fullscreen', () => {
+    it('renders fullscreen toggle button', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        // Look for the maximize icon button
+        const buttons = screen.getAllByRole('button');
+        const fullscreenButton = buttons.find(
+          (btn) => btn.querySelector('.lucide-maximize-2') || btn.title === 'Enter fullscreen'
+        );
+        expect(fullscreenButton).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('object count', () => {
+    it('displays object count for multi-plate files', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        // Total objects across both plates = 3 + 2 = 5
+        // The header shows "All Plates: 5 objects" in a span
+        const objectCountBadge = screen.getByText(/All Plates.*5 objects/);
+        expect(objectCountBadge).toBeInTheDocument();
+      });
+    });
+
+    it('updates object count when plate is selected', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('Plate 1')).toBeInTheDocument();
+      });
+
+      // Click on Plate 1
+      fireEvent.click(screen.getByText('Plate 1'));
+
+      await waitFor(() => {
+        // Plate 1 has 3 objects - header should update to show "Plate 1: 3 objects"
+        const objectCountBadge = screen.getByText(/Plate 1.*3 objects/);
+        expect(objectCountBadge).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('plate selector', () => {
+    it('shows plates panel for multi-plate files', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('Plates')).toBeInTheDocument();
+        // Use getAllByText for "All Plates" since it appears in header and panel
+        const allPlatesElements = screen.getAllByText('All Plates');
+        expect(allPlatesElements.length).toBeGreaterThan(0);
+        expect(screen.getByText('2 plates')).toBeInTheDocument();
+      });
+    });
+
+    it('shows individual plate buttons', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('Plate 1')).toBeInTheDocument();
+        expect(screen.getByText('Plate 2')).toBeInTheDocument();
+      });
+    });
+
+    it('shows object count for each plate', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        // Each plate shows its object count in the grid
+        expect(screen.getByText('3 objects')).toBeInTheDocument();
+        expect(screen.getByText('2 objects')).toBeInTheDocument();
+      });
+    });
+
+    it('hides plates panel for single-plate files', async () => {
+      server.use(
+        http.get('/api/v1/archives/:id/plates', () => {
+          return HttpResponse.json(mockSinglePlateResponse);
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        // Should show object count but not plate selector
+        expect(screen.getByText(/5 objects/)).toBeInTheDocument();
+      });
+
+      // Plates panel should not be shown for single plate
+      expect(screen.queryByText('2 plates')).not.toBeInTheDocument();
+    });
+
+    it('selects All Plates by default', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        // Find the All Plates button in the grid (the one with "2 plates" sibling text)
+        const platesCountText = screen.getByText('2 plates');
+        const allPlatesButton = platesCountText.closest('button');
+        // The selected button should have the green border class
+        expect(allPlatesButton).toHaveClass('border-bambu-green');
+      });
+    });
+
+    // #2661: plate-thumbnail endpoints are gated behind a camera stream token
+    // (an <img> can't send a Bearer header), so the src must carry ?token=.
+    // Without it the 3D Preview thumbnails 401 while the Slice dialog (which
+    // already appends the token) shows the same file's thumbnails fine.
+    it('appends the camera stream token to plate thumbnail URLs', async () => {
+      setStreamToken('tok-2661');
+      try {
+        render(
+          <ModelViewerModal
+            archiveId={1}
+            title="Test Model"
+            onClose={mockOnClose}
+          />
+        );
+
+        await waitFor(() => {
+          expect(screen.getByText('Plate 1')).toBeInTheDocument();
+        });
+
+        const thumb = screen.getByAltText('Plate 1') as HTMLImageElement;
+        expect(thumb.src).toContain('/api/v1/archives/1/plates/1/thumbnail');
+        expect(thumb.src).toContain('token=tok-2661');
+      } finally {
+        setStreamToken(null);
+      }
+    });
+
+    it('allows plate selection via click', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('Plate 1')).toBeInTheDocument();
+      });
+
+      // Click on Plate 1 - this should not throw
+      const plate1Button = screen.getByText('Plate 1').closest('button');
+      expect(plate1Button).toBeInTheDocument();
+      fireEvent.click(plate1Button!);
+
+      // After clicking, the header should show Plate 1 info
+      await waitFor(() => {
+        expect(screen.getByText(/Plate 1.*3 objects/)).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('close behavior', () => {
+    it('calls onClose when X button is clicked', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      const closeButton = screen.getAllByRole('button').find(
+        (btn) => btn.querySelector('.lucide-x')
+      );
+
+      if (closeButton) {
+        fireEvent.click(closeButton);
+        expect(mockOnClose).toHaveBeenCalled();
+      }
+    });
+
+    it('calls onClose when Escape key is pressed', () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      fireEvent.keyDown(window, { key: 'Escape' });
+      expect(mockOnClose).toHaveBeenCalled();
+    });
+
+    it('calls onClose when backdrop is clicked', () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      const backdrop = document.querySelector('.fixed.inset-0');
+      if (backdrop) {
+        fireEvent.click(backdrop);
+        expect(mockOnClose).toHaveBeenCalled();
+      }
+    });
+  });
+
+  describe('library file mode', () => {
+    it('renders for library file', async () => {
+      server.use(
+        http.get('/api/v1/library/files/:id/plates', () => {
+          return HttpResponse.json(mockSinglePlateResponse);
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          libraryFileId={1}
+          title="Library Model.3mf"
+          fileType="3mf"
+          onClose={mockOnClose}
+        />
+      );
+
+      expect(screen.getByText('Library Model.3mf')).toBeInTheDocument();
+
+      await waitFor(() => {
+        expect(screen.getByText('3D Model')).toBeInTheDocument();
+      });
+    });
+
+    it('disables Open in Slicer for library files that cannot be handed to a slicer', async () => {
+      render(
+        <ModelViewerModal
+          libraryFileId={1}
+          title="Model.gcode"
+          fileType="gcode"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        const slicerButton = screen.getByText('Open in Slicer').closest('button');
+        expect(slicerButton).toBeDisabled();
+      });
+    });
+  });
+
+  describe('slicer split button (#2725)', () => {
+    it('shows both slicers in the dropdown when Bambuddy is the default slicer', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () => {
+          return HttpResponse.json({ use_slicer_api: true });
+        }),
+        http.get('/api/v1/library/files/:id/plates', () => {
+          return HttpResponse.json(mockSinglePlateResponse);
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          libraryFileId={1}
+          title="Model.3mf"
+          fileType="3mf"
+          onClose={mockOnClose}
+          onSliceWithBambuddy={vi.fn()}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Slice' })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in Bambu Studio')).toBeInTheDocument();
+        expect(screen.getByText('Open in OrcaSlicer')).toBeInTheDocument();
+      });
+    });
+
+    it('opens the selected local slicer from the Bambuddy dropdown', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () => {
+          return HttpResponse.json({ use_slicer_api: true });
+        }),
+        http.get('/api/v1/library/files/:id/plates', () => {
+          return HttpResponse.json(mockSinglePlateResponse);
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          libraryFileId={1}
+          title="Model.3mf"
+          fileType="3mf"
+          onClose={mockOnClose}
+          onSliceWithBambuddy={vi.fn()}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Slice' })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+
+      const orcaItem = await screen.findByText('Open in OrcaSlicer');
+      fireEvent.click(orcaItem);
+
+      await waitFor(() => {
+        expect(openInSlicer).toHaveBeenCalledWith(expect.any(String), 'orcaslicer');
+      });
+    });
+
+    it('shows only the non-preferred slicer in the dropdown for a desktop handoff', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Open in Slicer' })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in OrcaSlicer')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Open in Bambu Studio')).not.toBeInTheDocument();
+    });
+
+    it('offers Bambu Studio when the preferred desktop slicer is OrcaSlicer', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () => {
+          return HttpResponse.json({ preferred_slicer: 'orcaslicer' });
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Open in Slicer' })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in Bambu Studio')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Open in OrcaSlicer')).not.toBeInTheDocument();
+    });
+
+    it('closes the split dropdown on Escape without closing the modal', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Open in Slicer' })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+      await waitFor(() => {
+        expect(screen.getByRole('menu')).toBeInTheDocument();
+      });
+
+      fireEvent.keyDown(document, { key: 'Escape' });
+
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+      expect(mockOnClose).not.toHaveBeenCalled();
+    });
+
+    it('closes the split dropdown on an outside click without closing the modal', async () => {
+      render(
+        <ModelViewerModal
+          archiveId={1}
+          title="Test Model"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Open in Slicer' })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+      await waitFor(() => {
+        expect(screen.getByRole('menu')).toBeInTheDocument();
+      });
+
+      fireEvent.mouseDown(document.body);
+
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+      expect(mockOnClose).not.toHaveBeenCalled();
+    });
+
+    it('does not render a split chevron when the file cannot open in a slicer', async () => {
+      render(
+        <ModelViewerModal
+          libraryFileId={1}
+          title="Model.gcode"
+          fileType="gcode"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Open in Slicer' })).toBeDisabled();
+      });
+
+      expect(screen.queryByRole('button', { name: 'More slicer options' })).not.toBeInTheDocument();
+    });
+
+    it('offers the desktop handoff for an STL library file', async () => {
+      render(
+        <ModelViewerModal
+          libraryFileId={1}
+          title="Model.stl"
+          fileType="stl"
+          onClose={mockOnClose}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Open in Slicer' })).toBeEnabled();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in OrcaSlicer')).toBeInTheDocument();
+      });
+    });
+
+    it('offers the split Slice button for an STL when the slicer API is enabled', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () => {
+          return HttpResponse.json({ use_slicer_api: true });
+        })
+      );
+
+      render(
+        <ModelViewerModal
+          libraryFileId={1}
+          title="Model.stl"
+          fileType="stl"
+          onClose={mockOnClose}
+          onSliceWithBambuddy={vi.fn()}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Slice' })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'More slicer options' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Open in Bambu Studio')).toBeInTheDocument();
+        expect(screen.getByText('Open in OrcaSlicer')).toBeInTheDocument();
+      });
+    });
+  });
+});

@@ -1,0 +1,598 @@
+"""API routes for GitHub profile backup."""
+
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import delete, desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.app.core.auth import RequirePermissionIfAuthEnabled
+from backend.app.core.database import get_db
+from backend.app.core.permissions import Permission
+from backend.app.models.github_backup import GitHubBackupConfig, GitHubBackupLog
+from backend.app.models.user import User
+from backend.app.schemas.github_backup import (
+    REF_PATTERN,
+    CloudAccountCounts,
+    GitHubBackupConfigCreate,
+    GitHubBackupConfigResponse,
+    GitHubBackupConfigUpdate,
+    GitHubBackupLogResponse,
+    GitHubBackupStatus,
+    GitHubBackupTriggerResponse,
+    GitHubCommitListResponse,
+    GitHubRestorePreview,
+    GitHubRestoreRequest,
+    GitHubRestoreResponse,
+    GitHubTestConnectionResponse,
+    ProviderType,
+    RestoreCategory,
+)
+from backend.app.services.github_backup import github_backup_service
+from backend.app.services.github_restore import github_restore_service
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/github-backup", tags=["github-backup"])
+
+
+_PUBLIC_REPO_ERROR = (
+    "Refusing to save: the target repository is not private. Bambuddy backups "
+    "include MQTT credentials, Home Assistant tokens, Prometheus tokens, your "
+    "Bambu Cloud email, the printer access codes via K-profiles, and other "
+    "settings that must not be exposed publicly. Make the repository private "
+    "in your provider's UI and try again."
+)
+_UNKNOWN_VISIBILITY_ERROR = (
+    "Refusing to save: could not confirm the target repository is private. "
+    "Bambuddy backups contain credentials and must never go to a public or "
+    "internal-visibility repository. Verify the URL, the access token's scope, "
+    "and that your provider exposes the 'private' / 'visibility' field on its "
+    "repo API."
+)
+
+# The permission that owns each category's rows, required on top of
+# github:restore. Backup is its own permission group, so without this a role
+# holding only Backup writes — via a restore — rows it cannot write through the
+# endpoint that owns them.
+#
+# Each entry is the permission that endpoint actually gates its writes on:
+#
+#   * SETTINGS   → PUT /api/v1/settings/ (settings:update)
+#   * SPOOLS     → POST/PATCH /api/v1/inventory/spools (inventory:update). Spool
+#     rows and their usage history both restore under this category.
+#   * ARCHIVES   → archives:update_all, not archives:create. A restore writes
+#     rows owned by other users — that is the whole point of carrying
+#     created_by_id — and update_all is the permission that means "may write an
+#     archive that is not yours". create alone would let an operator with
+#     archives:create_own-shaped access seed history onto someone else.
+#   * KPROFILES  → POST /api/v1/printers/{id}/kprofiles (kprofiles:update),
+#     which is what the restore ultimately calls through set_kprofiles_batch.
+#
+# Cloud profiles are absent because they are not a restorable category
+# (RestoreCategory's docstring).
+_CATEGORY_WRITE_PERMISSION = {
+    RestoreCategory.SETTINGS: Permission.SETTINGS_UPDATE,
+    RestoreCategory.SPOOLS: Permission.INVENTORY_UPDATE,
+    RestoreCategory.ARCHIVES: Permission.ARCHIVES_UPDATE_ALL,
+    RestoreCategory.KPROFILES: Permission.KPROFILES_UPDATE,
+}
+
+
+async def _enforce_private_repo(repo_url: str, token: str, provider: str) -> None:
+    """Run a test_connection and refuse if the repo is not confirmed private.
+
+    Used by POST and PATCH /config so a backup configuration can never be
+    saved against a public repository.
+
+    The URL is policy-checked first: the Gitea and Forgejo backends derive
+    their API base from this value (``get_api_base``) and then request it with
+    the supplied token, so an unchecked repository_url is an outbound fetch to
+    an operator-supplied host. A self-hosted Gitea on the LAN is the normal
+    case, so the LAN-service tier applies — this only rules out the targets
+    that are wrong under any topology.
+    """
+    from backend.app.api.routes._url_safety import assert_safe_lan_service_url
+
+    try:
+        assert_safe_lan_service_url(repo_url, label="Repository URL")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    result = await github_backup_service.test_connection(repo_url, token, provider=provider)
+    if not result.get("success"):
+        message = result.get("message") or "Connection test failed"
+        raise HTTPException(status_code=400, detail=f"Cannot verify repository: {message}")
+    is_private = result.get("is_private")
+    if is_private is None:
+        raise HTTPException(status_code=400, detail=_UNKNOWN_VISIBILITY_ERROR)
+    if is_private is False:
+        raise HTTPException(status_code=400, detail=_PUBLIC_REPO_ERROR)
+
+
+async def _count_cloud_accounts(db: AsyncSession) -> tuple[int, int]:
+    """How many Bambu / Orca accounts a backup would collect from.
+
+    Asks the collector itself rather than re-deriving the rule, so the number
+    the UI gates on can't drift from the number the backup actually uses
+    (#2717). Counts only — never who.
+    """
+    try:
+        bambu, orca = await github_backup_service.cloud_accounts(db)
+        return len(bambu), len(orca)
+    except Exception:
+        # A settings page must still render when a credential store is
+        # unreadable; the toggle simply shows as unavailable.
+        logger.warning("Failed to count connected cloud accounts", exc_info=True)
+        return 0, 0
+
+
+@router.get("/cloud-accounts", response_model=CloudAccountCounts)
+async def get_cloud_accounts(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """How many cloud accounts the Cloud Profiles category would collect from.
+
+    Its own endpoint rather than a field on ``/config``, because the settings
+    form needs this before any config exists — ``/config`` answers ``null``
+    until the first save, which would leave the toggle disabled during the
+    very setup it's part of.
+    """
+    bambu, orca = await _count_cloud_accounts(db)
+    return CloudAccountCounts(bambu=bambu, orca=orca)
+
+
+def _config_to_response(config: GitHubBackupConfig) -> dict:
+    """Convert config model to response dict."""
+    return {
+        "id": config.id,
+        "repository_url": config.repository_url,
+        "has_token": bool(config.access_token),
+        "branch": config.branch,
+        "provider": config.provider,
+        "allow_insecure_http": config.allow_insecure_http,
+        "schedule_enabled": config.schedule_enabled,
+        "schedule_type": config.schedule_type,
+        "backup_kprofiles": config.backup_kprofiles,
+        "backup_cloud_profiles": config.backup_cloud_profiles,
+        "backup_settings": config.backup_settings,
+        "backup_spools": config.backup_spools,
+        "backup_archives": config.backup_archives,
+        "enabled": config.enabled,
+        "last_backup_at": config.last_backup_at,
+        "last_backup_status": config.last_backup_status,
+        "last_backup_message": config.last_backup_message,
+        "last_backup_commit_sha": config.last_backup_commit_sha,
+        "next_scheduled_run": config.next_scheduled_run,
+        "created_at": config.created_at,
+        "updated_at": config.updated_at,
+    }
+
+
+@router.get("/config", response_model=GitHubBackupConfigResponse | None)
+async def get_config(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Get the current GitHub backup configuration."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        return None
+
+    return _config_to_response(config)
+
+
+@router.post("/config", response_model=GitHubBackupConfigResponse)
+async def save_config(
+    config_data: GitHubBackupConfigCreate,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Create or update GitHub backup configuration.
+
+    Only one configuration is supported. If one exists, it will be updated.
+    The target repository must be private — Bambuddy backups carry MQTT
+    credentials, HA/Prometheus tokens, the Bambu Cloud email, and printer
+    access codes (via K-profiles), so a public repo is a hard reject.
+    """
+    await _enforce_private_repo(
+        config_data.repository_url,
+        config_data.access_token,
+        config_data.provider.value,
+    )
+
+    # Check for existing config
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if config:
+        # Update existing
+        config.repository_url = config_data.repository_url
+        config.access_token = config_data.access_token
+        config.branch = config_data.branch
+        config.provider = config_data.provider.value
+        config.schedule_enabled = config_data.schedule_enabled
+        config.schedule_type = config_data.schedule_type.value
+        config.backup_kprofiles = config_data.backup_kprofiles
+        config.backup_cloud_profiles = config_data.backup_cloud_profiles
+        config.backup_settings = config_data.backup_settings
+        config.backup_spools = config_data.backup_spools
+        config.backup_archives = config_data.backup_archives
+        config.allow_insecure_http = config_data.allow_insecure_http
+        config.enabled = config_data.enabled
+
+        # Calculate next scheduled run if enabled
+        if config.schedule_enabled:
+            config.next_scheduled_run = github_backup_service.calculate_next_run(config.schedule_type)
+        else:
+            config.next_scheduled_run = None
+
+        logger.info("Updated GitHub backup config: %s", config.repository_url)
+    else:
+        # Create new
+        config = GitHubBackupConfig(
+            repository_url=config_data.repository_url,
+            access_token=config_data.access_token,
+            branch=config_data.branch,
+            provider=config_data.provider.value,
+            schedule_enabled=config_data.schedule_enabled,
+            schedule_type=config_data.schedule_type.value,
+            backup_kprofiles=config_data.backup_kprofiles,
+            backup_cloud_profiles=config_data.backup_cloud_profiles,
+            backup_settings=config_data.backup_settings,
+            backup_spools=config_data.backup_spools,
+            backup_archives=config_data.backup_archives,
+            allow_insecure_http=config_data.allow_insecure_http,
+            enabled=config_data.enabled,
+        )
+
+        if config.schedule_enabled:
+            config.next_scheduled_run = github_backup_service.calculate_next_run(config.schedule_type)
+
+        db.add(config)
+        logger.info("Created GitHub backup config: %s", config.repository_url)
+
+    await db.commit()
+    await db.refresh(config)
+
+    return _config_to_response(config)
+
+
+@router.patch("/config", response_model=GitHubBackupConfigResponse)
+async def update_config(
+    update_data: GitHubBackupConfigUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Partially update GitHub backup configuration."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found")
+
+    update_dict = update_data.model_dump(exclude_unset=True)
+
+    # Validate HTTP URL restriction when the URL policy is being changed. This avoids blocking unrelated autosaves
+    # for legacy configs that already contain an HTTP URL.
+    if "repository_url" in update_dict or "allow_insecure_http" in update_dict:
+        url_to_check = update_dict.get("repository_url", config.repository_url)
+        effective_allow_http = update_dict.get("allow_insecure_http", config.allow_insecure_http)
+        if url_to_check and url_to_check.startswith("http://") and not effective_allow_http:
+            raise HTTPException(
+                status_code=422,
+                detail="This URL uses HTTP instead of HTTPS. Enable 'Allow insecure HTTP' if your instance does not use TLS.",
+            )
+
+    # Re-verify the repo is private whenever the target changes — new URL,
+    # new token, or new provider. We DON'T re-test on every unrelated PATCH
+    # (e.g. toggling backup_archives) so flipping schedule settings doesn't
+    # round-trip a live API call.
+    target_changed = "repository_url" in update_dict or "access_token" in update_dict or "provider" in update_dict
+    if target_changed:
+        provider_value = update_dict.get("provider", config.provider)
+        if hasattr(provider_value, "value"):
+            provider_value = provider_value.value
+        await _enforce_private_repo(
+            update_dict.get("repository_url", config.repository_url),
+            update_dict.get("access_token", config.access_token),
+            provider_value,
+        )
+
+    for key, value in update_dict.items():
+        if key in ("schedule_type", "provider") and value is not None:
+            setattr(config, key, value.value)
+        else:
+            setattr(config, key, value)
+
+    # Recalculate next scheduled run if schedule settings changed
+    if "schedule_enabled" in update_dict or "schedule_type" in update_dict:
+        if config.schedule_enabled:
+            config.next_scheduled_run = github_backup_service.calculate_next_run(config.schedule_type)
+        else:
+            config.next_scheduled_run = None
+
+    await db.commit()
+    await db.refresh(config)
+
+    logger.info("Updated GitHub backup config: %s", config.repository_url)
+
+    return _config_to_response(config)
+
+
+@router.delete("/config")
+async def delete_config(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Delete the GitHub backup configuration and all logs."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found")
+
+    await db.delete(config)
+    await db.commit()
+
+    logger.info("Deleted GitHub backup config")
+
+    return {"message": "Configuration deleted"}
+
+
+@router.post("/test", response_model=GitHubTestConnectionResponse)
+async def test_connection(
+    repo_url: str = Query(..., description="Repository URL"),
+    token: str = Query(..., description="Personal Access Token"),
+    provider: ProviderType = Query(default=ProviderType.GITHUB, description="Git provider key"),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Test Git provider connection with provided credentials."""
+    result = await github_backup_service.test_connection(repo_url, token, provider=provider)
+    return GitHubTestConnectionResponse(**result)
+
+
+@router.post("/test-stored", response_model=GitHubTestConnectionResponse)
+async def test_stored_connection(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Test GitHub connection using stored configuration."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found")
+
+    if not config.access_token:
+        raise HTTPException(status_code=400, detail="No access token configured")
+
+    test_result = await github_backup_service.test_connection(
+        config.repository_url,
+        config.access_token,
+        provider=config.provider,
+    )
+    return GitHubTestConnectionResponse(**test_result)
+
+
+@router.post("/run", response_model=GitHubBackupTriggerResponse)
+async def trigger_backup(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Manually trigger a backup."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found. Configure backup first.")
+
+    if not config.enabled:
+        raise HTTPException(status_code=400, detail="Backup is disabled")
+
+    backup_result = await github_backup_service.run_backup(config.id, trigger="manual")
+
+    return GitHubBackupTriggerResponse(**backup_result)
+
+
+@router.get("/status", response_model=GitHubBackupStatus)
+async def get_status(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Get current backup status."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        return GitHubBackupStatus(
+            configured=False,
+            enabled=False,
+            is_running=False,
+            progress=None,
+            last_backup_at=None,
+            last_backup_status=None,
+            next_scheduled_run=None,
+        )
+
+    return GitHubBackupStatus(
+        configured=True,
+        enabled=config.enabled,
+        is_running=github_backup_service.is_running,
+        restore_running=github_restore_service.is_running,
+        progress=github_backup_service.progress or github_restore_service.progress,
+        last_backup_at=config.last_backup_at,
+        last_backup_status=config.last_backup_status,
+        next_scheduled_run=config.next_scheduled_run,
+    )
+
+
+@router.get("/commits", response_model=GitHubCommitListResponse)
+async def list_commits(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_RESTORE),
+):
+    """List recent backup commits so the user can pick one to restore from."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found. Configure backup first.")
+
+    commit_result = await github_restore_service.list_commits(config, limit=limit)
+    return GitHubCommitListResponse(**commit_result)
+
+
+@router.get("/restore/preview", response_model=GitHubRestorePreview)
+async def preview_restore(
+    ref: str = Query(default="HEAD", pattern=REF_PATTERN),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_RESTORE),
+):
+    """Report which categories a given backup commit contains."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found. Configure backup first.")
+
+    preview = await github_restore_service.preview(db, config, ref=ref)
+    return GitHubRestorePreview(**preview)
+
+
+@router.post("/restore", response_model=GitHubRestoreResponse)
+async def restore_backup(
+    request: GitHubRestoreRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_RESTORE),
+):
+    """Restore selected categories from one backup commit.
+
+    Note there is no private-repo gate here, unlike the config endpoints: that
+    check exists to stop credentials leaving the instance, and this path only
+    reads. A config can only be saved against a private repo anyway.
+
+    Every category needs the permission that owns the rows it writes, on top of
+    ``github:restore`` — see ``_CATEGORY_WRITE_PERMISSION`` and the check below.
+    """
+    if current_user is not None:
+        # Each category rewrites rows some other endpoint already owns, and
+        # Backup is its own permission group — so a role holding only Backup
+        # could otherwise write, through a restore, what it cannot write through
+        # the endpoint that owns them. This module already makes that argument;
+        # it is why the four protected auth keys are refused outright.
+        #
+        # current_user is None only when auth is disabled: github:restore is in
+        # _APIKEY_DENIED_PERMISSIONS, so an API key never gets past the
+        # dependency to reach this line.
+        missing = sorted(
+            {
+                permission.value
+                for category, permission in _CATEGORY_WRITE_PERMISSION.items()
+                if category in request.categories and not current_user.has_all_permissions(permission.value)
+            }
+        )
+        if missing:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing required permissions: {', '.join(missing)}",
+            )
+
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found. Configure backup first.")
+
+    restore_result = await github_restore_service.run_restore(
+        config.id,
+        ref=request.ref,
+        categories=request.categories,
+        overwrite_existing=request.overwrite_existing,
+    )
+    return GitHubRestoreResponse(**restore_result)
+
+
+@router.get("/logs", response_model=list[GitHubBackupLogResponse])
+async def get_logs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Get backup logs."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        return []
+
+    logs_result = await db.execute(
+        select(GitHubBackupLog)
+        .where(GitHubBackupLog.config_id == config.id)
+        .order_by(desc(GitHubBackupLog.started_at))
+        .offset(offset)
+        .limit(limit)
+    )
+    logs = logs_result.scalars().all()
+
+    return [
+        GitHubBackupLogResponse(
+            id=log.id,
+            config_id=log.config_id,
+            started_at=log.started_at,
+            completed_at=log.completed_at,
+            status=log.status,
+            trigger=log.trigger,
+            commit_sha=log.commit_sha,
+            files_changed=log.files_changed,
+            error_message=log.error_message,
+        )
+        for log in logs
+    ]
+
+
+@router.delete("/logs")
+async def clear_logs(
+    keep_last: int = Query(default=10, ge=0, le=100, description="Number of recent logs to keep"),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
+):
+    """Clear backup logs, optionally keeping the most recent entries."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        return {"deleted": 0, "message": "No configuration found"}
+
+    if keep_last > 0:
+        # Get IDs to keep
+        keep_result = await db.execute(
+            select(GitHubBackupLog.id)
+            .where(GitHubBackupLog.config_id == config.id)
+            .order_by(desc(GitHubBackupLog.started_at))
+            .limit(keep_last)
+        )
+        keep_ids = [row[0] for row in keep_result.fetchall()]
+
+        if keep_ids:
+            delete_result = await db.execute(
+                delete(GitHubBackupLog).where(
+                    GitHubBackupLog.config_id == config.id, GitHubBackupLog.id.not_in(keep_ids)
+                )
+            )
+        else:
+            delete_result = await db.execute(delete(GitHubBackupLog).where(GitHubBackupLog.config_id == config.id))
+    else:
+        delete_result = await db.execute(delete(GitHubBackupLog).where(GitHubBackupLog.config_id == config.id))
+
+    await db.commit()
+
+    deleted_count = delete_result.rowcount
+    logger.info("Deleted %s GitHub backup logs (kept %s)", deleted_count, keep_last)
+
+    return {"deleted": deleted_count, "message": f"Deleted {deleted_count} logs"}

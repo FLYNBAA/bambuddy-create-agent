@@ -1,0 +1,1386 @@
+/**
+ * Tests for the FileManagerPage component.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { render } from '../utils';
+import { FileManagerPage } from '../../pages/FileManagerPage';
+import { openInSlicer } from '../../utils/slicer';
+import { setAuthToken } from '../../api/client';
+import { http, HttpResponse } from 'msw';
+import { server } from '../mocks/server';
+
+// Only the protocol-handler launch is stubbed — it would navigate the jsdom
+// window. Everything else in the module is a pure predicate, so keep the real
+// implementations: isSliceableFilename decides which rows even offer the
+// action these tests click.
+vi.mock('../../utils/slicer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/slicer')>()),
+  openInSlicer: vi.fn(),
+}));
+
+vi.mock('../../components/SliceModal', () => ({
+  SliceModal: ({ source }: { source: { filename: string } }) => (
+    <div data-testid="slice-modal">{source.filename}</div>
+  ),
+}));
+
+// Mock data
+const mockFolders = [
+  {
+    id: 1,
+    name: 'Functional Parts',
+    parent_id: null,
+    file_count: 5,
+    project_id: null,
+    archive_id: null,
+    project_name: null,
+    archive_name: null,
+    // #2680: distinctive year so the folder-pane display test can assert on it
+    // without colliding with the file mtimes below.
+    latest_activity_at: '2031-04-05T10:00:00Z',
+    children: [
+      {
+        id: 2,
+        name: 'Brackets',
+        parent_id: 1,
+        file_count: 3,
+        project_id: null,
+        archive_id: null,
+        project_name: null,
+        archive_name: null,
+        latest_activity_at: '2032-06-07T10:00:00Z',
+        children: [],
+      },
+    ],
+  },
+  {
+    id: 3,
+    name: 'Art Projects',
+    parent_id: null,
+    file_count: 2,
+    project_id: 1,
+    archive_id: null,
+    project_name: 'My Art Project',
+    archive_name: null,
+    // No activity timestamp — must render no date line rather than an
+    // "Invalid Date" placeholder.
+    latest_activity_at: null,
+    children: [],
+  },
+];
+
+const mockFiles = [
+  {
+    id: 1,
+    filename: 'benchy.gcode.3mf',
+    file_path: '/library/benchy.gcode.3mf',
+    file_size: 1048576,
+    file_type: '3mf',
+    folder_id: null,
+    thumbnail_path: '/thumbnails/1.png',
+    print_name: 'Benchy',
+    print_time_seconds: 3600,
+    print_count: 5,
+    duplicate_count: 0,
+    created_at: '2024-01-01T00:00:00Z',
+    // #2680: real on-disk mtime in a distinctive year so the display test can
+    // prove fs_modified_at is preferred over created_at (2024).
+    fs_modified_at: '2030-06-15T12:00:00Z',
+  },
+  {
+    id: 2,
+    filename: 'bracket.stl',
+    file_path: '/library/bracket.stl',
+    file_size: 524288,
+    file_type: 'stl',
+    folder_id: null,
+    thumbnail_path: null,
+    print_name: null,
+    print_time_seconds: null,
+    print_count: 0,
+    duplicate_count: 2,
+    created_at: '2024-01-02T00:00:00Z',
+  },
+  {
+    id: 3,
+    filename: 'cube.gcode.3mf',
+    file_path: '/library/cube.gcode.3mf',
+    file_size: 2048576,
+    file_type: '3mf',
+    folder_id: null,
+    thumbnail_path: '/thumbnails/3.png',
+    print_name: 'Cube',
+    print_time_seconds: 1800,
+    print_count: 2,
+    duplicate_count: 0,
+    created_at: '2024-01-03T00:00:00Z',
+  },
+];
+
+const mockStats = {
+  total_files: 10,
+  total_folders: 3,
+  total_size_bytes: 104857600,
+  disk_free_bytes: 10737418240,
+  disk_total_bytes: 107374182400,
+};
+
+describe('FileManagerPage', () => {
+  beforeEach(() => {
+    // Clear localStorage to ensure consistent view mode
+    localStorage.clear();
+
+    server.use(
+      http.get('/api/v1/library/folders', () => {
+        return HttpResponse.json(mockFolders);
+      }),
+      http.get('/api/v1/library/files', () => {
+        return HttpResponse.json(mockFiles);
+      }),
+      http.get('/api/v1/library/stats', () => {
+        return HttpResponse.json(mockStats);
+      }),
+      http.get('/api/v1/settings/', () => {
+        return HttpResponse.json({
+          check_updates: false,
+          check_printer_firmware: false,
+          library_disk_warning_gb: 5,
+        });
+      }),
+      http.post('/api/v1/library/folders', async ({ request }) => {
+        const body = await request.json() as { name: string };
+        return HttpResponse.json({ id: 4, name: body.name, parent_id: null, children: [] });
+      }),
+      http.delete('/api/v1/library/folders/:id', () => {
+        return HttpResponse.json({ success: true });
+      }),
+      http.delete('/api/v1/library/files/:id', () => {
+        return HttpResponse.json({ success: true });
+      }),
+      http.post('/api/v1/library/files/move', () => {
+        return HttpResponse.json({ success: true });
+      }),
+      http.post('/api/v1/library/files/add-to-queue', () => {
+        return HttpResponse.json({ added: [{ file_id: 1, queue_id: 1 }], errors: [] });
+      }),
+      http.get('/api/v1/projects/', () => {
+        return HttpResponse.json([{ id: 1, name: 'Test Project', color: '#00ae42' }]);
+      }),
+      http.get('/api/v1/archives/', () => {
+        return HttpResponse.json([{ id: 1, print_name: 'Test Archive', filename: 'test.3mf' }]);
+      })
+    );
+  });
+
+  describe('rendering', () => {
+    it('renders the page title', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('File Manager')).toBeInTheDocument();
+      });
+    });
+
+    it('renders the page description', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Organize and manage your print files')).toBeInTheDocument();
+      });
+    });
+
+    it('shows New Folder button', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('New Folder')).toBeInTheDocument();
+      });
+    });
+
+    it('shows Upload button', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('stats display', () => {
+    it('shows file count', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Files:')).toBeInTheDocument();
+        expect(screen.getByText('10')).toBeInTheDocument();
+      });
+    });
+
+    it('shows folder count', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Folders:')).toBeInTheDocument();
+        // Folder count appears multiple places, just verify the label is present
+        const foldersLabel = screen.getByText('Folders:');
+        expect(foldersLabel.nextElementSibling?.textContent).toBe('3');
+      });
+    });
+
+    it('shows total size', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Size:')).toBeInTheDocument();
+        expect(screen.getByText('100.0 MB')).toBeInTheDocument();
+      });
+    });
+
+    it('shows free space', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Free:')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('folder sidebar', () => {
+    it('shows All Files option', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('All Files')).toBeInTheDocument();
+      });
+    });
+
+    it('shows folder tree', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Functional Parts')).toBeInTheDocument();
+        expect(screen.getByText('Art Projects')).toBeInTheDocument();
+      });
+    });
+
+    it('shows nested folders', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Brackets')).toBeInTheDocument();
+      });
+    });
+
+    it('shows linked folder indicator', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        // Art Projects has a project_id
+        expect(screen.getByText('Art Projects')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('file display', () => {
+    it('shows files in grid', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Benchy')).toBeInTheDocument();
+      });
+    });
+
+    it('shows file type badges', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        // File type badges show uppercase type
+        expect(screen.getAllByText('3MF').length).toBeGreaterThan(0);
+        expect(screen.getAllByText('STL').length).toBeGreaterThan(0);
+      });
+    });
+
+    it('shows print count', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Printed 5x')).toBeInTheDocument();
+      });
+    });
+
+    it('shows duplicate badge', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        // Duplicate badge shows count, there may be multiple "2"s on the page
+        // so we check that at least one element with "2" exists
+        const elements = screen.getAllByText('2');
+        expect(elements.length).toBeGreaterThan(0);
+      });
+    });
+  });
+
+  describe('view modes', () => {
+    it('has grid view button', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Grid view')).toBeInTheDocument();
+      });
+    });
+
+    it('has list view button', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle('List view')).toBeInTheDocument();
+      });
+    });
+
+    it('can switch to list view', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      // Wait for files to load first
+      await waitFor(() => {
+        expect(screen.getByText('Benchy')).toBeInTheDocument();
+      });
+
+      // Both view mode buttons should be present and clickable
+      const gridButton = screen.getByTitle('Grid view');
+      const listButton = screen.getByTitle('List view');
+
+      expect(gridButton).toBeInTheDocument();
+      expect(listButton).toBeInTheDocument();
+
+      // Click list view button - verify no errors occur
+      await user.click(listButton);
+
+      // Clicking grid button should also work
+      await user.click(gridButton);
+
+      // Verify files are still displayed after toggling
+      expect(screen.getByText('Benchy')).toBeInTheDocument();
+    });
+  });
+
+  describe('search and filter', () => {
+    it('has search input', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText('Search files...')).toBeInTheDocument();
+      });
+    });
+
+    it('has type filter', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('All types')).toBeInTheDocument();
+      });
+    });
+
+    it('has sort options', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        // Sort dropdown should show Name as default option (persisted to localStorage)
+        expect(screen.getByDisplayValue('Name')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('selection', () => {
+    it('shows select all button', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Select All')).toBeInTheDocument();
+      });
+    });
+
+    it('can select files', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Benchy')).toBeInTheDocument();
+      });
+
+      // Click on the file card to select it
+      const fileCard = screen.getByText('Benchy').closest('div[class*="cursor-pointer"]');
+      if (fileCard) {
+        await user.click(fileCard);
+      }
+
+      await waitFor(() => {
+        expect(screen.getByText('1 selected')).toBeInTheDocument();
+      });
+    });
+
+    it('shows bulk actions when files selected', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Select All')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Select All'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Move')).toBeInTheDocument();
+        expect(screen.getByText('Delete')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('new folder modal', () => {
+    it('opens new folder modal', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('New Folder')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('New Folder'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Folder Name')).toBeInTheDocument();
+        expect(screen.getByPlaceholderText('e.g., Functional Parts')).toBeInTheDocument();
+      });
+    });
+
+    it('can create a folder', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('New Folder')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('New Folder'));
+
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText('e.g., Functional Parts')).toBeInTheDocument();
+      });
+
+      const input = screen.getByPlaceholderText('e.g., Functional Parts');
+      await user.type(input, 'My New Folder');
+
+      const createButton = screen.getByRole('button', { name: 'Create' });
+      await user.click(createButton);
+
+      // Modal should close after creation
+      await waitFor(() => {
+        expect(screen.queryByText('Folder Name')).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('empty state', () => {
+    it('shows empty state when no files', async () => {
+      server.use(
+        http.get('/api/v1/library/files', () => {
+          return HttpResponse.json([]);
+        })
+      );
+
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('No files yet')).toBeInTheDocument();
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('bulk-action print button', () => {
+    // PR #1625 consolidated print actions: the old single-file-selected
+    // "Schedule" button now opens the unified PrintModal (which carries
+    // schedule options inside). The bulk-action toolbar shows a single
+    // "Print" button only when exactly one sliced file is selected, and
+    // hides it for multi-selection. The button is targeted by its accessible
+    // name ("Print") + role to disambiguate from the file-card dropdown's
+    // own Print entry, which stays collapsed unless its kebab is opened.
+    it('shows a Print button in the bulk toolbar when one sliced file is selected', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Benchy')).toBeInTheDocument();
+      });
+
+      // Select a sliced file (benchy.gcode.3mf) by clicking on its card
+      const fileCard = screen.getByText('Benchy').closest('div[class*="cursor-pointer"]');
+      if (fileCard) {
+        await user.click(fileCard);
+      }
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: /^Print$/ })).toBeInTheDocument();
+      });
+    });
+
+    it('hides the bulk Print button when multiple files are selected', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Select All')).toBeInTheDocument();
+      });
+
+      // Select all files
+      await user.click(screen.getByText('Select All'));
+
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: /^Print$/ })).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('STL thumbnail generation', () => {
+    it('shows Generate Thumbnails button', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Generate Thumbnails')).toBeInTheDocument();
+      });
+    });
+
+    it('Generate Thumbnails button has correct title', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        const button = screen.getByTitle('Generate thumbnails for STL files missing them');
+        expect(button).toBeInTheDocument();
+      });
+    });
+
+    it('can click Generate Thumbnails button', async () => {
+      const user = userEvent.setup();
+
+      server.use(
+        http.post('/api/v1/library/generate-stl-thumbnails', () => {
+          return HttpResponse.json({
+            processed: 1,
+            succeeded: 1,
+            failed: 0,
+            results: [{ file_id: 2, success: true }],
+          });
+        })
+      );
+
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Generate Thumbnails')).toBeInTheDocument();
+      });
+
+      const button = screen.getByText('Generate Thumbnails');
+      await user.click(button);
+
+      // Button should work without error
+      await waitFor(() => {
+        expect(screen.getByText('Generate Thumbnails')).toBeInTheDocument();
+      });
+    });
+
+    it('shows STL file without thumbnail in file list', async () => {
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        // bracket.stl has no thumbnail_path
+        expect(screen.getByText('bracket.stl')).toBeInTheDocument();
+        expect(screen.getAllByText('STL').length).toBeGreaterThan(0);
+      });
+    });
+  });
+
+  describe('upload modal (FileUploadModal)', () => {
+    it('opens upload modal when Upload button is clicked', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Upload'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+        expect(screen.getByText(/Drag & drop/)).toBeInTheDocument();
+      });
+    });
+
+    it('closes upload modal when Cancel is clicked', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Upload'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Upload Files')).not.toBeInTheDocument();
+      });
+    });
+
+    it('shows 3MF extraction info when 3MF file is added', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Upload'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+
+      const threemfFile = new File(['content'], 'model.gcode.3mf', { type: 'application/octet-stream' });
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      expect(fileInput).toBeInTheDocument();
+
+      await user.upload(fileInput, threemfFile);
+
+      await waitFor(() => {
+        expect(screen.getByText('3MF files detected')).toBeInTheDocument();
+        expect(screen.getByText(/Printer model.*will be automatically extracted/i)).toBeInTheDocument();
+      });
+    });
+
+    it('shows STL thumbnail option when STL file is added', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Upload'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+
+      const stlFile = new File(['solid test'], 'model.stl', { type: 'application/sla' });
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      expect(fileInput).toBeInTheDocument();
+
+      await user.upload(fileInput, stlFile);
+
+      await waitFor(() => {
+        expect(screen.getByText('STL thumbnail generation')).toBeInTheDocument();
+        expect(screen.getByText(/Thumbnails can be generated/i)).toBeInTheDocument();
+      });
+    });
+
+    it('shows ZIP options when ZIP file is added', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Upload'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+
+      const zipFile = new File(['pk'], 'models.zip', { type: 'application/zip' });
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      await user.upload(fileInput, zipFile);
+
+      await waitFor(() => {
+        expect(screen.getByText('ZIP files detected')).toBeInTheDocument();
+        expect(screen.getByText(/Preserve folder structure/)).toBeInTheDocument();
+      });
+    });
+
+    it('can add a file via the file input', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Upload'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+
+      const file = new File(['content'], 'model.3mf', { type: 'application/octet-stream' });
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      await user.upload(fileInput, file);
+
+      await waitFor(() => {
+        expect(screen.getByText('model.3mf')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Upload \(1\)/i })).toBeInTheDocument();
+      });
+    });
+
+    it('uploads file and refreshes file list', async () => {
+      server.use(
+        http.post('/api/v1/library/files', () => {
+          return HttpResponse.json({
+            id: 10,
+            filename: 'uploaded.3mf',
+            file_type: '3mf',
+            file_size: 1024,
+            thumbnail_path: null,
+            duplicate_of: null,
+            metadata: null,
+          });
+        })
+      );
+
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Upload'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Upload Files')).toBeInTheDocument();
+      });
+
+      const file = new File(['content'], 'uploaded.3mf', { type: 'application/octet-stream' });
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      await user.upload(fileInput, file);
+
+      const uploadButton = screen.getByRole('button', { name: /Upload \(1\)/i });
+      await user.click(uploadButton);
+
+      // Modal should auto-close after upload completes
+      await waitFor(() => {
+        expect(screen.queryByText('Upload Files')).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('authentication-based UI changes', () => {
+    it('hides "Uploaded By" column and user filter when auth is disabled', async () => {
+      // Mock auth disabled (default)
+      server.use(
+        http.get('*/api/v1/auth/status', () => {
+          return HttpResponse.json({
+            auth_enabled: false,
+            requires_setup: false,
+          });
+        }),
+        http.get('/api/v1/library/files', () => {
+          return HttpResponse.json([
+            {
+              id: 1,
+              filename: 'test.3mf',
+              file_path: '/library/test.3mf',
+              file_size: 1048576,
+              file_type: '3mf',
+              folder_id: null,
+              thumbnail_path: null,
+              print_name: 'Test File',
+              print_time_seconds: 3600,
+              print_count: 0,
+              duplicate_count: 0,
+              created_at: '2024-01-01T00:00:00Z',
+              created_by_username: 'testuser',
+            },
+          ]);
+        })
+      );
+
+      render(<FileManagerPage />);
+
+      // Switch to list view to see the column headers
+      await waitFor(() => {
+        expect(screen.getByText('Test File')).toBeInTheDocument();
+      });
+
+      const user = userEvent.setup();
+      const listViewButton = screen.getByRole('button', { name: /list/i });
+      await user.click(listViewButton);
+
+      // "Uploaded By" column header should not be present
+      await waitFor(() => {
+        expect(screen.queryByText('Uploaded By')).not.toBeInTheDocument();
+      });
+
+      // User filter dropdown should not be present
+      expect(screen.queryByPlaceholderText('Filter by user')).not.toBeInTheDocument();
+    });
+
+    it('shows "Uploaded By" column and user filter when auth is enabled', async () => {
+      // Mock auth enabled
+      server.use(
+        http.get('*/api/v1/auth/status', () => {
+          return HttpResponse.json({
+            auth_enabled: true,
+            requires_setup: false,
+          });
+        }),
+        http.get('/api/v1/library/files', () => {
+          return HttpResponse.json([
+            {
+              id: 1,
+              filename: 'test.3mf',
+              file_path: '/library/test.3mf',
+              file_size: 1048576,
+              file_type: '3mf',
+              folder_id: null,
+              thumbnail_path: null,
+              print_name: 'Test File',
+              print_time_seconds: 3600,
+              print_count: 0,
+              duplicate_count: 0,
+              created_at: '2024-01-01T00:00:00Z',
+              created_by_username: 'testuser',
+            },
+          ]);
+        }),
+        http.get('/api/v1/users/', () => {
+          return HttpResponse.json([
+            { id: 1, username: 'testuser' },
+            { id: 2, username: 'admin' },
+          ]);
+        })
+      );
+
+      render(<FileManagerPage />);
+
+      // Switch to list view to see the column headers
+      await waitFor(() => {
+        expect(screen.getByText('Test File')).toBeInTheDocument();
+      });
+
+      const user = userEvent.setup();
+      const listViewButton = screen.getByRole('button', { name: /list/i });
+      await user.click(listViewButton);
+
+      // "Uploaded By" column header should be present
+      await waitFor(() => {
+        expect(screen.getByText('Uploaded By')).toBeInTheDocument();
+      });
+
+      // User filter dropdown should be present
+      expect(screen.getByPlaceholderText('Filter by user')).toBeInTheDocument();
+
+      // Username should be displayed in the column
+      expect(screen.getByText('testuser')).toBeInTheDocument();
+    });
+  });
+
+  describe('folder tree collapse preference (#996)', () => {
+    // localStorage is globally mocked in setup.ts (returns undefined by default),
+    // so we program each test's getItem return value explicitly.
+    const getItemMock = localStorage.getItem as ReturnType<typeof vi.fn>;
+    const setItemMock = localStorage.setItem as ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      getItemMock.mockReset();
+      setItemMock.mockReset();
+    });
+
+    // The mock is module-global, so an implementation left behind here would
+    // silently change every later describe (e.g. collapsing the folder tree).
+    afterEach(() => {
+      getItemMock.mockReset();
+      setItemMock.mockReset();
+    });
+
+    it('defaults to expanded (nested folders visible) when library-collapse-folders is unset', async () => {
+      getItemMock.mockReturnValue(null);
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Functional Parts')).toBeInTheDocument();
+      });
+      expect(screen.getByText('Brackets')).toBeInTheDocument();
+    });
+
+    it('honors library-collapse-folders=true on load (nested folders hidden)', async () => {
+      getItemMock.mockImplementation((key: string) =>
+        key === 'library-collapse-folders' ? 'true' : null
+      );
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Functional Parts')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Brackets')).not.toBeInTheDocument();
+    });
+
+    it('collapses nested folders and persists preference when Collapse is clicked', async () => {
+      getItemMock.mockReturnValue(null);
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Brackets')).toBeInTheDocument();
+      });
+
+      // The Collapse button sits next to Wrap in the sidebar header.
+      // Its text content is "Collapse" (from fileManager.collapse).
+      await user.click(screen.getByRole('button', { name: 'Collapse' }));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Brackets')).not.toBeInTheDocument();
+      });
+      expect(setItemMock).toHaveBeenCalledWith('library-collapse-folders', 'true');
+    });
+
+    it('re-expands nested folders and persists preference when Collapse is toggled off', async () => {
+      getItemMock.mockImplementation((key: string) =>
+        key === 'library-collapse-folders' ? 'true' : null
+      );
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Functional Parts')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Brackets')).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Collapse' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Brackets')).toBeInTheDocument();
+      });
+      expect(setItemMock).toHaveBeenCalledWith('library-collapse-folders', 'false');
+    });
+  });
+
+  describe('Internal / External top-level views (#1621)', () => {
+    const externalMockFolders = [
+      ...mockFolders,
+      {
+        id: 99,
+        name: 'NAS Library',
+        parent_id: null,
+        file_count: 200,
+        project_id: null,
+        archive_id: null,
+        project_name: null,
+        archive_name: null,
+        is_external: true,
+        external_readonly: false,
+        external_path: '/mnt/nas',
+        children: [],
+      },
+    ];
+
+    it('shows the External sidebar entry only when at least one external folder is linked', async () => {
+      // Default mockFolders have no is_external entries → no External row.
+      const { unmount } = render(<FileManagerPage />);
+      await waitFor(() => {
+        expect(screen.getByText('All Files')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('External')).not.toBeInTheDocument();
+      unmount();
+
+      // With an external folder linked, the row appears.
+      server.use(
+        http.get('/api/v1/library/folders', () => HttpResponse.json(externalMockFolders)),
+      );
+      render(<FileManagerPage />);
+      await waitFor(() => {
+        expect(screen.getByText('External')).toBeInTheDocument();
+      });
+    });
+
+    it('sends internal_only=true by default ("All Files" = managed storage only)', async () => {
+      const scopes: string[] = [];
+      server.use(
+        http.get('/api/v1/library/folders', () => HttpResponse.json(externalMockFolders)),
+        http.get('/api/v1/library/files', ({ request }) => {
+          const url = new URL(request.url);
+          scopes.push(
+            url.searchParams.get('internal_only') === 'true'
+              ? 'internal'
+              : url.searchParams.get('external_only') === 'true'
+                ? 'external'
+                : 'all',
+          );
+          return HttpResponse.json(mockFiles);
+        }),
+      );
+
+      render(<FileManagerPage />);
+      await waitFor(() => {
+        expect(scopes).toContain('internal');
+      });
+    });
+
+    it('switches to external_only=true when the External sidebar entry is clicked', async () => {
+      const scopes: string[] = [];
+      server.use(
+        http.get('/api/v1/library/folders', () => HttpResponse.json(externalMockFolders)),
+        http.get('/api/v1/library/files', ({ request }) => {
+          const url = new URL(request.url);
+          scopes.push(
+            url.searchParams.get('internal_only') === 'true'
+              ? 'internal'
+              : url.searchParams.get('external_only') === 'true'
+                ? 'external'
+                : 'all',
+          );
+          return HttpResponse.json([]);
+        }),
+      );
+
+      const { default: userEvent } = await import('@testing-library/user-event');
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+      await waitFor(() => expect(screen.getByText('External')).toBeInTheDocument());
+
+      await user.click(screen.getByText('External'));
+
+      await waitFor(() => {
+        expect(scopes).toContain('external');
+      });
+    });
+  });
+
+  describe('"All Files" view (#1499)', () => {
+    it('requests every file (include_root=false) so subfolder contents are visible', async () => {
+      const rootFile = {
+        id: 10,
+        filename: 'root-file.3mf',
+        file_path: '/library/root-file.3mf',
+        file_size: 1024,
+        file_type: '3mf',
+        folder_id: null,
+        thumbnail_path: null,
+        print_name: 'Root File',
+        print_time_seconds: 0,
+        print_count: 0,
+        duplicate_count: 0,
+        created_at: '2024-01-01T00:00:00Z',
+      };
+      const nestedFile = {
+        ...rootFile,
+        id: 11,
+        filename: 'nested-file.3mf',
+        file_path: '/library/Functional Parts/nested-file.3mf',
+        folder_id: 1,
+        print_name: 'Nested File',
+      };
+
+      const includeRootValues: string[] = [];
+      server.use(
+        http.get('/api/v1/library/files', ({ request }) => {
+          const url = new URL(request.url);
+          const includeRoot = url.searchParams.get('include_root');
+          includeRootValues.push(includeRoot ?? '');
+          // Mirror the backend: include_root=false returns everything; true
+          // returns only files with folder_id IS NULL.
+          if (includeRoot === 'false') {
+            return HttpResponse.json([rootFile, nestedFile]);
+          }
+          return HttpResponse.json([rootFile]);
+        }),
+      );
+
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Root File')).toBeInTheDocument();
+        expect(screen.getByText('Nested File')).toBeInTheDocument();
+      });
+      // Sanity-check: the buggy call would have sent include_root=true here.
+      expect(includeRootValues).toContain('false');
+    });
+  });
+
+  describe('last-modified date display (#2680)', () => {
+    it('is hidden by default and revealed by the toolbar toggle', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Benchy')).toBeInTheDocument();
+      });
+
+      // Hidden by default.
+      expect(screen.queryByText(/2030/)).not.toBeInTheDocument();
+
+      // Toggle on via the toolbar button.
+      await user.click(screen.getByTitle('Show modified dates'));
+
+      // benchy carries fs_modified_at in 2030, which must be preferred over its
+      // created_at (2024) — proving the real on-disk mtime drives the display.
+      await waitFor(() => {
+        expect(screen.getByText(/2030/)).toBeInTheDocument();
+      });
+
+      // Toggling off hides it again.
+      await user.click(screen.getByTitle('Hide modified dates'));
+      await waitFor(() => {
+        expect(screen.queryByText(/2030/)).not.toBeInTheDocument();
+      });
+    });
+
+    it('the same toggle reveals latest activity on folder rows, including nested ones', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Functional Parts')).toBeInTheDocument();
+      });
+
+      expect(screen.queryByText(/2031/)).not.toBeInTheDocument();
+
+      await user.click(screen.getByTitle('Show modified dates'));
+
+      await waitFor(() => {
+        expect(screen.getByText(/2031/)).toBeInTheDocument();
+      });
+      // Nested folders get it too — the prop must survive the recursion.
+      expect(screen.getByText(/2032/)).toBeInTheDocument();
+
+      // A folder with no activity timestamp renders nothing rather than an
+      // "Invalid Date" string.
+      const artRow = screen.getByText('Art Projects').closest('div.group')!;
+      expect(artRow.textContent).not.toMatch(/Invalid/);
+
+      await user.click(screen.getByTitle('Hide modified dates'));
+      await waitFor(() => {
+        expect(screen.queryByText(/2031/)).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('slice action', () => {
+    beforeEach(() => {
+      vi.mocked(openInSlicer).mockClear();
+      server.use(
+        http.post('/api/v1/library/files/:id/slicer-token', () => HttpResponse.json({ token: 'test-token' })),
+      );
+    });
+
+    afterEach(() => {
+      // Permission tests set a token; clear it so it can't leak into the
+      // list-view tests that follow (mirrors FileManagerFolderDelete.test.tsx).
+      setAuthToken(null);
+    });
+
+    const openMenu = async (user: ReturnType<typeof userEvent.setup>, filename: string) => {
+      const card = screen.getByText(filename).closest('.group') as HTMLElement;
+      // Target the kebab (ellipsis) toggle specifically rather than the card's
+      // first button — a button added ahead of the kebab would otherwise
+      // break the menu-opening assumption.
+      const kebab = card.querySelector('.lucide-ellipsis-vertical')?.closest('button') as HTMLButtonElement;
+      await user.click(kebab);
+      return card;
+    };
+
+    it('opens the desktop slicer when the slicer API is disabled', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'bracket.stl');
+      await user.click(within(card).getByText('Slice'));
+
+      await waitFor(() => {
+        expect(openInSlicer).toHaveBeenCalledWith(
+          expect.stringContaining('/library/files/2/dl/test-token/'),
+          'bambu_studio',
+        );
+      });
+    });
+
+    it('opens the in-app SliceModal when the slicer API is enabled', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({ use_slicer_api: true })),
+      );
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'bracket.stl');
+      await user.click(within(card).getByText('Slice'));
+
+      expect(await screen.findByTestId('slice-modal')).toBeInTheDocument();
+      expect(openInSlicer).not.toHaveBeenCalled();
+    });
+
+    it('hides the slice item for already-sliced files', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('Benchy')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'Benchy');
+      expect(within(card).queryByText('Slice')).not.toBeInTheDocument();
+    });
+
+    // Permission gating is the security-relevant half of the slice action: the
+    // in-app API path needs library:upload, and the desktop handoff mirrors the
+    // ownership check the slicer-token endpoint runs — library:read_all or
+    // library:read_own. The legacy library:read is deliberately not accepted;
+    // it satisfies neither the token endpoint nor the folder listing that gets
+    // a user to this page at all.
+    const mockAuthUser = (permissions: string[]) => {
+      setAuthToken('test-token', 'session');
+      server.use(
+        http.get('*/api/v1/auth/status', () =>
+          HttpResponse.json({ auth_enabled: true, requires_setup: false }),
+        ),
+        http.get('*/api/v1/auth/me', () =>
+          HttpResponse.json({
+            id: 7,
+            username: 'operator1',
+            is_admin: false,
+            permissions,
+          }),
+        ),
+        http.get('/api/v1/users/', () => HttpResponse.json([])),
+      );
+    };
+
+    it('disables the Slice menu item without library:upload when the slicer API is enabled', async () => {
+      mockAuthUser([]);
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({ use_slicer_api: true })),
+      );
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'bracket.stl');
+      const sliceItem = within(card).getByText('Slice').closest('button');
+      expect(sliceItem).toBeDisabled();
+
+      await user.click(sliceItem!);
+      expect(openInSlicer).not.toHaveBeenCalled();
+    });
+
+    it('enables the Slice menu item with library:upload when the slicer API is enabled', async () => {
+      mockAuthUser(['library:upload']);
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({ use_slicer_api: true })),
+      );
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'bracket.stl');
+      const sliceItem = within(card).getByText('Slice').closest('button');
+      expect(sliceItem).not.toBeDisabled();
+    });
+
+    it('disables the Slice menu item without any library read permission for the desktop handoff', async () => {
+      mockAuthUser(['library:upload']);
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'bracket.stl');
+      const sliceItem = within(card).getByText('Slice').closest('button');
+      expect(sliceItem).toBeDisabled();
+
+      await user.click(sliceItem!);
+      expect(openInSlicer).not.toHaveBeenCalled();
+    });
+
+    it('enables the Slice menu item with library:read_own for the desktop handoff', async () => {
+      mockAuthUser(['library:read_own']);
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'bracket.stl');
+      const sliceItem = within(card).getByText('Slice').closest('button');
+      expect(sliceItem).not.toBeDisabled();
+    });
+
+    it('does not accept the legacy library:read for the desktop handoff', async () => {
+      // require_ownership_permission(LIBRARY_READ_ALL, LIBRARY_READ_OWN) does no
+      // legacy expansion, so this group 403s on the slicer-token endpoint.
+      // Enabling the item would offer an action the server refuses, and the
+      // failure would look like "no slicer installed" once the fallback URL is
+      // handed over.
+      mockAuthUser(['library:read']);
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const card = await openMenu(user, 'bracket.stl');
+      const sliceItem = within(card).getByText('Slice').closest('button');
+      expect(sliceItem).toBeDisabled();
+
+      await user.click(sliceItem!);
+      expect(openInSlicer).not.toHaveBeenCalled();
+    });
+
+    it('slices from the list-view button when the slicer API is disabled', async () => {
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      await user.click(screen.getByTitle('List view'));
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const row = screen.getByText('bracket.stl').closest('div[class*="cursor-pointer"]') as HTMLElement;
+      await user.click(within(row).getByTitle('Slice'));
+
+      await waitFor(() => {
+        expect(openInSlicer).toHaveBeenCalledWith(
+          expect.stringContaining('/library/files/2/dl/test-token/'),
+          'bambu_studio',
+        );
+      });
+    });
+
+    it('slices from the list-view button into the in-app modal when the slicer API is enabled', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({ use_slicer_api: true })),
+      );
+      const user = userEvent.setup();
+      render(<FileManagerPage />);
+
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      await user.click(screen.getByTitle('List view'));
+      await waitFor(() => expect(screen.getByText('bracket.stl')).toBeInTheDocument());
+
+      const row = screen.getByText('bracket.stl').closest('div[class*="cursor-pointer"]') as HTMLElement;
+      await user.click(within(row).getByTitle('Slice'));
+
+      expect(await screen.findByTestId('slice-modal')).toBeInTheDocument();
+      expect(openInSlicer).not.toHaveBeenCalled();
+    });
+  });
+});

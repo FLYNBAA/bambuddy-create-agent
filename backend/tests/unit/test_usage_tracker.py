@@ -1,0 +1,2533 @@
+"""Unit tests for usage_tracker.py — 3MF-primary filament tracking.
+
+Tests the unified tracking logic: 3MF slicer estimates as primary path,
+AMS remain% delta as fallback, per-layer gcode for partial prints,
+slot-to-tray mapping resolution, and notification variable formatting.
+"""
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from backend.app.services.usage_tracker import (
+    PrintSession,
+    _active_sessions,
+    _archive_types_from_spools,
+    _decode_mqtt_mapping,
+    _find_3mf_by_filename,
+    _match_slots_by_color,
+    _track_from_3mf,
+    on_print_complete,
+    on_print_start,
+)
+
+
+def _make_spool(spool_id=1, label_weight=1000, weight_used=0, tag_uid=None, tray_uuid=None):
+    """Create a mock Spool object."""
+    spool = MagicMock()
+    spool.id = spool_id
+    spool.label_weight = label_weight
+    spool.weight_used = weight_used
+    spool.tag_uid = tag_uid
+    spool.tray_uuid = tray_uuid
+    spool.last_used = None
+    spool.cost_per_kg = None
+    spool.material = "PLA"
+    return spool
+
+
+def _make_assignment(spool_id=1, printer_id=1, ams_id=0, tray_id=0):
+    """Create a mock SpoolAssignment object."""
+    assignment = MagicMock()
+    assignment.spool_id = spool_id
+    assignment.printer_id = printer_id
+    assignment.ams_id = ams_id
+    assignment.tray_id = tray_id
+    return assignment
+
+
+def _make_archive(archive_id=1, file_path="archives/1/test.3mf", extra_data=None):
+    """Create a mock PrintArchive object."""
+    archive = MagicMock()
+    archive.id = archive_id
+    archive.file_path = file_path
+    archive.extra_data = extra_data
+    return archive
+
+
+def _make_queue_item(ams_mapping=None, status="printing", plate_id=None):
+    """Create a mock PrintQueueItem object."""
+    item = MagicMock()
+    item.ams_mapping = ams_mapping
+    item.status = status
+    item.plate_id = plate_id
+    return item
+
+
+def _mock_db_execute(*return_values):
+    """Create a mock db with execute() that returns values in sequence."""
+    db = AsyncMock()
+    results = []
+    for val in return_values:
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = val
+        results.append(result)
+    db.execute = AsyncMock(side_effect=results)
+    return db
+
+
+def _mock_db_sequential(responses):
+    """Create mock db that returns responses in order."""
+    db = AsyncMock()
+    call_count = [0]
+
+    async def mock_execute(*args, **kwargs):
+        idx = call_count[0]
+        call_count[0] += 1
+        result = MagicMock()
+        value = responses[idx] if idx < len(responses) else None
+        result.scalar_one_or_none.return_value = value
+        # Lookups that may legitimately match more than one row (an archive
+        # dispatched as several queue items in a batch) use scalars().first()
+        # instead of scalar_one_or_none() — same response sequence either way.
+        result.scalars.return_value.first.return_value = value
+        # For cost aggregation queries that use .scalar() instead of .scalar_one_or_none()
+        result.scalar.return_value = None
+        return result
+
+    db.execute = mock_execute
+    return db
+
+
+class TestOnPrintStart:
+    """Tests for on_print_start()."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.mark.asyncio
+    async def test_captures_remain_data(self):
+        """Captures AMS remain% at print start."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}, {"id": 1, "remain": 50}]}]},
+            tray_now=5,
+        )
+
+        await on_print_start(1, {"subtask_name": "Benchy"}, printer_manager)
+
+        assert 1 in _active_sessions
+        session = _active_sessions[1]
+        assert session.print_name == "Benchy"
+        assert session.tray_remain_start == {(0, 0): 80, (0, 1): 50}
+
+    @pytest.mark.asyncio
+    async def test_captures_tray_now_at_start(self):
+        """Captures tray_now at print start for later use in usage tracking."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]},
+            tray_now=9,
+        )
+
+        await on_print_start(1, {"subtask_name": "Test"}, printer_manager)
+
+        assert _active_sessions[1].tray_now_at_start == 9
+
+    @pytest.mark.asyncio
+    async def test_tray_now_at_start_255_when_unloaded(self):
+        """Captures tray_now=255 when printer has no filament loaded at start."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]},
+            tray_now=255,
+        )
+
+        await on_print_start(1, {"subtask_name": "Test"}, printer_manager)
+
+        assert _active_sessions[1].tray_now_at_start == 255
+
+    @pytest.mark.asyncio
+    async def test_creates_session_without_remain(self):
+        """Creates session even without valid remain data (for 3MF tracking)."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": -1}]}]},
+            tray_now=255,
+        )
+
+        await on_print_start(1, {"subtask_name": "Test"}, printer_manager)
+
+        assert 1 in _active_sessions
+        assert _active_sessions[1].tray_remain_start == {}
+
+
+class TestOnPrintComplete:
+    """Tests for on_print_complete() — path ordering and interaction."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.fixture(autouse=True)
+    def _mock_get_setting(self):
+        with patch(
+            "backend.app.api.routes.settings.get_setting",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_bl_spool_uses_3mf(self):
+        """BL spool (with tag_uid) is tracked via 3MF, not just AMS delta."""
+        spool = _make_spool(spool_id=1, tag_uid="AABB1122", label_weight=1000)
+        assignment = _make_assignment(spool_id=1, printer_id=1, ams_id=0, tray_id=0)
+        archive = _make_archive(archive_id=10)
+
+        # Setup: session with AMS remain data
+        _active_sessions[1] = PrintSession(
+            printer_id=1,
+            print_name="Benchy",
+            started_at=datetime.now(timezone.utc),
+            tray_remain_start={(0, 0): 80},
+        )
+
+        # Mock printer state: tray_now=0 (AMS0-T0), single filament
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
+            progress=100,
+            layer_num=50,
+            tray_now=0,
+        )
+
+        # db returns: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": "#FF0000"}]
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await on_print_complete(
+                printer_id=1,
+                data={"status": "completed"},
+                printer_manager=printer_manager,
+                db=db,
+                archive_id=10,
+            )
+
+        # 3MF path should handle it (BL guard removed)
+        assert len(results) >= 1
+        assert results[0]["spool_id"] == 1
+        assert results[0]["weight_used"] == 15.0
+
+    @pytest.mark.asyncio
+    async def test_ams_delta_fallback_no_archive(self):
+        """AMS delta tracks consumption when archive_id is None."""
+        spool = _make_spool(spool_id=2, label_weight=1000)
+        assignment = _make_assignment(spool_id=2)
+
+        _active_sessions[1] = PrintSession(
+            printer_id=1,
+            print_name="Test",
+            started_at=datetime.now(timezone.utc),
+            tray_remain_start={(0, 0): 80},
+        )
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
+            tray_now=0,
+            last_loaded_tray=-1,
+        )
+
+        # Pad 2 Nones for _find_3mf_by_filename DB queries (library + archive search),
+        # then assignment and spool for the AMS fallback path
+        db = _mock_db_sequential([None, None, assignment, spool])
+
+        results = await on_print_complete(
+            printer_id=1,
+            data={"status": "completed"},
+            printer_manager=printer_manager,
+            db=db,
+            archive_id=None,
+        )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 2
+        # 10% of 1000g = 100g
+        assert results[0]["weight_used"] == 100.0
+        assert results[0]["percent_used"] == 10
+
+    @pytest.mark.asyncio
+    async def test_no_double_tracking(self):
+        """When 3MF handles a tray, AMS delta skips it."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1)
+        archive = _make_archive(archive_id=10)
+
+        _active_sessions[1] = PrintSession(
+            printer_id=1,
+            print_name="Benchy",
+            started_at=datetime.now(timezone.utc),
+            tray_remain_start={(0, 0): 80},
+        )
+
+        # tray_now=0 matches the single filament slot
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
+            progress=100,
+            layer_num=50,
+            tray_now=0,
+        )
+
+        # db returns: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": "#FF0000"}]
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await on_print_complete(
+                printer_id=1,
+                data={"status": "completed"},
+                printer_manager=printer_manager,
+                db=db,
+                archive_id=10,
+            )
+
+        # Only 1 result (3MF), NOT 2 (3MF + AMS delta)
+        assert len(results) == 1
+        assert results[0]["weight_used"] == 15.0
+
+
+class TestTrackFrom3mf:
+    """Tests for _track_from_3mf() — per-layer, linear scaling, and slot mapping."""
+
+    @pytest.mark.asyncio
+    async def test_prefers_live_assignment_when_reassigned_mid_print(self):
+        """If tray assignment changed during print, track usage on the new spool."""
+        spool_old = _make_spool(spool_id=1, label_weight=1000)
+        spool_new = _make_spool(spool_id=2, label_weight=1000)
+        archive = _make_archive(archive_id=80)
+
+        live_assignment = _make_assignment(spool_id=2, ams_id=0, tray_id=0)
+        started_at = datetime.now(timezone.utc)
+        live_assignment.created_at = started_at + timedelta(seconds=5)
+
+        # db: archive, queue_item(None), live assignment lookup, spool_new lookup
+        db = _mock_db_sequential([archive, None, live_assignment, spool_new])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=0,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=80,
+                status="completed",
+                print_name="MidPrintReassign",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                spool_assignments={(0, 0): spool_old.id},
+                print_started_at=started_at,
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == spool_new.id
+
+    @pytest.mark.asyncio
+    async def test_keeps_snapshot_when_live_assignment_predates_print(self):
+        """If live assignment predates print start, preserve snapshot spool mapping."""
+        spool_old = _make_spool(spool_id=1, label_weight=1000)
+        archive = _make_archive(archive_id=81)
+
+        live_assignment = _make_assignment(spool_id=2, ams_id=0, tray_id=0)
+        started_at = datetime.now(timezone.utc)
+        live_assignment.created_at = started_at - timedelta(seconds=5)
+
+        # db: archive, queue_item(None), live assignment lookup, spool_old lookup
+        db = _mock_db_sequential([archive, None, live_assignment, spool_old])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=0,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=81,
+                status="completed",
+                print_name="SnapshotPreserved",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                spool_assignments={(0, 0): spool_old.id},
+                print_started_at=started_at,
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == spool_old.id
+
+    @pytest.mark.asyncio
+    async def test_linear_fallback_for_partial_print(self):
+        """Falls back to linear scaling when gcode layer data unavailable."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1)
+        archive = _make_archive(archive_id=10)
+
+        # db: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=50,
+            layer_num=25,
+            tray_now=0,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=None,  # No layer data available
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="failed",
+                print_name="Benchy",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 1
+        # 50% of 20g = 10g
+        assert results[0]["weight_used"] == 10.0
+        # Tray should be marked as handled
+        assert (0, 0) in handled_trays
+
+    @pytest.mark.asyncio
+    async def test_per_layer_partial_print(self):
+        """Failed print at layer N uses gcode cumulative data."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1)
+        archive = _make_archive(archive_id=10)
+
+        # db: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=50,
+            layer_num=25,
+            tray_now=0,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": ""}]
+        # Per-layer data: at layer 25, filament 0 used 5000mm
+        layer_data = {10: {0: 2000.0}, 25: {0: 5000.0}, 50: {0: 10000.0}}
+        filament_props = {1: {"density": 1.24, "diameter": 1.75}}
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=layer_data,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.get_cumulative_usage_at_layer",
+                return_value={0: 5000.0},
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_properties_from_3mf",
+                return_value=filament_props,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.mm_to_grams",
+                return_value=12.0,  # 5000mm at 1.75mm/1.24g/cm3
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="failed",
+                print_name="Benchy",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 1
+        # Should use per-layer grams (12.0g), not linear scale (10.0g)
+        assert results[0]["weight_used"] == 12.0
+
+    @pytest.mark.asyncio
+    async def test_completed_print_uses_full_weight(self):
+        """Completed print uses full 3MF weight (scale=1.0)."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1)
+        archive = _make_archive(archive_id=10)
+
+        # db: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=0,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="Benchy",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 1
+        assert results[0]["weight_used"] == 20.0
+
+    @pytest.mark.asyncio
+    async def test_tray_now_override_for_single_filament(self):
+        """Single-filament non-queue print uses tray_now instead of slot_id mapping."""
+        # Spool 2 is at AMS1-T3 (global_tray_id=7)
+        spool = _make_spool(spool_id=2, label_weight=1000)
+        assignment = _make_assignment(spool_id=2, ams_id=1, tray_id=3)
+        archive = _make_archive(archive_id=10)
+
+        # db: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        # tray_now=7 = (ams_id=1, tray_id=3), the ACTUAL tray used
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=7,
+        )
+
+        # 3MF has slot_id=12 (would default-map to ams_id=2, tray_id=3 — WRONG)
+        filament_usage = [{"slot_id": 12, "used_g": 10.6, "type": "PLA", "color": "#FF0000"}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="Test",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 2
+        assert results[0]["ams_id"] == 1
+        assert results[0]["tray_id"] == 3
+        assert results[0]["weight_used"] == 10.6
+        assert (1, 3) in handled_trays
+
+    @pytest.mark.asyncio
+    async def test_queue_ams_mapping_overrides_default(self):
+        """Queue item ams_mapping overrides default slot_id mapping."""
+        # Spool at AMS1-T3 (global_tray_id=7)
+        spool = _make_spool(spool_id=5, label_weight=1000)
+        assignment = _make_assignment(spool_id=5, ams_id=1, tray_id=3)
+        archive = _make_archive(archive_id=20)
+        # Queue item maps slot 1 → global tray 7 (ams_id=1, tray_id=3)
+        queue_item = _make_queue_item(ams_mapping="[7, -1, -1, -1]")
+
+        # db: archive, queue_item, assignment, spool
+        db = _mock_db_sequential([archive, queue_item, assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=7,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 25.0, "type": "PETG", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=20,
+                status="completed",
+                print_name="Queue Print",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 5
+        assert results[0]["ams_id"] == 1
+        assert results[0]["tray_id"] == 3
+        assert results[0]["weight_used"] == 25.0
+
+    @pytest.mark.asyncio
+    async def test_multi_filament_uses_queue_mapping(self):
+        """Multi-filament queue prints use ams_mapping for each slot."""
+        spool_a = _make_spool(spool_id=1, label_weight=1000)
+        spool_b = _make_spool(spool_id=2, label_weight=1000)
+        assign_a = _make_assignment(spool_id=1, ams_id=0, tray_id=0)
+        assign_b = _make_assignment(spool_id=2, ams_id=1, tray_id=2)
+        archive = _make_archive(archive_id=30)
+        # slot 1 → tray 0 (AMS0-T0), slot 2 → tray 6 (AMS1-T2)
+        queue_item = _make_queue_item(ams_mapping="[0, 6]")
+
+        # db: archive, queue_item, assign_a, spool_a, assign_b, spool_b
+        db = _mock_db_sequential([archive, queue_item, assign_a, spool_a, assign_b, spool_b])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=6,
+        )
+
+        filament_usage = [
+            {"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""},
+            {"slot_id": 2, "used_g": 5.0, "type": "PETG", "color": ""},
+        ]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=30,
+                status="completed",
+                print_name="Multi",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 2
+        assert results[0]["spool_id"] == 1
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 0
+        assert results[0]["weight_used"] == 10.0
+        assert results[1]["spool_id"] == 2
+        assert results[1]["ams_id"] == 1
+        assert results[1]["tray_id"] == 2
+        assert results[1]["weight_used"] == 5.0
+
+    @pytest.mark.asyncio
+    async def test_no_tray_now_override_for_multi_filament(self):
+        """Multi-filament non-queue prints fall back to default mapping, not tray_now."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=0)
+        archive = _make_archive(archive_id=10)
+
+        # db: archive, queue_item(None), assignment, spool (2nd slot has no assignment)
+        db = _mock_db_sequential([archive, None, assignment, spool, None])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=4,  # tray_now won't be used
+        )
+
+        # Two filament slots with usage
+        filament_usage = [
+            {"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""},
+            {"slot_id": 2, "used_g": 5.0, "type": "PETG", "color": ""},
+        ]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="Test",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        # Should use default mapping (slot 1 → tray 0, slot 2 → tray 1)
+        assert len(results) == 1  # Only slot 1 has assignment
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stored_ams_mapping_overrides_all(self):
+        """Stored ams_mapping from print command takes priority over queue and tray_now."""
+        # Spool at AMS2-T1 (global_tray_id=9)
+        spool = _make_spool(spool_id=10, label_weight=1000)
+        assignment = _make_assignment(spool_id=10, ams_id=2, tray_id=1)
+        archive = _make_archive(archive_id=50)
+
+        # db: archive, assignment, spool (no queue lookup when ams_mapping provided)
+        db = _mock_db_sequential([archive, assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=0,  # Different from mapped tray — should be ignored
+            last_loaded_tray=0,
+        )
+
+        filament_usage = [{"slot_id": 2, "used_g": 1.57, "type": "PLA", "color": "#FFFFFF"}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            # ams_mapping: slot 2 (index 1) -> tray 9 (AMS2-T1)
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=50,
+                status="completed",
+                print_name="Test",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                ams_mapping=[-1, 9],
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 10
+        assert results[0]["ams_id"] == 2
+        assert results[0]["tray_id"] == 1
+        assert results[0]["weight_used"] == 1.6  # rounded
+
+    @pytest.mark.asyncio
+    async def test_last_loaded_tray_fallback(self):
+        """Falls back to last_loaded_tray when tray_now_at_start and current tray_now are both 255."""
+        # Spool at AMS2-T1 (global_tray_id=9)
+        spool = _make_spool(spool_id=11, label_weight=1000)
+        assignment = _make_assignment(spool_id=11, ams_id=2, tray_id=1)
+        archive = _make_archive(archive_id=60)
+
+        # db: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        # H2D scenario: tray_now=255 at completion, but last_loaded_tray=9
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=255,
+            last_loaded_tray=9,
+        )
+
+        filament_usage = [{"slot_id": 6, "used_g": 1.52, "type": "PLA", "color": "#7CC4D5"}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=60,
+                status="completed",
+                print_name="Cube",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                tray_now_at_start=255,  # H2D: 255 at start too
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 11
+        assert results[0]["ams_id"] == 2
+        assert results[0]["tray_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_tray_now_at_start_preferred_over_last_loaded(self):
+        """tray_now_at_start is used before last_loaded_tray fallback."""
+        spool = _make_spool(spool_id=3, label_weight=1000)
+        assignment = _make_assignment(spool_id=3, ams_id=1, tray_id=1)
+        archive = _make_archive(archive_id=70)
+
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        # tray_now_at_start=5 (valid), last_loaded_tray=9 (different) — should use 5
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=50,
+            tray_now=255,
+            last_loaded_tray=9,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 5.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=70,
+                status="completed",
+                print_name="Test",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                tray_now_at_start=5,  # AMS1-T1
+            )
+
+        assert len(results) == 1
+        assert results[0]["ams_id"] == 1
+        assert results[0]["tray_id"] == 1
+
+
+class TestTrayChangeSplit:
+    """Tests for mid-print tray switch weight splitting in _track_from_3mf()."""
+
+    @pytest.mark.asyncio
+    async def test_tray_switch_splits_weight_with_gcode(self):
+        """Two-tray runout: weight split using per-layer gcode data."""
+        spool_a = _make_spool(spool_id=10, label_weight=1000)
+        spool_b = _make_spool(spool_id=20, label_weight=1000)
+        assign_a = _make_assignment(spool_id=10, ams_id=0, tray_id=1)
+        assign_b = _make_assignment(spool_id=20, ams_id=0, tray_id=0)
+        archive = _make_archive(archive_id=100)
+
+        # db: archive, queue_item(None), then for each segment: assignment, spool
+        db = _mock_db_sequential([archive, None, assign_a, spool_a, assign_b, spool_b])
+
+        # Tray change log: started on tray 1, switched to tray 0 at layer 60
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=100,
+            tray_now=0,
+            last_loaded_tray=0,
+            total_layers=100,
+            tray_change_log=[(1, 0), (0, 60)],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value={30: {0: 3000.0}, 60: {0: 6000.0}, 100: {0: 10000.0}},
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.get_cumulative_usage_at_layer",
+                side_effect=lambda data, layer: {0: {0: 0.0, 60: 6000.0, 100: 10000.0}.get(layer, 0.0)},
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_properties_from_3mf",
+                return_value={1: {"density": 1.24, "diameter": 1.75}},
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.mm_to_grams",
+                side_effect=lambda mm, d, dens: round(mm * 0.003, 1),  # Simple conversion
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=100,
+                status="completed",
+                print_name="Runout Test",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        # Two results: one per tray segment
+        assert len(results) == 2
+        # First segment: tray 1 (AMS0-T1), layers 0→60
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 1
+        assert results[0]["spool_id"] == 10
+        assert results[0]["weight_used"] == 18.0  # 6000mm * 0.003
+        # Second segment: tray 0 (AMS0-T0), layers 60→end = 30.0 - 18.0 = 12.0
+        assert results[1]["ams_id"] == 0
+        assert results[1]["tray_id"] == 0
+        assert results[1]["spool_id"] == 20
+        assert results[1]["weight_used"] == 12.0
+        # Both trays handled
+        assert (0, 1) in handled_trays
+        assert (0, 0) in handled_trays
+
+    @pytest.mark.asyncio
+    async def test_tray_switch_linear_fallback(self):
+        """Two-tray runout without per-layer gcode: linear split by layer ratio."""
+        spool_a = _make_spool(spool_id=10, label_weight=1000)
+        spool_b = _make_spool(spool_id=20, label_weight=1000)
+        assign_a = _make_assignment(spool_id=10, ams_id=0, tray_id=2)
+        assign_b = _make_assignment(spool_id=20, ams_id=0, tray_id=1)
+        archive = _make_archive(archive_id=101)
+
+        db = _mock_db_sequential([archive, None, assign_a, spool_a, assign_b, spool_b])
+
+        # Tray 2 from layer 0, switched to tray 1 at layer 40 (of 100 total)
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=100,
+            tray_now=1,
+            last_loaded_tray=1,
+            total_layers=100,
+            tray_change_log=[(2, 0), (1, 40)],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 50.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=None,  # No per-layer gcode available
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=101,
+                status="completed",
+                print_name="Linear Fallback",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 2
+        # Linear split: tray 2 for 40/100 layers = 20g
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 2
+        assert results[0]["weight_used"] == 20.0
+        # Last segment gets remainder: 50 - 20 = 30g
+        assert results[1]["ams_id"] == 0
+        assert results[1]["tray_id"] == 1
+        assert results[1]["weight_used"] == 30.0
+
+    @pytest.mark.asyncio
+    async def test_tray_switch_overrides_print_cmd_mapping(self):
+        """tray_change_log evidence overrides slot_to_tray captured at print start.
+
+        Regression for #957: when AMS auto-falls-back from an empty spool to a
+        same-material sibling, the print_cmd's mapping (which named the
+        original tray) is stale by the time the print finishes. Before this
+        fix, the splitting branch was gated on ``not slot_to_tray`` so the
+        slicer mapping was preferred even when the printer actually fed from
+        a different tray — Path 1 credited the original tray with the full
+        3MF estimate and Path 2 layered the AMS-fallback delta on top, so
+        spool consumption double-counted (e.g. 78 g print credited as 78 g
+        + 60 g = 138 g). This test pins the new behavior: when
+        tray_change_log has > 1 entries, splitting takes over regardless of
+        whether ams_mapping was provided.
+        """
+        spool_a = _make_spool(spool_id=10, label_weight=1000)
+        spool_b = _make_spool(spool_id=20, label_weight=1000)
+        assign_a = _make_assignment(spool_id=10, ams_id=0, tray_id=0)
+        assign_b = _make_assignment(spool_id=20, ams_id=0, tray_id=1)
+        archive = _make_archive(archive_id=200)
+
+        # No queue_item placeholder: passing ams_mapping bypasses the queue lookup
+        # at usage_tracker.py:816 (`if not slot_to_tray and archive_id`).
+        db = _mock_db_sequential([archive, assign_a, spool_a, assign_b, spool_b])
+
+        # Slicer mapping says slot 1 -> tray 0; printer actually swapped to tray 1 at layer 30
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=100,
+            tray_now=1,
+            last_loaded_tray=1,
+            total_layers=100,
+            tray_change_log=[(0, 0), (1, 30)],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 78.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=None,  # No per-layer data — exercises linear fallback
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=200,
+                status="completed",
+                print_name="Runout w/ slicer mapping",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                # ams_mapping captured at print start — slicer told us slot 0 -> tray 0
+                # (1-based slot_id=1 -> 0-based slot index 0).
+                ams_mapping=[0],
+            )
+
+        # Splitting branch ran despite ams_mapping being set: two segments,
+        # one per tray, total weight matches the 3MF estimate (no double-count).
+        assert len(results) == 2
+        total = sum(r["weight_used"] for r in results)
+        assert total == pytest.approx(78.0, abs=0.1)
+        # Both trays now in handled_trays so Path 2 (remain%-delta) skips them.
+        assert (0, 0) in handled_trays
+        assert (0, 1) in handled_trays
+
+    @pytest.mark.asyncio
+    async def test_no_tray_change_uses_normal_path(self):
+        """Single-entry tray_change_log falls through to normal tray_now_at_start logic."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=2)
+        archive = _make_archive(archive_id=102)
+
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        # Only one entry = no switch, should use normal path
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=100,
+            tray_now=2,
+            last_loaded_tray=2,
+            total_layers=100,
+            tray_change_log=[(2, 0)],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=102,
+                status="completed",
+                print_name="No Switch",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                tray_now_at_start=2,
+            )
+
+        # Normal path: single result, full weight
+        assert len(results) == 1
+        assert results[0]["weight_used"] == 15.0
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_tray_change_log_uses_normal_path(self):
+        """Empty tray_change_log (e.g. server restart) falls through to existing logic."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=0)
+        archive = _make_archive(archive_id=103)
+
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        # Empty log (server restarted mid-print)
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=100,
+            tray_now=0,
+            last_loaded_tray=0,
+            total_layers=100,
+            tray_change_log=[],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=103,
+                status="completed",
+                print_name="Restart Recovery",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                tray_now_at_start=0,
+            )
+
+        assert len(results) == 1
+        assert results[0]["weight_used"] == 10.0
+
+    @pytest.mark.asyncio
+    async def test_tray_switch_segment_no_spool(self):
+        """Segment with no spool assignment is skipped; other segments still tracked."""
+        spool_b = _make_spool(spool_id=20, label_weight=1000)
+        assign_b = _make_assignment(spool_id=20, ams_id=0, tray_id=3)
+        archive = _make_archive(archive_id=104)
+
+        # db: archive, queue_item(None), 1st segment: no assignment, 2nd segment: assignment, spool
+        db = _mock_db_sequential([archive, None, None, assign_b, spool_b])
+
+        # Tray 5 (no spool) from layer 0, switched to tray 3 at layer 50
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=100,
+            tray_now=3,
+            last_loaded_tray=3,
+            total_layers=100,
+            tray_change_log=[(5, 0), (3, 50)],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 40.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=None,  # No per-layer data
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=104,
+                status="completed",
+                print_name="Missing Spool",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        # Only the second segment (tray 3) tracked; first segment (tray 5) skipped
+        assert len(results) == 1
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 3
+        assert results[0]["spool_id"] == 20
+
+    @pytest.mark.asyncio
+    async def test_tray_switch_three_segments(self):
+        """Three-segment switch (rare): A→B→C split by linear fallback."""
+        spool_a = _make_spool(spool_id=1, label_weight=1000)
+        spool_b = _make_spool(spool_id=2, label_weight=1000)
+        spool_c = _make_spool(spool_id=3, label_weight=1000)
+        assign_a = _make_assignment(spool_id=1, ams_id=0, tray_id=0)
+        assign_b = _make_assignment(spool_id=2, ams_id=0, tray_id=1)
+        assign_c = _make_assignment(spool_id=3, ams_id=0, tray_id=2)
+        archive = _make_archive(archive_id=105)
+
+        db = _mock_db_sequential(
+            [
+                archive,
+                None,
+                assign_a,
+                spool_a,
+                assign_b,
+                spool_b,
+                assign_c,
+                spool_c,
+            ]
+        )
+
+        # 3 segments: tray 0 (0-30), tray 1 (30-70), tray 2 (70-end)
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=100,
+            tray_now=2,
+            last_loaded_tray=2,
+            total_layers=100,
+            tray_change_log=[(0, 0), (1, 30), (2, 70)],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 100.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=None,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=105,
+                status="completed",
+                print_name="Triple Switch",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 3
+        # Tray 0: 30/100 * 100g = 30g
+        assert results[0]["weight_used"] == 30.0
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 0
+        # Tray 1: 40/100 * 100g = 40g
+        assert results[1]["weight_used"] == 40.0
+        assert results[1]["ams_id"] == 0
+        assert results[1]["tray_id"] == 1
+        # Tray 2: remainder = 100 - 30 - 40 = 30g
+        assert results[2]["weight_used"] == 30.0
+        assert results[2]["ams_id"] == 0
+        assert results[2]["tray_id"] == 2
+
+    @pytest.mark.asyncio
+    async def test_tray_switch_uses_last_layer_num_when_total_layers_reset(self):
+        """#1771 regression: P1S firmware resets `total_layer_num` to 0 at print
+        end; without the cascade the linear fallback collapsed to `0.0` per
+        non-last segment and dumped the whole print onto the last spool. With
+        the fix, `last_layer_num` (the print's last-valid layer captured before
+        the firmware reset) is the substitute denominator.
+
+        Reporter's exact shape: print needed ~260 g, started on a 180 g spool,
+        AMS Backup switched at ~70% through, second spool finished the print.
+        Before fix: spool 1 → 0 g, spool 2 → 260 g (the bug).
+        After fix:  spool 1 → 180 g, spool 2 → 80 g (correct).
+        """
+        spool_a = _make_spool(spool_id=10, label_weight=1000)
+        spool_b = _make_spool(spool_id=20, label_weight=1000)
+        assign_a = _make_assignment(spool_id=10, ams_id=0, tray_id=0)
+        assign_b = _make_assignment(spool_id=20, ams_id=0, tray_id=1)
+        archive = _make_archive(archive_id=171)
+
+        db = _mock_db_sequential([archive, None, assign_a, spool_a, assign_b, spool_b])
+
+        # Firmware reset: state.total_layers is 0 by the time usage_tracker runs.
+        # last_layer_num threaded in from on_print_complete is the survival value.
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=0,  # also reset
+            tray_now=1,
+            last_loaded_tray=1,
+            total_layers=0,  # the bug trigger
+            tray_change_log=[(0, 0), (1, 180)],  # switched at layer 180 of 260
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 260.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=None,  # No per-layer 3MF data — force linear fallback path
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=171,
+                status="completed",
+                print_name="#1771 repro",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                last_layer_num=260,  # survives the firmware reset of total_layer_num
+            )
+
+        # Both segments must be attributed correctly.
+        assert len(results) == 2
+        # Segment 1: tray 0, layers 0-180 of 260 → 260 * 180/260 = 180.0 g
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 0
+        assert results[0]["weight_used"] == 180.0
+        # Segment 2: tray 1, remainder = 260 - 180 = 80.0 g
+        assert results[1]["ams_id"] == 0
+        assert results[1]["tray_id"] == 1
+        assert results[1]["weight_used"] == 80.0
+
+    @pytest.mark.asyncio
+    async def test_tray_switch_equal_split_when_no_layer_info_at_all(self):
+        """Defensive fence: when neither `state.total_layers` nor `last_layer_num`
+        survives (older firmware / edge case), equal-split across segments is the
+        last-resort fallback. Still wrong but BOUNDED — the original bug dumped
+        the whole print weight onto the last segment, which was strictly worse.
+        """
+        spool_a = _make_spool(spool_id=10, label_weight=1000)
+        spool_b = _make_spool(spool_id=20, label_weight=1000)
+        assign_a = _make_assignment(spool_id=10, ams_id=0, tray_id=0)
+        assign_b = _make_assignment(spool_id=20, ams_id=0, tray_id=1)
+        archive = _make_archive(archive_id=172)
+
+        db = _mock_db_sequential([archive, None, assign_a, spool_a, assign_b, spool_b])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            progress=100,
+            layer_num=0,
+            tray_now=1,
+            last_loaded_tray=1,
+            total_layers=0,  # neither source available
+            tray_change_log=[(0, 0), (1, 50)],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 60.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch(
+                "backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf",
+                return_value=None,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=172,
+                status="completed",
+                print_name="no layer info",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                last_layer_num=0,  # also unavailable
+            )
+
+        # 2 segments, equal split: 60g / 2 = 30g each. Last segment uses the
+        # `is_last` remainder branch so it stays at 30.0 too.
+        assert len(results) == 2
+        assert results[0]["weight_used"] == 30.0
+        assert results[1]["weight_used"] == 30.0
+
+
+class TestDecodeMqttMapping:
+    """Tests for _decode_mqtt_mapping() — snow-encoded MQTT mapping to global tray IDs."""
+
+    def test_none_input(self):
+        assert _decode_mqtt_mapping(None) is None
+
+    def test_empty_list(self):
+        assert _decode_mqtt_mapping([]) is None
+
+    def test_all_unmapped(self):
+        """All 65535 values → None (no valid mappings)."""
+        assert _decode_mqtt_mapping([65535, 65535, 65535]) is None
+
+    def test_single_ams_slots(self):
+        """AMS 0 slots: snow values 0-3 → global tray IDs 0-3."""
+        assert _decode_mqtt_mapping([0, 1, 2, 3]) == [0, 1, 2, 3]
+
+    def test_multi_ams_slots(self):
+        """AMS 1 (hw_id=1): snow 256=AMS1-T0, 257=AMS1-T1 → global 4, 5."""
+        assert _decode_mqtt_mapping([256, 257]) == [4, 5]
+
+    def test_ams_ht_slot(self):
+        """AMS-HT (hw_id=128): snow 32768 → global 128."""
+        assert _decode_mqtt_mapping([32768]) == [128]
+
+    def test_external_spool(self):
+        """External spool: ams_hw_id=254, slot=0 → global 254."""
+        # snow = 254 * 256 + 0 = 65024
+        assert _decode_mqtt_mapping([65024]) == [254]
+
+    def test_mixed_with_unmapped(self):
+        """Mix of valid and unmapped (65535) values."""
+        result = _decode_mqtt_mapping([1, 65535, 0])
+        assert result == [1, -1, 0]
+
+    def test_h2c_real_mapping(self):
+        """Real H2C mapping from MQTT logs: [1, 0, 65535*4, 32768]."""
+        mapping = [1, 0, 65535, 65535, 65535, 65535, 32768]
+        result = _decode_mqtt_mapping(mapping)
+        assert result == [1, 0, -1, -1, -1, -1, 128]
+
+    def test_non_int_values_treated_as_unmapped(self):
+        """Non-integer values in the mapping are treated as unmapped."""
+        assert _decode_mqtt_mapping(["foo", 0]) == [-1, 0]
+
+
+class TestMatchSlotsByColor:
+    """Tests for _match_slots_by_color() — color-based filament slot to AMS tray matching."""
+
+    def _ams(self, trays):
+        """Build AMS data from list of (ams_id, tray_id, color_hex, tray_type) tuples."""
+        units: dict[int, list] = {}
+        for ams_id, tray_id, color, tray_type in trays:
+            units.setdefault(ams_id, []).append({"id": tray_id, "tray_color": color, "tray_type": tray_type})
+        return [{"id": aid, "tray": t} for aid, t in units.items()]
+
+    def _usage(self, slots):
+        """Build filament_usage from list of (slot_id, color_hex) tuples."""
+        return [{"slot_id": sid, "used_g": 10.0, "type": "PLA", "color": color} for sid, color in slots]
+
+    def test_none_inputs(self):
+        assert _match_slots_by_color(None, None) is None
+        assert _match_slots_by_color([], None) is None
+        assert _match_slots_by_color(None, {"ams": []}) is None
+
+    def test_empty_ams(self):
+        usage = self._usage([(1, "#FF0000")])
+        assert _match_slots_by_color(usage, {"ams": []}) is None
+
+    def test_single_slot_single_tray(self):
+        """One 3MF slot matches one AMS tray by color."""
+        ams = self._ams([(0, 0, "FF0000FF", "PLA")])
+        usage = self._usage([(1, "#FF0000")])
+        assert _match_slots_by_color(usage, {"ams": ams}) == [0]
+
+    def test_a1_mini_three_colors(self):
+        """A1 Mini: 3 slots match 3 distinct AMS trays."""
+        ams = self._ams(
+            [
+                (0, 0, "FF0000FF", "PLA"),  # Red
+                (0, 1, "00FF00FF", "PLA"),  # Green
+                (0, 2, "0000FFFF", "PLA"),  # Blue
+            ]
+        )
+        usage = self._usage([(1, "#FF0000"), (2, "#00FF00"), (3, "#0000FF")])
+        assert _match_slots_by_color(usage, {"ams": ams}) == [0, 1, 2]
+
+    def test_dual_ams_p2s_like(self):
+        """P2S with dual AMS: slots from second AMS unit."""
+        ams = self._ams(
+            [
+                (0, 0, "AAAAAAFF", "PLA"),
+                (0, 1, "BBBBBBFF", "PLA"),
+                (1, 0, "CC0000FF", "PETG"),  # global_id=4
+                (1, 1, "00CC00FF", "PETG"),  # global_id=5
+            ]
+        )
+        usage = self._usage([(1, "#CC0000"), (2, "#00CC00")])
+        assert _match_slots_by_color(usage, {"ams": ams}) == [4, 5]
+
+    def test_ams_ht_global_id(self):
+        """AMS-HT (ams_id >= 128) uses raw ams_id as global tray ID."""
+        ams = self._ams(
+            [
+                (0, 0, "FF0000FF", "PLA"),
+                (128, 0, "0000FFFF", "PLA"),  # AMS-HT → global_id=128
+            ]
+        )
+        usage = self._usage([(1, "#FF0000"), (2, "#0000FF")])
+        assert _match_slots_by_color(usage, {"ams": ams}) == [0, 128]
+
+    def test_ambiguous_same_color_returns_none(self):
+        """Two trays with the same color → ambiguous → None."""
+        ams = self._ams(
+            [
+                (0, 0, "FF0000FF", "PLA"),
+                (0, 1, "FF0000FF", "PLA"),  # Same red
+            ]
+        )
+        usage = self._usage([(1, "#FF0000")])
+        assert _match_slots_by_color(usage, {"ams": ams}) is None
+
+    def test_no_matching_color_returns_none(self):
+        """3MF slot color not found in any AMS tray → None."""
+        ams = self._ams([(0, 0, "00FF00FF", "PLA")])
+        usage = self._usage([(1, "#FF0000")])  # Red, but AMS has green
+        assert _match_slots_by_color(usage, {"ams": ams}) is None
+
+    def test_color_normalization_strips_alpha(self):
+        """AMS colors (RRGGBBAA) and 3MF colors (#RRGGBB) match after normalization."""
+        ams = self._ams([(0, 0, "AABBCC80", "PLA")])  # 8-char with alpha
+        usage = self._usage([(1, "#AABBCC")])  # 6-char with #
+        assert _match_slots_by_color(usage, {"ams": ams}) == [0]
+
+    def test_case_insensitive(self):
+        """Color matching is case-insensitive."""
+        ams = self._ams([(0, 0, "aaBBccFF", "PLA")])
+        usage = self._usage([(1, "#AAbbCC")])
+        assert _match_slots_by_color(usage, {"ams": ams}) == [0]
+
+    def test_empty_tray_color_skipped(self):
+        """Trays with empty color are skipped (not matched)."""
+        ams = self._ams(
+            [
+                (0, 0, "", "PLA"),
+                (0, 1, "FF0000FF", "PLA"),
+            ]
+        )
+        usage = self._usage([(1, "#FF0000")])
+        assert _match_slots_by_color(usage, {"ams": ams}) == [1]
+
+    def test_empty_tray_type_skipped(self):
+        """Trays with empty tray_type are skipped (unloaded slot)."""
+        ams = self._ams(
+            [
+                (0, 0, "FF0000FF", ""),  # Empty slot
+                (0, 1, "FF0000FF", "PLA"),  # Loaded slot
+            ]
+        )
+        usage = self._usage([(1, "#FF0000")])
+        assert _match_slots_by_color(usage, {"ams": ams}) == [1]
+
+    def test_short_slot_color_returns_none(self):
+        """3MF slot with color < 6 chars → can't match → None."""
+        ams = self._ams([(0, 0, "FF0000FF", "PLA")])
+        usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": "#FFF"}]
+        assert _match_slots_by_color(usage, {"ams": ams}) is None
+
+    def test_slot_id_zero_skipped(self):
+        """Slots with slot_id=0 are skipped."""
+        ams = self._ams([(0, 0, "FF0000FF", "PLA")])
+        usage = [{"slot_id": 0, "used_g": 10.0, "type": "PLA", "color": "#FF0000"}]
+        assert _match_slots_by_color(usage, {"ams": ams}) is None
+
+    def test_ams_data_as_list(self):
+        """Handles ams_raw as a plain list (some printer models)."""
+        ams_list = [{"id": 0, "tray": [{"id": 0, "tray_color": "FF0000FF", "tray_type": "PLA"}]}]
+        usage = self._usage([(1, "#FF0000")])
+        assert _match_slots_by_color(usage, ams_list) == [0]
+
+    def test_same_color_two_trays_disambiguated_by_usage(self):
+        """Two trays same color, two slots same color → unique assignment via used_trays tracking."""
+        ams = self._ams(
+            [
+                (0, 0, "FF0000FF", "PLA"),
+                (0, 1, "FF0000FF", "PLA"),
+            ]
+        )
+        # Two slots both wanting red — first gets tray 0, second gets tray 1? No.
+        # When first slot takes the only available, second has 1 left → should work
+        usage = self._usage([(1, "#FF0000"), (2, "#FF0000")])
+        # First slot: candidates=[0,1], available=[0,1], len!=1 → None
+        assert _match_slots_by_color(usage, {"ams": ams}) is None
+
+    def test_dict_wrapper_with_ams_key(self):
+        """Standard dict format with 'ams' key."""
+        ams_data = {"ams": [{"id": 0, "tray": [{"id": 0, "tray_color": "00FF00FF", "tray_type": "PLA"}]}]}
+        usage = self._usage([(1, "#00FF00")])
+        assert _match_slots_by_color(usage, ams_data) == [0]
+
+
+class TestMqttMappingIntegration:
+    """Integration tests: MQTT mapping field used in _track_from_3mf."""
+
+    @pytest.mark.asyncio
+    async def test_h2c_multi_filament_uses_mqtt_mapping(self):
+        """H2C: 3 filaments resolved via MQTT mapping field (no ams_mapping, no queue)."""
+        # AMS0-T1 (White PLA), AMS0-T0 (Black PLA), AMS128-T0 (Red PLA)
+        spool_white = _make_spool(spool_id=1, label_weight=1000)
+        spool_black = _make_spool(spool_id=2, label_weight=1000)
+        spool_red = _make_spool(spool_id=3, label_weight=1000)
+        assign_white = _make_assignment(spool_id=1, ams_id=0, tray_id=1)
+        assign_black = _make_assignment(spool_id=2, ams_id=0, tray_id=0)
+        assign_red = _make_assignment(spool_id=3, ams_id=128, tray_id=0)
+        archive = _make_archive(archive_id=12)
+
+        # db: archive, queue lookup (no queue item — this is a direct print),
+        # then 3 pairs of (assignment, spool). The queue mapping is consulted
+        # before the MQTT field because AMS backup rewrites the live one.
+        db = _mock_db_sequential(
+            [
+                archive,
+                None,
+                assign_white,
+                spool_white,
+                assign_black,
+                spool_black,
+                assign_red,
+                spool_red,
+            ]
+        )
+
+        # MQTT mapping: slot0→AMS0-T1(1), slot1→AMS0-T0(0), slots2-5→unmapped, slot6→AMS128-T0(32768)
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"mapping": [1, 0, 65535, 65535, 65535, 65535, 32768]},
+            progress=100,
+            layer_num=50,
+            tray_now=255,
+        )
+
+        # 3MF slots 1, 2, 7 (1-based) → indices 0, 1, 6 in mapping
+        filament_usage = [
+            {"slot_id": 1, "used_g": 21.16, "type": "PLA", "color": "#FFFFFF"},
+            {"slot_id": 2, "used_g": 24.22, "type": "PLA", "color": "#000000"},
+            {"slot_id": 7, "used_g": 18.47, "type": "PLA", "color": "#F72323"},
+        ]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=12,
+                status="completed",
+                print_name="Cube + Cube + Cube",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 3
+
+        # slot_id=1 → mapping[0]=1 → AMS0-T1 (White PLA)
+        assert results[0]["spool_id"] == 1
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 1
+        assert results[0]["weight_used"] == 21.2
+
+        # slot_id=2 → mapping[1]=0 → AMS0-T0 (Black PLA)
+        assert results[1]["spool_id"] == 2
+        assert results[1]["ams_id"] == 0
+        assert results[1]["tray_id"] == 0
+        assert results[1]["weight_used"] == 24.2
+
+        # slot_id=7 → mapping[6]=32768 → AMS128-T0 (Red PLA)
+        assert results[2]["spool_id"] == 3
+        assert results[2]["ams_id"] == 128
+        assert results[2]["tray_id"] == 0
+        assert results[2]["weight_used"] == 18.5
+
+    @pytest.mark.asyncio
+    async def test_print_cmd_mapping_takes_priority_over_mqtt(self):
+        """ams_mapping from print command is used even when MQTT mapping exists."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=2)
+        archive = _make_archive(archive_id=10)
+
+        # db: archive, assignment, spool (no queue lookup when ams_mapping provided)
+        db = _mock_db_sequential([archive, assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"mapping": [0, 65535]},  # MQTT says slot 0 → AMS0-T0
+            progress=100,
+            layer_num=50,
+            tray_now=255,
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=10,
+                status="completed",
+                print_name="Test",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+                ams_mapping=[2],  # Print cmd says slot 0 → AMS0-T2 (overrides MQTT)
+            )
+
+        assert len(results) == 1
+        assert results[0]["ams_id"] == 0
+        assert results[0]["tray_id"] == 2  # From print_cmd mapping, not MQTT
+
+
+class TestPositionBasedFallbackEmptyAmsSlot:
+    """Position-based mapping fallback (#1607): when no explicit mapping is
+    available, the slicer's Nth filament must map to the Nth *loaded* AMS tray
+    (skipping empty slots), not the Nth physical slot position. BambuStudio /
+    OrcaSlicer compact their filament-assignment UI by hiding unloaded AMS
+    slots, so the 3MF slot list is dense even when the AMS itself has gaps."""
+
+    @pytest.mark.asyncio
+    async def test_external_routed_correctly_when_ams_has_empty_middle_slot(self):
+        """Reporter's scenario: AMS trays 0-2 loaded, tray 3 empty, external
+        loaded. Slicer emits 4 filaments — slot 4 = external. Without the fix
+        the position-based fallback maps slot 4 to the empty AMS tray 3
+        (since `available_trays = [0, 1, 2, 3, 254]`) and external usage is
+        silently dropped because no spool is assigned to AMS0-T3.
+        After the fix, empty AMS slots are filtered (tray_type is empty) so
+        `available_trays = [0, 1, 2, 254]` and slot 4 correctly resolves to
+        the external (global tray 254 → AMS255-T0)."""
+        # Spool fed via external (vt_tray 254 → AMS255-T0)
+        spool = _make_spool(spool_id=42, label_weight=1000)
+        assignment = _make_assignment(spool_id=42, ams_id=255, tray_id=0)
+        archive = _make_archive(archive_id=70)
+
+        # db: archive, queue_item(None), assignment, spool
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        # AMS reports 4 physical tray slots but slot 3 has no spool (empty
+        # tray_type); external spool is loaded in vt_tray.
+        # No `mapping` field on the state — forces fallback through path 5.
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [
+                            {"id": 0, "tray_type": "PLA"},
+                            {"id": 1, "tray_type": "PETG"},
+                            {"id": 2, "tray_type": "ABS"},
+                            {"id": 3, "tray_type": ""},  # empty slot
+                        ],
+                    }
+                ],
+                "vt_tray": [{"id": 254, "tray_type": "PLA"}],
+            },
+            progress=100,
+            layer_num=50,
+            tray_now=254,
+            tray_change_log=[],
+        )
+
+        # 3MF has 4 dense filament slots — slot 4 is the external. Only slot 4
+        # has weight (other slots came from AMS spools handled separately).
+        filament_usage = [{"slot_id": 4, "used_g": 12.3, "type": "PLA", "color": "#00AABB"}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=70,
+                status="completed",
+                print_name="External + AMS print",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 1
+        # The external spool was charged, NOT the empty AMS slot.
+        assert results[0]["spool_id"] == 42
+        assert results[0]["ams_id"] == 255
+        assert results[0]["tray_id"] == 0
+        assert results[0]["weight_used"] == 12.3
+        assert (255, 0) in handled_trays
+        # Critical assertion: AMS0-T3 (the empty slot) was NOT charged.
+        assert (0, 3) not in handled_trays
+
+    @pytest.mark.asyncio
+    async def test_dense_ams_unchanged_no_empty_slots(self):
+        """Sanity check: when every AMS slot is loaded, the position-based
+        fallback still works for the slicer's external = last slot case."""
+        spool = _make_spool(spool_id=99, label_weight=1000)
+        assignment = _make_assignment(spool_id=99, ams_id=255, tray_id=0)
+        archive = _make_archive(archive_id=71)
+
+        db = _mock_db_sequential([archive, None, assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [
+                            {"id": 0, "tray_type": "PLA"},
+                            {"id": 1, "tray_type": "PETG"},
+                            {"id": 2, "tray_type": "ABS"},
+                            {"id": 3, "tray_type": "TPU"},
+                        ],
+                    }
+                ],
+                "vt_tray": [{"id": 254, "tray_type": "PLA"}],
+            },
+            progress=100,
+            layer_num=50,
+            tray_now=254,
+            tray_change_log=[],
+        )
+
+        # 5 filaments, slot 5 = external. available_trays = [0,1,2,3,254] →
+        # slot_id=5 → available_trays[4] = 254.
+        filament_usage = [{"slot_id": 5, "used_g": 7.5, "type": "PLA", "color": ""}]
+        handled_trays: set[tuple[int, int]] = set()
+
+        with (
+            patch("backend.app.core.config.settings") as mock_settings,
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=71,
+                status="completed",
+                print_name="Dense AMS + external",
+                handled_trays=handled_trays,
+                printer_manager=printer_manager,
+                db=db,
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 99
+        assert results[0]["ams_id"] == 255
+        assert results[0]["tray_id"] == 0
+
+
+class TestNotificationVariables:
+    """Tests for filament_details formatting in notifications."""
+
+    def test_filament_details_single_slot(self):
+        """Single slot produces 'PLA: 15.2g' format."""
+        slots = [{"type": "PLA", "used_g": 15.2, "slot_id": 1, "color": "#FF0000"}]
+        parts = []
+        for slot in slots:
+            ftype = slot.get("type", "Unknown") or "Unknown"
+            used = slot.get("used_g", 0)
+            parts.append(f"{ftype}: {used:.1f}g")
+        result = " | ".join(parts)
+        assert result == "PLA: 15.2g"
+
+    def test_filament_details_multi_slot(self):
+        """Multiple slots produce 'PLA: 10.0g | PETG: 5.0g' format."""
+        slots = [
+            {"type": "PLA", "used_g": 10.0, "slot_id": 1, "color": ""},
+            {"type": "PETG", "used_g": 5.0, "slot_id": 2, "color": ""},
+        ]
+        parts = []
+        for slot in slots:
+            ftype = slot.get("type", "Unknown") or "Unknown"
+            used = slot.get("used_g", 0)
+            parts.append(f"{ftype}: {used:.1f}g")
+        result = " | ".join(parts)
+        assert result == "PLA: 10.0g | PETG: 5.0g"
+
+    def test_filament_details_empty_type(self):
+        """Empty type defaults to 'Unknown'."""
+        slots = [{"type": "", "used_g": 5.0, "slot_id": 1, "color": ""}]
+        parts = []
+        for slot in slots:
+            ftype = slot.get("type", "Unknown") or "Unknown"
+            used = slot.get("used_g", 0)
+            parts.append(f"{ftype}: {used:.1f}g")
+        result = " | ".join(parts)
+        assert result == "Unknown: 5.0g"
+
+    def test_filament_grams_scaled_for_partial(self):
+        """filament_grams is scaled by progress for partial prints."""
+        filament_used_grams = 20.0
+        progress = 50
+        scale = max(0.0, min(progress / 100.0, 1.0))
+        scaled = round(filament_used_grams * scale, 1)
+        assert scaled == 10.0
+
+    def test_filament_grams_zero_progress(self):
+        """Progress=0 at cancellation gives 0.0g."""
+        filament_used_grams = 20.0
+        progress = 0
+        scale = max(0.0, min(progress / 100.0, 1.0))
+        scaled = round(filament_used_grams * scale, 1)
+        assert scaled == 0.0
+
+    def test_slot_scaling_for_partial(self):
+        """Per-slot usage is scaled linearly for partial prints."""
+        slots = [
+            {"type": "PLA", "used_g": 20.0, "slot_id": 1, "color": ""},
+            {"type": "PETG", "used_g": 10.0, "slot_id": 2, "color": ""},
+        ]
+        progress = 30
+        scale = max(0.0, min(progress / 100.0, 1.0))
+        scaled_slots = [{**s, "used_g": round(s["used_g"] * scale, 1)} for s in slots]
+        assert scaled_slots[0]["used_g"] == 6.0
+        assert scaled_slots[1]["used_g"] == 3.0
+
+
+class TestOnPrintStartAmsMapping:
+    """Tests for ams_mapping capture in on_print_start()."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.mark.asyncio
+    async def test_captures_ams_mapping_from_data(self):
+        """on_print_start captures ams_mapping from the data dict into the session."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]},
+            tray_now=0,
+        )
+
+        await on_print_start(1, {"subtask_name": "Test", "ams_mapping": [3, -1, -1, 2]}, printer_manager)
+
+        assert _active_sessions[1].ams_mapping == [3, -1, -1, 2]
+
+    @pytest.mark.asyncio
+    async def test_ams_mapping_none_when_not_in_data(self):
+        """Session ams_mapping is None when data dict has no ams_mapping."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]},
+            tray_now=0,
+        )
+
+        await on_print_start(1, {"subtask_name": "Test"}, printer_manager)
+
+        assert _active_sessions[1].ams_mapping is None
+
+    @pytest.mark.asyncio
+    async def test_captures_queue_plate_id(self):
+        """on_print_start records the queue item's plate_id onto the session (#1697)."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]},
+            tray_now=0,
+        )
+
+        queue_item = _make_queue_item(plate_id=2)
+        # on_print_start now executes: SpoolAssignment lookup, then PrintQueueItem lookup.
+        db = AsyncMock()
+        assignment_result = MagicMock()
+        assignment_result.scalars.return_value.all.return_value = []
+        queue_result = MagicMock()
+        queue_result.scalars.return_value.first.return_value = queue_item
+        db.execute = AsyncMock(side_effect=[assignment_result, queue_result])
+
+        await on_print_start(1, {"subtask_name": "Test"}, printer_manager, db=db)
+
+        assert _active_sessions[1].plate_id == 2
+
+    @pytest.mark.asyncio
+    async def test_plate_id_none_when_no_queue_item(self):
+        """Direct/library prints with no queue item leave session.plate_id = None."""
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 80}]}]},
+            tray_now=0,
+        )
+
+        db = AsyncMock()
+        assignment_result = MagicMock()
+        assignment_result.scalars.return_value.all.return_value = []
+        queue_result = MagicMock()
+        queue_result.scalars.return_value.first.return_value = None
+        db.execute = AsyncMock(side_effect=[assignment_result, queue_result])
+
+        await on_print_start(1, {"subtask_name": "Test"}, printer_manager, db=db)
+
+        assert _active_sessions[1].plate_id is None
+
+
+class TestFindThreemfByFilename:
+    """Tests for _find_3mf_by_filename() — library/archive search without archive_id."""
+
+    @pytest.mark.asyncio
+    async def test_finds_library_file(self):
+        """Finds a 3MF from library files matching filename."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        lib_file = MagicMock()
+        lib_file.file_path = "library/BMCU-BADGE.3mf"
+
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [lib_file]
+
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=mock_result)
+
+        base_dir = MagicMock(spec=Path)
+        candidate = MagicMock(spec=Path)
+        candidate.exists.return_value = True
+        candidate.suffix = ".3mf"
+        base_dir.__truediv__ = MagicMock(return_value=candidate)
+
+        result = await _find_3mf_by_filename(1, "BMCU-BADGE.3mf", db, base_dir)
+
+        assert result == candidate
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_empty_filename(self):
+        """Returns None when filename is empty or just extensions."""
+        db = AsyncMock()
+        base_dir = MagicMock()
+
+        result = await _find_3mf_by_filename(1, ".3mf", db, base_dir)
+        assert result is None
+
+        result = await _find_3mf_by_filename(1, "", db, base_dir)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_falls_through_to_archive_search(self):
+        """Falls back to previous archives when library search returns no results."""
+        from pathlib import Path
+
+        # Library returns nothing
+        empty_result = MagicMock()
+        empty_result.scalars.return_value.all.return_value = []
+
+        # Archive returns a match
+        archive = MagicMock()
+        archive.id = 35
+        archive.file_path = "archives/35/BMCU-BADGE.3mf"
+        archive_result = MagicMock()
+        archive_result.scalars.return_value.all.return_value = [archive]
+
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=[empty_result, archive_result])
+
+        base_dir = MagicMock(spec=Path)
+        candidate = MagicMock(spec=Path)
+        candidate.exists.return_value = True
+        candidate.suffix = ".3mf"
+        base_dir.__truediv__ = MagicMock(return_value=candidate)
+
+        result = await _find_3mf_by_filename(1, "BMCU-BADGE.3mf", db, base_dir)
+
+        assert result == candidate
+        assert db.execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_nothing_found(self):
+        """Returns None when neither library nor archives have a matching 3MF."""
+        empty_result = MagicMock()
+        empty_result.scalars.return_value.all.return_value = []
+
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=empty_result)
+
+        base_dir = MagicMock()
+
+        result = await _find_3mf_by_filename(1, "nonexistent.3mf", db, base_dir)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_strips_path_and_extensions(self):
+        """Correctly strips path components and extensions for search."""
+        empty_result = MagicMock()
+        empty_result.scalars.return_value.all.return_value = []
+
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=empty_result)
+
+        base_dir = MagicMock()
+
+        # Should search for "BMCU-BADGE" base name even with path and .gcode.3mf
+        await _find_3mf_by_filename(1, "/sdcard/BMCU-BADGE.gcode.3mf", db, base_dir)
+
+        # Verify the execute was called (search was attempted with stripped name)
+        assert db.execute.call_count == 2  # library + archive search
+
+
+class TestTrackFrom3mfWithPreresolvedPath:
+    """Tests for _track_from_3mf() with threemf_path (no archive needed)."""
+
+    @pytest.mark.asyncio
+    async def test_uses_preresolved_path_without_archive(self):
+        """When threemf_path is provided with archive_id=None, uses the path directly."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=3)
+
+        # DB: 1st call = assignment lookup (live), 2nd = spool lookup
+        db = _mock_db_sequential([assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": []}]},
+            tray_now=255,
+            last_loaded_tray=3,
+            tray_change_log=[],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 5.0, "type": "PETG", "color": "#FFFFFF"}]
+
+        with (
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch("backend.app.core.config.settings") as mock_settings,
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=None,
+                status="completed",
+                print_name="BMCU-BADGE",
+                handled_trays=set(),
+                printer_manager=printer_manager,
+                db=db,
+                ams_mapping=[3, -1, -1, -1],
+                threemf_path=mock_path,
+            )
+
+        assert len(results) == 1
+        assert results[0]["spool_id"] == 1
+        assert results[0]["weight_used"] == 5.0
+
+    @pytest.mark.asyncio
+    async def test_skips_queue_lookup_without_archive_id(self):
+        """When archive_id is None, queue item lookup is skipped."""
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=0)
+
+        db = _mock_db_sequential([assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": []}]},
+            tray_now=0,
+            last_loaded_tray=0,
+            tray_change_log=[],
+        )
+
+        filament_usage = [{"slot_id": 1, "used_g": 2.0, "type": "PLA", "color": "#FF0000"}]
+
+        with (
+            patch(
+                "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
+                return_value=filament_usage,
+            ),
+            patch("backend.app.core.config.settings") as mock_settings,
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+
+            # Should NOT fail even though there's no archive_id for queue lookup
+            results = await _track_from_3mf(
+                printer_id=1,
+                archive_id=None,
+                status="completed",
+                print_name="Test",
+                handled_trays=set(),
+                printer_manager=printer_manager,
+                db=db,
+                tray_now_at_start=0,
+                threemf_path=mock_path,
+            )
+
+        assert len(results) == 1
+        assert results[0]["weight_used"] == 2.0
+
+
+class TestTrackFrom3mfPlateId:
+    """plate_id must propagate from PrintSession through _track_from_3mf to the
+    3MF parser, so multi-plate files dispatched for one plate only count that
+    plate's filament (#1697)."""
+
+    @pytest.mark.asyncio
+    async def test_passes_plate_id_to_3mf_extract(self):
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=0)
+
+        db = _mock_db_sequential([assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": []}]},
+            tray_now=0,
+            last_loaded_tray=0,
+            tray_change_log=[],
+        )
+
+        extract_mock = MagicMock(return_value=[{"slot_id": 1, "used_g": 190.0, "type": "PETG", "color": "#888888"}])
+
+        with (
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", extract_mock),
+            patch("backend.app.core.config.settings") as mock_settings,
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+
+            await _track_from_3mf(
+                printer_id=1,
+                archive_id=None,
+                status="completed",
+                print_name="GridfinityLid",
+                handled_trays=set(),
+                printer_manager=printer_manager,
+                db=db,
+                tray_now_at_start=0,
+                threemf_path=mock_path,
+                plate_id=2,
+            )
+
+        # plate_id=2 passed positionally as second arg
+        assert extract_mock.call_count == 1
+        assert extract_mock.call_args.args[1] == 2
+
+    @pytest.mark.asyncio
+    async def test_plate_id_none_for_non_queue_print(self):
+        spool = _make_spool(spool_id=1, label_weight=1000)
+        assignment = _make_assignment(spool_id=1, ams_id=0, tray_id=0)
+
+        db = _mock_db_sequential([assignment, spool])
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(
+            raw_data={"ams": [{"id": 0, "tray": []}]},
+            tray_now=0,
+            last_loaded_tray=0,
+            tray_change_log=[],
+        )
+
+        extract_mock = MagicMock(return_value=[{"slot_id": 1, "used_g": 5.0, "type": "PLA", "color": "#FF0000"}])
+
+        with (
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", extract_mock),
+            patch("backend.app.core.config.settings") as mock_settings,
+        ):
+            mock_settings.base_dir = MagicMock()
+            mock_path = MagicMock()
+            mock_path.exists.return_value = True
+
+            # No plate_id kwarg — direct/library Print flow.
+            await _track_from_3mf(
+                printer_id=1,
+                archive_id=None,
+                status="completed",
+                print_name="DirectPrint",
+                handled_trays=set(),
+                printer_manager=printer_manager,
+                db=db,
+                tray_now_at_start=0,
+                threemf_path=mock_path,
+            )
+
+        assert extract_mock.call_args.args[1] is None
+
+
+class TestArchiveTypesFromSpools:
+    """Tests for _archive_types_from_spools() — adopting the mapped inventory
+    spool's material as the archive/print-log/stats filament type (#2563)."""
+
+    @staticmethod
+    def _usage(slots):
+        """slots: list of (slot_id, used_g)."""
+        return [{"slot_id": sid, "used_g": g} for sid, g in slots]
+
+    @staticmethod
+    def _results(entries):
+        """entries: list of (slot_id, material)."""
+        return [{"slot_id": sid, "material": m} for sid, m in entries]
+
+    def test_mapped_material_overrides_sliced_type(self):
+        """The reporter's case: PLA-sliced slot mapped to a PETG spool → PETG."""
+        usage = self._usage([(1, 2.9)])
+        results = self._results([(1, "PETG")])
+        assert _archive_types_from_spools(usage, results) == ["PETG"]
+
+    def test_multi_slot_slot_ordered_and_deduped(self):
+        """Distinct materials keep slot order; a repeated material collapses."""
+        usage = self._usage([(1, 5.0), (2, 3.0), (3, 4.0)])
+        results = self._results([(2, "PETG"), (1, "PLA"), (3, "PLA")])
+        assert _archive_types_from_spools(usage, results) == ["PLA", "PETG"]
+
+    def test_partial_match_returns_none(self):
+        """All-or-nothing: an unmatched used slot means no rewrite at all."""
+        usage = self._usage([(1, 5.0), (2, 3.0)])
+        results = self._results([(1, "PETG")])  # slot 2 never resolved
+        assert _archive_types_from_spools(usage, results) is None
+
+    def test_zero_usage_slot_ignored(self):
+        """A slot that consumed nothing doesn't need a spool material."""
+        usage = self._usage([(1, 5.0), (2, 0.0)])
+        results = self._results([(1, "PETG")])
+        assert _archive_types_from_spools(usage, results) == ["PETG"]
+
+    def test_no_used_slots_returns_none(self):
+        assert _archive_types_from_spools([], []) is None
+        assert _archive_types_from_spools(self._usage([(1, 0.0)]), []) is None
+
+    def test_fallback_results_without_slot_id_ignored(self):
+        """AMS remain%-delta results carry slot_id=None and must not count."""
+        usage = self._usage([(1, 5.0)])
+        results = [{"slot_id": None, "material": "PETG"}]
+        assert _archive_types_from_spools(usage, results) is None
+
+    def test_blank_material_is_not_a_match(self):
+        """An empty/whitespace material doesn't satisfy the all-or-nothing gate."""
+        usage = self._usage([(1, 5.0)])
+        assert _archive_types_from_spools(usage, self._results([(1, "  ")])) is None
+        assert _archive_types_from_spools(usage, self._results([(1, " PETG ")])) == ["PETG"]

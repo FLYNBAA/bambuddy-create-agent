@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from sqlalchemy import DateTime, String, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from backend.app.core.database import Base
+
+if TYPE_CHECKING:
+    from backend.app.models.group import Group
+    from backend.app.models.user_email_pref import UserEmailPreference
+
+
+class User(Base):
+    """User model for authentication and authorization.
+
+    Users can belong to multiple groups, and their permissions are additive
+    across all groups. The legacy 'role' field is kept for backward compatibility
+    but is_admin property now also considers group membership.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    role: Mapped[str] = mapped_column(
+        String(20), default="user"
+    )  # "admin" or "user" (legacy, kept for backward compat)
+    auth_source: Mapped[str] = mapped_column(String(20), default="local")  # "local", "ldap", or "oidc"
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # Set whenever the local password is changed/reset — used to invalidate JWTs
+    # issued before the change (M-R7-B).  NULL means no password change recorded yet.
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Per-user Bambu Cloud credentials (when auth is enabled, each user has their own)
+    cloud_token: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
+    cloud_email: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    # "global" or "china"; NULL treated as "global" for legacy rows.
+    cloud_region: Mapped[str | None] = mapped_column(String(10), nullable=True, default=None)
+    # Set when Bambu answers 401 to a call made with ``cloud_token`` — the token
+    # has expired or been revoked. NULL means "not known to be dead". The token
+    # itself is kept: clearing it would lose the email/region we show on the
+    # re-login form, and a token can only be replaced by signing in again anyway.
+    # Bambu's token is opaque and carries no expiry we can read, and Bambuddy
+    # does not persist the refresh token, so this flag is the *only* record that
+    # a stored credential has stopped working (#2562 follow-up).
+    cloud_token_invalid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+
+    # Per-user Orca Cloud credentials. Unlike Bambu Cloud, Orca uses Supabase PKCE
+    # with short-lived access tokens (1h) and rotating single-use refresh tokens,
+    # so we store the refresh token + expiry alongside the access token.
+    orca_cloud_token: Mapped[str | None] = mapped_column(String(2000), nullable=True, default=None)
+    orca_cloud_refresh_token: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    orca_cloud_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    orca_cloud_email: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    orca_cloud_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    # Transient PKCE state held between /orca-cloud/auth/start and /orca-cloud/auth/finish.
+    # Cleared on successful finish; expires after 10 minutes if the user abandons the flow.
+    orca_cloud_pending_verifier: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    orca_cloud_pending_state: Mapped[str | None] = mapped_column(String(32), nullable=True, default=None)
+    orca_cloud_pending_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+
+    # Relationship to groups through association table
+    groups: Mapped[list[Group]] = relationship(
+        "Group",
+        secondary="user_groups",
+        back_populates="users",
+        lazy="selectin",
+    )
+
+    # Relationship to email notification preferences
+    email_preferences: Mapped[UserEmailPreference | None] = relationship(
+        "UserEmailPreference",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+    @property
+    def is_admin(self) -> bool:
+        """Check if user is an admin.
+
+        Returns True if:
+        - User has legacy role='admin', OR
+        - User belongs to the Administrators group
+        """
+        if self.role == "admin":
+            return True
+        return any(g.name == "Administrators" for g in self.groups)
+
+    def get_permissions(self) -> set[str]:
+        """Get all permissions from all groups the user belongs to.
+
+        Returns a set of permission strings. Permissions are additive across groups.
+        """
+        permissions: set[str] = set()
+        for group in self.groups:
+            if group.permissions:
+                permissions.update(group.permissions)
+        return permissions
+
+    def has_permission(self, permission: str) -> bool:
+        """Check if user has a specific permission.
+
+        Admins have all permissions. For other users, checks if the permission
+        exists in any of their groups.
+        """
+        if self.is_admin:
+            return True
+        return permission in self.get_permissions()
+
+    def has_all_permissions(self, *permissions: str) -> bool:
+        """Check if user has ALL specified permissions.
+
+        Admins have all permissions. For other users, checks if all permissions
+        exist in their combined group permissions.
+        """
+        if self.is_admin:
+            return True
+        user_permissions = self.get_permissions()
+        return all(p in user_permissions for p in permissions)
+
+    def has_any_permission(self, *permissions: str) -> bool:
+        """Check if user has ANY of the specified permissions.
+
+        Admins have all permissions. For other users, checks if at least one
+        permission exists in their combined group permissions.
+        """
+        if self.is_admin:
+            return True
+        user_permissions = self.get_permissions()
+        return any(p in user_permissions for p in permissions)
+
+    def __repr__(self) -> str:
+        return f"<User {self.username}>"

@@ -1,0 +1,512 @@
+import { useEffect, useMemo, useState } from 'react';
+import { useParams, useSearchParams } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
+import { Layers, Clock, Timer, Printer, Flame, Square, Box } from 'lucide-react';
+import { api, ApiError, withStreamToken } from '../api/client';
+import { formatDuration, formatETA, type TimeFormat } from '../utils/date';
+
+type TFunction = (key: string, options?: Record<string, unknown>) => string;
+
+type OverlaySize = 'small' | 'medium' | 'large';
+
+interface OverlayConfig {
+  size: OverlaySize;
+  fps: number;
+  showCamera: boolean;
+  showProgress: boolean;
+  showLayers: boolean;
+  showEta: boolean;
+  showFilename: boolean;
+  showStatus: boolean;
+  showPrinter: boolean;
+  showNozzle: boolean;
+  showBed: boolean;
+  showChamber: boolean;
+}
+
+function formatPrintName(name: string | null, gcodeFile: string | null | undefined, t: (key: string, fallback: string, opts?: Record<string, unknown>) => string): string {
+  if (!name) return '';
+  if (!gcodeFile) return name;
+  const match = gcodeFile.match(/plate_(\d+)\.gcode/);
+  if (match && parseInt(match[1], 10) > 1) {
+    return `${name} — ${t('printers.plateNumber', 'Plate {{number}}', { number: match[1] })}`;
+  }
+  return name;
+}
+
+function parseConfig(params: URLSearchParams): OverlayConfig {
+  // The default set is deliberately unchanged by #1422: temperatures are opt-in,
+  // so every overlay URL already pasted into an OBS scene keeps looking the same
+  // after upgrading.
+  const show = params.get('show')?.split(',') || ['progress', 'layers', 'eta', 'filename', 'status'];
+
+  // Parse FPS (default 15, max 30, min 1)
+  const fpsParam = parseInt(params.get('fps') || '15', 10);
+  const fps = Math.min(Math.max(isNaN(fpsParam) ? 15 : fpsParam, 1), 30);
+
+  // Parse camera toggle (default true, set camera=false to hide)
+  const cameraParam = params.get('camera');
+  const showCamera = cameraParam !== 'false' && cameraParam !== '0';
+
+  return {
+    size: (params.get('size') as OverlaySize) || 'medium',
+    fps,
+    showCamera,
+    showProgress: show.includes('progress'),
+    showLayers: show.includes('layers'),
+    showEta: show.includes('eta'),
+    showFilename: show.includes('filename'),
+    showStatus: show.includes('status'),
+    showPrinter: show.includes('printer'),
+    showNozzle: show.includes('nozzle'),
+    showBed: show.includes('bed'),
+    showChamber: show.includes('chamber'),
+  };
+}
+
+// Accepts the minimal shape shared by PrinterStatus (logged-in path) and the
+// token-authed OverlayStatus (kiosk path) — both carry state + stg_cur_name.
+function getStatusText(status: { state: string | null; stg_cur_name?: string | null }, t: TFunction): string {
+  if (status.stg_cur_name) return status.stg_cur_name;
+
+  switch (status.state) {
+    case 'RUNNING': return t('streamOverlay.status.printing');
+    case 'PAUSE': return t('streamOverlay.status.paused');
+    case 'FINISH': return t('streamOverlay.status.finished');
+    case 'FAILED': return t('streamOverlay.status.failed');
+    case 'IDLE': return t('streamOverlay.status.idle');
+    default: return status.state || t('streamOverlay.status.unknown');
+  }
+}
+
+// Reads one reading out of either status shape. The kiosk feed types
+// temperatures as Record<string, number>; the logged-in PrinterStatus types it
+// as a named object that also carries `*_heating` booleans. Narrowing here lets
+// one render path serve both without casting.
+function readTemp(temps: Record<string, unknown>, key: string): number | null {
+  const value = temps[key];
+  return typeof value === 'number' ? value : null;
+}
+
+interface TempReadingProps {
+  icon: React.ReactNode;
+  label: string;
+  current: number;
+  target: number | null;
+  sizes: ReturnType<typeof getSizeClasses>;
+}
+
+// One "Nozzle 220°C" reading. The target is appended only while it is set and
+// still differs from the current value, so a hotend that has reached
+// temperature reads "220°C" for the rest of the print instead of the noisier
+// "220 / 220°C".
+function TempReading({ icon, label, current, target, sizes }: TempReadingProps) {
+  const heating = target != null && target > 0 && Math.round(target) !== Math.round(current);
+  return (
+    <div className={`flex items-center ${sizes.gap} text-white/70`}>
+      {icon}
+      <span className={sizes.text}>
+        <span className="mr-1">{label}</span>
+        <span className="text-white">{Math.round(current)}°C</span>
+        {heating && (
+          <>
+            <span className="mx-1">/</span>
+            <span>{Math.round(target)}°C</span>
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function getSizeClasses(size: OverlaySize) {
+  switch (size) {
+    case 'small':
+      return {
+        container: 'p-3',
+        text: 'text-sm',
+        textLarge: 'text-lg',
+        progressHeight: 'h-2',
+        icon: 'w-3 h-3',
+        gap: 'gap-2',
+        logoHeight: 'h-12',
+      };
+    case 'large':
+      return {
+        container: 'p-6',
+        text: 'text-xl',
+        textLarge: 'text-3xl',
+        progressHeight: 'h-4',
+        icon: 'w-6 h-6',
+        gap: 'gap-4',
+        logoHeight: 'h-24',
+      };
+    case 'medium':
+    default:
+      return {
+        container: 'p-4',
+        text: 'text-base',
+        textLarge: 'text-xl',
+        progressHeight: 'h-3',
+        icon: 'w-4 h-4',
+        gap: 'gap-3',
+        logoHeight: 'h-16',
+      };
+  }
+}
+
+export function StreamOverlayPage() {
+  const { printerId } = useParams<{ printerId: string }>();
+  const [searchParams] = useSearchParams();
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const id = parseInt(printerId || '0', 10);
+  const [imageKey, setImageKey] = useState(Date.now());
+
+  const config = useMemo(() => parseConfig(searchParams), [searchParams]);
+  const sizes = getSizeClasses(config.size);
+
+  // Kiosk mode (#2613): OBS and other embeds have no login session, so they
+  // pass an `overlay`-scoped token in the URL. When present, every data call
+  // (status + camera stream) is authenticated by that token instead of a JWT.
+  const token = searchParams.get('token');
+  const kiosk = token != null && token !== '';
+
+  // Kiosk path: one token-authenticated call for name + live status + the one
+  // setting the overlay reads. No JWT, so this is the only feed available.
+  const { data: overlay } = useQuery({
+    queryKey: ['overlayStatus', id, token],
+    queryFn: () => api.getOverlayStatus(id, token ?? undefined),
+    enabled: id > 0 && kiosk,
+    refetchInterval: 2000,
+  });
+
+  // Logged-in path: the ordinary JWT-authenticated queries, unchanged. Disabled
+  // in kiosk mode so an unauthenticated OBS browser never fires a doomed 401.
+  const { data: printerData } = useQuery({
+    queryKey: ['printer', id],
+    queryFn: () => api.getPrinter(id),
+    enabled: id > 0 && !kiosk,
+  });
+
+  const { data: statusData } = useQuery({
+    queryKey: ['printerStatus', id],
+    queryFn: () => api.getPrinterStatus(id),
+    enabled: id > 0 && !kiosk,
+    refetchInterval: 2000,
+  });
+
+  const { data: settings } = useQuery({
+    queryKey: ['settings'],
+    queryFn: api.getSettings,
+    enabled: !kiosk,
+  });
+
+  // Normalize the two sources into the shape the render below reads. Memoized
+  // because the title effect depends on `printer` — a fresh object literal each
+  // render would re-run it (and reset document.title) on every poll tick.
+  const printer = useMemo(
+    () =>
+      kiosk
+        ? overlay && { name: overlay.name, camera_rotation: overlay.camera_rotation }
+        : printerData,
+    [kiosk, overlay, printerData],
+  );
+  const status = kiosk ? overlay : statusData;
+  const timeFormat: TimeFormat = (kiosk ? overlay?.time_format : settings?.time_format) || 'system';
+
+  // WebSocket for real-time updates (JWT-authenticated; skipped in kiosk mode,
+  // where the token can't mint a ws-token — the 2s poll above is the feed).
+  useEffect(() => {
+    if (!id || kiosk) return;
+
+    let ws: WebSocket | null = null;
+    let cancelled = false;
+
+    // GHSA-r2qv follow-up: mint a ws-token before connecting. Uses
+    // api.getWebSocketToken so the JWT Authorization header rides along
+    // (raw fetch+credentials:'include' would miss it — Bambuddy uses
+    // Bearer tokens, not cookies, for JWT auth). Auth-disabled deployments
+    // succeed even without a token.
+    (async () => {
+      let wsToken: string | undefined;
+      try {
+        const resp = await api.getWebSocketToken();
+        wsToken = resp.token;
+      } catch (err) {
+        // A 401 (JWT expired) / 403 (no WEBSOCKET_CONNECT permission) is an
+        // auth decision — a tokenless socket would just be closed 4401, so
+        // skip opening one and let the REST polling fallback keep the overlay
+        // fresh. There's no reconnect loop on this page, so this is purely
+        // avoiding one doomed socket per mount. A network/5xx error is not
+        // auth: fall through and try anyway (auth-disabled deployments land
+        // here with no token and connect fine).
+        const status = err instanceof ApiError ? err.status : 0;
+        if (status === 401 || status === 403) return;
+      }
+      if (cancelled) return;
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const tokenParam = wsToken ? `?token=${encodeURIComponent(wsToken)}` : '';
+      const wsUrl = `${protocol}//${window.location.host}/api/v1/ws${tokenParam}`;
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'printer_status' && data.printer_id === id) {
+          queryClient.setQueryData(['printerStatus', id], data.status);
+        }
+      } catch {
+        // Ignore parse errors
+      }
+    };
+
+      ws.onerror = () => {
+        // WebSocket error - polling will continue as fallback
+      };
+    })();
+
+    return () => {
+      cancelled = true;
+      if (ws) ws.close();
+    };
+  }, [id, kiosk, queryClient]);
+
+  // Update document title
+  useEffect(() => {
+    document.title = printer ? `${printer.name} - ${t('streamOverlay.title')}` : t('streamOverlay.title');
+    return () => {
+      document.title = 'Bambuddy';
+    };
+  }, [printer, t]);
+
+  // Refresh stream on error
+  const handleStreamError = () => {
+    setTimeout(() => {
+      setImageKey(Date.now());
+    }, 3000);
+  };
+
+  if (!id) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <p className="text-white">{t('streamOverlay.invalidPrinterId')}</p>
+      </div>
+    );
+  }
+
+  if (!status) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <p className="text-gray-400">{t('common.loading')}</p>
+      </div>
+    );
+  }
+
+  const isPrinting = status.state === 'RUNNING' || status.state === 'PAUSE';
+  const progress = status.progress || 0;
+
+  // Temperature readings the URL asked for, in a fixed order, skipping any the
+  // printer doesn't report. Labels reuse printers.heaterHistory.* so the naming
+  // matches the heater chart rather than inventing a second vocabulary.
+  const temps: Record<string, unknown> = status.temperatures ?? {};
+  const tempReadings: {
+    key: string;
+    icon: React.ReactNode;
+    label: string;
+    current: number;
+    target: number | null;
+  }[] = [];
+  if (config.showNozzle) {
+    const nozzle = readTemp(temps, 'nozzle');
+    const nozzle2 = readTemp(temps, 'nozzle_2');
+    if (nozzle != null) {
+      tempReadings.push({
+        key: 'nozzle',
+        icon: <Flame className={sizes.icon} />,
+        label: t('printers.heaterHistory.nozzle', 'Nozzle'),
+        current: nozzle,
+        target: readTemp(temps, 'nozzle_target'),
+      });
+    }
+    if (nozzle2 != null) {
+      tempReadings.push({
+        key: 'nozzle_2',
+        icon: <Flame className={sizes.icon} />,
+        label: t('printers.heaterHistory.nozzle2', 'Nozzle 2'),
+        current: nozzle2,
+        target: readTemp(temps, 'nozzle_2_target'),
+      });
+    }
+  }
+  if (config.showBed) {
+    const bed = readTemp(temps, 'bed');
+    if (bed != null) {
+      tempReadings.push({
+        key: 'bed',
+        icon: <Square className={sizes.icon} />,
+        label: t('printers.heaterHistory.bed', 'Bed'),
+        current: bed,
+        target: readTemp(temps, 'bed_target'),
+      });
+    }
+  }
+  if (config.showChamber) {
+    const chamber = readTemp(temps, 'chamber');
+    if (chamber != null) {
+      tempReadings.push({
+        key: 'chamber',
+        icon: <Box className={sizes.icon} />,
+        label: t('printers.heaterHistory.chamber', 'Chamber'),
+        current: chamber,
+        target: readTemp(temps, 'chamber_target'),
+      });
+    }
+  }
+  // Append the kiosk token directly rather than leaning on withStreamToken's
+  // module cache — the cache is populated by an effect and would miss the first
+  // render (a 401 flash before the retry). The logged-in path keeps the cache.
+  const camPath = `/api/v1/printers/${id}/camera/stream?fps=${config.fps}&t=${imageKey}`;
+  const streamUrl = kiosk && token
+    ? `${camPath}&token=${encodeURIComponent(token)}`
+    : withStreamToken(camPath);
+
+  return (
+    <div className="min-h-screen bg-black relative overflow-hidden">
+      {/* Camera feed - fullscreen background (optional) */}
+      {config.showCamera && (
+        <img
+          key={imageKey}
+          src={streamUrl}
+          alt={t('streamOverlay.cameraStream')}
+          className="absolute inset-0 w-full h-full object-contain"
+          style={printer?.camera_rotation ? { transform: `rotate(${printer.camera_rotation}deg)` } : undefined}
+          onError={handleStreamError}
+        />
+      )}
+
+      {/* Bambuddy logo - top right */}
+      <a
+        href="https://github.com/maziggy/bambuddy"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="absolute top-4 right-4 z-10"
+      >
+        <img
+          src="/img/bambuddy_logo_dark_transparent.png"
+          alt="Bambuddy"
+          className={`${sizes.logoHeight} object-contain drop-shadow-lg hover:scale-105 transition-transform`}
+        />
+      </a>
+
+      {/* Status overlay - bottom */}
+      <div className="absolute bottom-0 left-0 right-0 z-10 bg-gradient-to-t from-black/80 via-black/60 to-transparent">
+        <div className={`${sizes.container}`}>
+          {/* Printer name */}
+          {config.showPrinter && printer && (
+            <div className={`flex items-center ${sizes.gap} mb-2`}>
+              <Printer className={`${sizes.icon} text-white/70`} />
+              <span className={`${sizes.text} text-white font-medium`}>{printer.name}</span>
+            </div>
+          )}
+
+          {/* Filename */}
+          {config.showFilename && status.current_print && (
+            <div className={`${sizes.textLarge} text-white font-semibold mb-2 truncate drop-shadow-md`}>
+              {formatPrintName(status.current_print.replace(/\.gcode\.3mf$|\.3mf$|\.gcode$/i, ''), status.gcode_file, t)}
+            </div>
+          )}
+
+          {/* Status text */}
+          {config.showStatus && (
+            <div className={`${sizes.text} text-white/70 mb-2`}>
+              {getStatusText(status, t)}
+            </div>
+          )}
+
+          {/* Progress bar */}
+          {config.showProgress && isPrinting && (
+            <div className="mb-3">
+              <div className={`flex items-center justify-between mb-1 ${sizes.text}`}>
+                <span className="text-white/70">{t('streamOverlay.progress')}</span>
+                <span className="text-white font-bold">{Math.round(progress)}%</span>
+              </div>
+              <div className={`w-full bg-white/20 rounded-full ${sizes.progressHeight}`}>
+                <div
+                  className={`bg-bambu-green ${sizes.progressHeight} rounded-full transition-all duration-500`}
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Stats row */}
+          {isPrinting && (config.showLayers || config.showEta) && (
+            <div className={`flex items-center ${sizes.gap} flex-wrap`}>
+              {/* Layers */}
+              {config.showLayers && status.layer_num != null && status.total_layers != null && status.total_layers > 0 && (
+                <div className={`flex items-center ${sizes.gap} text-white/70`}>
+                  <Layers className={sizes.icon} />
+                  <span className={sizes.text}>
+                    <span className="text-white">{status.layer_num}</span>
+                    <span className="mx-1">/</span>
+                    <span>{status.total_layers}</span>
+                  </span>
+                </div>
+              )}
+
+              {/* Remaining time */}
+              {config.showEta && status.remaining_time != null && status.remaining_time > 0 && (
+                <>
+                  <div className={`flex items-center ${sizes.gap} text-white/70`}>
+                    <Timer className={sizes.icon} />
+                    <span className={`${sizes.text} text-white`}>
+                      {formatDuration(status.remaining_time * 60)}
+                    </span>
+                  </div>
+
+                  <div className={`flex items-center ${sizes.gap} text-white/70`}>
+                    <Clock className={sizes.icon} />
+                    <span className={`${sizes.text} text-white`}>
+                      {t('streamOverlay.eta')} {formatETA(status.remaining_time, timeFormat, t)}
+                    </span>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Idle state */}
+          {!isPrinting && (
+            <div className={`${sizes.text} text-white/70 py-2`}>
+              {status.connected ? t('streamOverlay.printerIdle') : t('streamOverlay.printerOffline')}
+            </div>
+          )}
+
+          {/* Temperatures (#1422). Rendered whether or not a print is running —
+              a preheating or cooling printer is exactly when these are worth
+              watching. Each reading appears only when the printer reports it,
+              so a single-nozzle machine shows one nozzle and a model without a
+              chamber sensor shows no chamber row even if `chamber` is in
+              ?show= (the backend omits the reading entirely for those). */}
+          {tempReadings.length > 0 && (
+            <div className={`flex items-center ${sizes.gap} flex-wrap mt-2`}>
+              {tempReadings.map((reading) => (
+                <TempReading
+                  key={reading.key}
+                  icon={reading.icon}
+                  label={reading.label}
+                  current={reading.current}
+                  target={reading.target}
+                  sizes={sizes}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

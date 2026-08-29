@@ -1,0 +1,329 @@
+"""Pydantic schemas for GitHub backup configuration."""
+
+import re
+from datetime import datetime
+
+from pydantic import BaseModel, Field, model_validator
+
+from backend.app.core.compat import StrEnum
+
+
+class ScheduleType(StrEnum):
+    """Backup schedule types."""
+
+    HOURLY = "hourly"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+
+
+class ProviderType(StrEnum):
+    """Git hosting provider types."""
+
+    GITHUB = "github"
+    GITLAB = "gitlab"
+    GITEA = "gitea"
+    FORGEJO = "forgejo"
+
+
+class GitHubBackupConfigCreate(BaseModel):
+    """Schema for creating/updating GitHub backup config."""
+
+    repository_url: str = Field(..., min_length=1, max_length=500, description="Git repository URL")
+    access_token: str = Field(..., min_length=1, description="Personal Access Token")
+    branch: str = Field(default="main", max_length=100, description="Branch to push to")
+    provider: ProviderType = Field(default=ProviderType.GITHUB, description="Git hosting provider")
+
+    schedule_enabled: bool = Field(default=False, description="Enable scheduled backups")
+    schedule_type: ScheduleType = Field(default=ScheduleType.DAILY, description="Schedule frequency")
+
+    backup_kprofiles: bool = Field(default=True, description="Backup K-profiles")
+    backup_cloud_profiles: bool = Field(default=True, description="Backup Bambu Cloud profiles")
+    backup_settings: bool = Field(default=False, description="Backup app settings")
+    backup_spools: bool = Field(default=False, description="Backup spool inventory")
+    backup_archives: bool = Field(default=False, description="Backup print archive history")
+
+    allow_insecure_http: bool = Field(default=False, description="Allow HTTP (non-TLS) repository URLs")
+    enabled: bool = Field(default=True, description="Enable backup feature")
+
+    @model_validator(mode="after")
+    def validate_repo_url(self) -> "GitHubBackupConfigCreate":
+        url = self.repository_url.strip().rstrip("/")
+        self.repository_url = url
+        https_or_ssh = [
+            r"^https://[\w.-]+(:\d+)?/[\w.-]+(\/[\w.-]+)+(?:\.git)?/?$",
+            r"^git@[\w.-]+:[\w.-]+(\/[\w.-]+)+(?:\.git)?$",
+        ]
+        http_pattern = r"^http://[\w.-]+(:\d+)?/[\w.-]+(\/[\w.-]+)+(?:\.git)?/?$"
+        if any(re.match(p, url) for p in https_or_ssh):
+            return self
+        if re.match(http_pattern, url):
+            if not self.allow_insecure_http:
+                raise ValueError(
+                    "This URL uses HTTP instead of HTTPS. "
+                    "Enable 'Allow insecure HTTP' if your instance does not use TLS."
+                )
+            return self
+        raise ValueError(
+            "Invalid Git repository URL. Expected: https://host/owner/repo, "
+            "http://host/owner/repo (with 'Allow insecure HTTP' enabled), or git@host:owner/repo"
+        )
+
+
+class GitHubBackupConfigUpdate(BaseModel):
+    """Schema for updating GitHub backup config (all fields optional)."""
+
+    repository_url: str | None = Field(default=None, max_length=500)
+    access_token: str | None = Field(default=None)
+    branch: str | None = Field(default=None, max_length=100)
+    provider: ProviderType | None = None
+
+    schedule_enabled: bool | None = None
+    schedule_type: ScheduleType | None = None
+
+    backup_kprofiles: bool | None = None
+    backup_cloud_profiles: bool | None = None
+    backup_settings: bool | None = None
+    backup_spools: bool | None = None
+    backup_archives: bool | None = None
+
+    allow_insecure_http: bool | None = None
+    enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_repo_url(self) -> "GitHubBackupConfigUpdate":
+        if self.repository_url is None:
+            return self
+        url = self.repository_url.strip().rstrip("/")
+        self.repository_url = url
+        valid_patterns = [
+            r"^https?://[\w.-]+(:\d+)?/[\w.-]+(\/[\w.-]+)+(?:\.git)?/?$",
+            r"^git@[\w.-]+:[\w.-]+(\/[\w.-]+)+(?:\.git)?$",
+        ]
+        if not any(re.match(p, url) for p in valid_patterns):
+            raise ValueError(
+                "Invalid repository URL. Expected: https://host/owner/repo, "
+                "http://host/owner/repo, or git@host:owner/repo"
+            )
+        return self
+
+
+class GitHubBackupConfigResponse(BaseModel):
+    """Schema for GitHub backup config API response."""
+
+    id: int
+    repository_url: str
+    has_token: bool = Field(description="Whether an access token is configured")
+    branch: str
+    provider: str
+    allow_insecure_http: bool
+
+    schedule_enabled: bool
+    schedule_type: str
+
+    backup_kprofiles: bool
+    backup_cloud_profiles: bool
+    backup_settings: bool
+    backup_spools: bool
+    backup_archives: bool
+
+    enabled: bool
+    last_backup_at: datetime | None
+    last_backup_status: str | None
+    last_backup_message: str | None
+    last_backup_commit_sha: str | None
+    next_scheduled_run: datetime | None
+
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class GitHubBackupLogResponse(BaseModel):
+    """Schema for backup log API response."""
+
+    id: int
+    config_id: int
+    started_at: datetime
+    completed_at: datetime | None
+    status: str
+    trigger: str
+    commit_sha: str | None
+    files_changed: int
+    error_message: str | None
+
+    class Config:
+        from_attributes = True
+
+
+class CloudAccountCounts(BaseModel):
+    """How many connected cloud accounts a backup would collect presets from.
+
+    Counts only, never identities: with auth enabled these are other users'
+    accounts, and whoever administers the backup has no business learning who
+    signed in to what. The number is enough to answer the only question the UI
+    asks — is the Cloud Profiles category worth offering at all (#2717).
+    """
+
+    bambu: int = Field(default=0, description="Connected Bambu Cloud accounts")
+    orca: int = Field(default=0, description="Connected Orca Cloud accounts")
+
+
+class GitHubBackupStatus(BaseModel):
+    """Schema for current backup status."""
+
+    configured: bool = Field(description="Whether backup is configured")
+    enabled: bool = Field(description="Whether backup is enabled")
+    is_running: bool = Field(description="Whether a backup is currently running")
+    restore_running: bool = Field(default=False, description="Whether a restore is currently running")
+    progress: str | None = Field(default=None, description="Current backup progress message")
+    last_backup_at: datetime | None
+    last_backup_status: str | None
+    next_scheduled_run: datetime | None
+
+
+class GitHubTestConnectionResponse(BaseModel):
+    """Schema for test connection response."""
+
+    success: bool
+    message: str
+    repo_name: str | None = None
+    permissions: dict | None = None
+    # True = confirmed private. False = confirmed public (or non-private such
+    # as GitLab "internal"). None = could not be determined (older self-hosted
+    # API, non-2xx response). The backup config endpoints refuse anything that
+    # isn't an explicit True.
+    is_private: bool | None = None
+
+
+class GitHubBackupTriggerResponse(BaseModel):
+    """Schema for manual backup trigger response."""
+
+    success: bool
+    message: str
+    log_id: int | None = None
+    commit_sha: str | None = None
+    files_changed: int = 0
+
+
+# --- Restore (issue #2656) --------------------------------------------------
+
+# "HEAD" means "whatever the branch tip is right now"; the service resolves it
+# to a concrete SHA before reading anything so preview and apply can't straddle
+# two different commits. Anything else must look like a git object name.
+REF_PATTERN = r"^(?:HEAD|[0-9a-fA-F]{7,40})$"
+
+
+class RestoreCategory(StrEnum):
+    """Backup categories that can be restored.
+
+    Cloud profiles are deliberately absent: restoring a preset means writing to
+    a Bambu or Orca Cloud account, which is a different operation from every
+    other category here — those land in the local database, or on a printer the
+    instance already owns. Tracked separately from #2656.
+    """
+
+    KPROFILES = "kprofiles"
+    SETTINGS = "settings"
+    SPOOLS = "spools"
+    ARCHIVES = "archives"
+
+
+class GitHubCommitInfo(BaseModel):
+    """One commit in the backup repository."""
+
+    sha: str
+    message: str
+    author: str
+    date: str
+
+
+class GitHubCommitListResponse(BaseModel):
+    """Schema for the commit picker."""
+
+    success: bool
+    message: str
+    branch: str
+    commits: list[GitHubCommitInfo] = Field(default_factory=list)
+
+
+class GitHubRestorePreviewCategory(BaseModel):
+    """What a single category looks like inside one backup commit."""
+
+    category: RestoreCategory
+    available: bool = Field(description="Whether this category is present in the commit")
+    item_count: int = Field(default=0, description="Rows/profiles found, 0 when unavailable")
+    detail: str | None = Field(default=None, description="Why unavailable, or extra context, in English")
+    detail_code: str | None = Field(
+        default=None, description="Key under backup.restoreFromGit.details, for the client to translate"
+    )
+    detail_params: dict[str, str | int] = Field(
+        default_factory=dict, description="Interpolation values for detail_code"
+    )
+
+
+class GitHubRestorePreview(BaseModel):
+    """Schema for inspecting a commit before restoring from it."""
+
+    success: bool
+    message: str
+    ref: str = Field(description="The concrete commit SHA that was inspected")
+    commit: GitHubCommitInfo | None = None
+    metadata_version: str | None = Field(default=None, description="version field from backup_metadata.json")
+    categories: list[GitHubRestorePreviewCategory] = Field(default_factory=list)
+
+
+class GitHubRestoreRequest(BaseModel):
+    """Schema for triggering a restore."""
+
+    ref: str = Field(default="HEAD", pattern=REF_PATTERN, description="Commit SHA to restore from, or HEAD")
+    categories: list[RestoreCategory] = Field(..., min_length=1, description="Categories to restore")
+    overwrite_existing: bool = Field(
+        default=False,
+        description="Update rows that already exist locally. When false, only missing rows are inserted.",
+    )
+
+    @model_validator(mode="after")
+    def deduplicate_categories(self) -> "GitHubRestoreRequest":
+        # Same category twice would double-count the result totals.
+        seen: list[RestoreCategory] = []
+        for category in self.categories:
+            if category not in seen:
+                seen.append(category)
+        self.categories = seen
+        return self
+
+
+class GitHubRestoreNote(BaseModel):
+    """One tally note, as a translation code plus the values it interpolates.
+
+    Follows the ``backup.pathCheck`` contract already in use one card down in the
+    same component: the server chooses the code and supplies typed params, and
+    the client renders ``t(`...${code}`, { ...params, defaultValue: message })``.
+    ``message`` is the English original, so a client that does not know a code
+    yet still shows something sensible rather than the raw key.
+    """
+
+    code: str = Field(description="Key under backup.restoreFromGit.notes")
+    params: dict[str, str | int] = Field(default_factory=dict, description="Interpolation values for code")
+    message: str = Field(description="English rendering, used as the client's defaultValue")
+
+
+class GitHubRestoreCategoryResult(BaseModel):
+    """Per-category outcome of a restore."""
+
+    restored: int = 0
+    skipped: int = 0
+    failed: int = 0
+    notes: list[GitHubRestoreNote] = Field(default_factory=list)
+
+
+class GitHubRestoreResponse(BaseModel):
+    """Schema for the restore result."""
+
+    success: bool
+    message: str
+    log_id: int | None = None
+    ref: str | None = Field(default=None, description="The concrete commit SHA restored from")
+    results: dict[str, GitHubRestoreCategoryResult] = Field(default_factory=dict)
