@@ -13,7 +13,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.library import LibraryFile
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.utils import threemf_tools
-from backend.app.utils.safe_path import safe_join_under
+from backend.app.utils.safe_path import PathTraversalError, safe_join_under
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +47,18 @@ def plate_scoped_run_estimate(
     return round(plate_grams, 2), plate_cost
 
 
-def _source_path(library_file: LibraryFile) -> Path:
+def _source_path(library_file: LibraryFile) -> Path | None:
     path = Path(library_file.file_path)
     if path.is_absolute():
         # SEC-PATH-OK: absolute paths are persisted LibraryFile locations for
         # configured external libraries; this branch performs no path join.
         return path
-    return safe_join_under(settings.base_dir, library_file.file_path, http=False)
+    try:
+        return safe_join_under(settings.base_dir, library_file.file_path, http=False)
+    except PathTraversalError:
+        # A malformed legacy path is unavailable for optional cost estimation;
+        # it must not become a 503 while queue creation continues safely.
+        return None
 
 
 def _parse_mapping(mapping: list[int] | str | None) -> list[int] | None:
@@ -117,7 +122,7 @@ async def estimate_queue_source_cost(
 
     path = _source_path(library_file)
     usage: list[dict] = []
-    if path.exists():
+    if path is not None and path.exists():
         usage = threemf_tools.extract_plate_metadata_from_3mf(path, plate_id).filament_usage
 
     metadata = library_file.file_metadata or {}

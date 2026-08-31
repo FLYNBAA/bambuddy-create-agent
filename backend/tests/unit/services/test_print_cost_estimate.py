@@ -15,11 +15,10 @@ def library_file(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows must not reinterpret POSIX roots as trusted native paths")
-def test_windows_rejects_posix_root_library_path(monkeypatch, tmp_path):
+def test_windows_ignores_posix_root_library_path_for_optional_cost_estimate(monkeypatch, tmp_path):
     monkeypatch.setattr(print_cost_estimate.settings, "base_dir", tmp_path)
 
-    with pytest.raises(ValueError, match="Absolute path part not allowed"):
-        print_cost_estimate._source_path(SimpleNamespace(file_path="/data/secret.3mf"))
+    assert print_cost_estimate._source_path(SimpleNamespace(file_path="/data/secret.3mf")) is None
 
 
 @pytest.mark.asyncio

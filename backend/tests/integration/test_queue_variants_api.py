@@ -12,16 +12,17 @@ from sqlalchemy import select
 
 
 @pytest.fixture
-async def sliced_file_factory(db_session):
+async def sliced_file_factory(db_session, tmp_path):
     _counter = [0]
 
     async def _create(model: str | None = "H2S", **kwargs):
         from backend.app.models.library import LibraryFile
 
         _counter[0] += 1
+        file_path = tmp_path / f"job_{_counter[0]}.gcode.3mf"
         defaults = {
             "filename": f"job_{_counter[0]}.gcode.3mf",
-            "file_path": f"/test/job_{_counter[0]}.gcode.3mf",
+            "file_path": str(file_path),
             "file_size": 100,
             "file_type": "gcode.3mf",
             "file_metadata": {"sliced_for_model": model} if model else {},

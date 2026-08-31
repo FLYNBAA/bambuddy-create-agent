@@ -11,6 +11,7 @@ from backend.app.three_d_agent.contracts import (
     SessionSnapshot,
     SessionStatus,
 )
+from backend.app.three_d_agent.conversation import CreatorConversationPlanner
 
 
 def _snapshot(report_status: str) -> SessionSnapshot:
@@ -48,3 +49,24 @@ def test_creator_provider_url_updates_reject_unsafe_schemes() -> None:
 def test_chat_requires_explicit_issue_acknowledgment_phrase() -> None:
     assert _message_acknowledges_print_issues("我已了解打印分析报告中的问题，确认继续")
     assert not _message_acknowledges_print_issues("确认继续生成多色 3MF")
+
+
+def test_creator_chat_normalizes_provider_create_action_to_prepare() -> None:
+    session = SessionSnapshot(session_id="session", status=SessionStatus.NEEDS_INPUT)
+
+    command = CreatorConversationPlanner._command_from_response(
+        '{"action":"create","object":"cat figurine"}',
+        session,
+    )
+
+    assert command.action == "prepare"
+    assert command.reply
+
+
+def test_creator_chat_defaults_invalid_output_to_safe_prepare_action() -> None:
+    session = SessionSnapshot(session_id="session", status=SessionStatus.NEEDS_INPUT)
+
+    command = CreatorConversationPlanner._command_from_response("not JSON", session)
+
+    assert command.action == "prepare"
+    assert command.reply

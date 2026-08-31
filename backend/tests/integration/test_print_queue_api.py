@@ -1327,7 +1327,7 @@ class TestQueueLibraryFileSupport:
         return _create_printer
 
     @pytest.fixture
-    async def library_file_factory(self, db_session):
+    async def library_file_factory(self, db_session, tmp_path):
         """Factory to create test library files."""
         _counter = [0]
 
@@ -1337,9 +1337,10 @@ class TestQueueLibraryFileSupport:
             _counter[0] += 1
             counter = _counter[0]
 
+            file_path = tmp_path / f"library_test_{counter}.3mf"
             defaults = {
                 "filename": f"library_test_{counter}.3mf",
-                "file_path": f"/test/library/library_test_{counter}.3mf",
+                "file_path": str(file_path),
                 "file_size": 2048,
                 "file_type": "3mf",
                 "file_metadata": {"print_name": f"Library Print {counter}", "print_time_seconds": 3600},
