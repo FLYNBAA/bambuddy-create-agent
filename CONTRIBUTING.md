@@ -1,424 +1,126 @@
-# Contributing to Bambuddy
+# 贡献 BCA
 
-Thank you for your interest in contributing to Bambuddy! This document provides guidelines and instructions for contributing.
+[English](CONTRIBUTING.en.md) | **中文**
 
-## Table of Contents
+本仓库是 Bambuddy Create Agent（BCA）二次开发仓库。贡献必须针对当前 BCA fork，而不是 upstream `maziggy/bambuddy` 的仓库、Wiki、网站或 PR 流程。
 
-- [Code of Conduct](#code-of-conduct)
-- [Before You Start](#before-you-start)
-- [Documentation Requirements](#documentation-requirements)
-- [Getting Started](#getting-started)
-- [Development Setup](#development-setup)
-- [Making Changes](#making-changes)
-- [Code Style](#code-style)
-- [Internationalization (i18n)](#internationalization-i18n)
-- [Authentication & Permissions](#authentication--permissions)
-- [Testing](#testing)
-- [CI Pipeline](#ci-pipeline)
-- [Submitting Changes](#submitting-changes)
-- [Reporting Bugs](#reporting-bugs)
-- [Requesting Features](#requesting-features)
+## 开始前
 
-## Code of Conduct
+1. 在当前 BCA fork 的 issue、讨论区或维护者指定渠道说明工作范围。
+2. 先确认是否会影响付费确认门、状态机、Provider、持久化、队列、权限、明文配置或部署文档。
+3. 将架构选择写入 issue/PR，避免同时创建第二套约定。
+4. 不要把真实 Provider 凭据、生产数据库、产物 URL 或打印机访问码提交到分支、测试或 PR。
 
-Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md) to keep our community welcoming and respectful.
-
-## Before You Start
-
-**Every contribution starts with an issue.** Before writing any code or opening a pull request:
-
-1. **Open a new issue** or **comment on an existing one** describing what you'd like to work on
-2. **Wait for agreement** — discuss the approach with a maintainer so we're aligned on scope and direction
-3. **Get assigned** — once we agree, a maintainer will assign the issue to you
-4. **Then start coding** — only open a PR for an issue that is assigned to you
-
-**No assigned issue = no PR.** Pull requests without a corresponding assigned issue will be closed.
-
-This keeps everyone on the same page, avoids wasted effort on changes that may not fit the project's direction, and prevents multiple contributors from working on the same thing.
-
-## Documentation Requirements
-
-Features and user-visible behavior changes **must** include matching documentation updates in the docs repos:
-
-- **[bambuddy-wiki](https://github.com/maziggy/bambuddy-wiki)** — end-user guide (installation, configuration, feature walkthroughs, reference)
-- **[bambuddy-website](https://github.com/maziggy/bambuddy-website)** — marketing site (updated only when the change affects public claims or feature lists)
-
-### When docs updates are required
-
-| Change | Needs wiki? | Needs website? |
-|---|---|---|
-| New feature | ✅ | Maybe (if in the feature list) |
-| New config key / setting | ✅ | ❌ |
-| New port, URL, API endpoint | ✅ | ❌ |
-| Installation or upgrade steps change | ✅ | ✅ |
-| UI change that affects screenshots | ✅ | ❌ |
-| Bug fix with no observable behavior change | ❌ | ❌ |
-| Internal refactor | ❌ | ❌ |
-| Test-only change | ❌ | ❌ |
-
-### Workflow
-
-1. Open your code PR here in `bambuddy`
-2. Open companion PR(s) in `bambuddy-wiki` and/or `bambuddy-website`
-3. **Link the companion PR(s) in the code PR description** (the PR template has a dedicated section)
-4. Merge the PRs together — usually code first, then docs, unless the docs reference new things that don't exist yet
-
-If your change truly doesn't need docs (internal refactor, silent bug fix), say so in the PR description and give a one-line reason.
-
-### Previews before you merge
-
-Clone the docs repo and run it locally to see your changes rendered with the real theme before opening the PR:
-
-- **Wiki** (`bambuddy-wiki`) — `pip install -r requirements.txt && mkdocs serve` — live-reload on `http://localhost:8000`
-- **Website** (`bambuddy-website`) — static HTML/CSS, open the changed file directly or serve with `python -m http.server`
-
-Review like you would the production site. Catch broken links, layout regressions, typos, missing images. If it looks right, open the PR.
-
-### Editing docs without a local clone
-
-Both docs repos can be edited directly in the browser, no `git clone` required:
-
-- **GitHub web editor** — click the pencil icon on any file in the repo
-- **github.dev** — press `.` (period) on any repo page to open VS Code in your browser, with multi-file editing and syntax highlighting
-
-## Getting Started
-
-1. **Fork the repository** on GitHub
-2. **Clone your fork** locally:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/bambuddy.git
-   cd bambuddy
-   ```
-3. **Add the upstream remote**:
-   ```bash
-   git remote add upstream https://github.com/maziggy/bambuddy.git
-   ```
-
-## Development Setup
-
-### Prerequisites
-
-- Python 3.11+
-- Node.js 20+
-- npm
-
-### Backend Setup
+## 克隆与开发环境
 
 ```bash
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-pip install -r requirements-dev.txt  # Dev/test dependencies (pytest, ruff, bandit, etc.)
-
-# Install pre-commit hooks
-pip install pre-commit
-pre-commit install
-
-# Run backend (--loop asyncio matches production; avoids a uvloop TLS bug
-# that can truncate Virtual Printer FTP uploads on slow storage — see #1896)
-DEBUG=true uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000 --loop asyncio
+git clone <your-bca-fork-url> bambuddy-create-agent
+cd bambuddy-create-agent
+python -m venv .venv
 ```
 
-### Frontend Setup
+Linux/macOS：
 
 ```bash
-cd frontend
-
-# Install dependencies
-npm install
-
-# Run development server
-npm run dev
+.venv/bin/python -m pip install -r requirements.txt
+npm --prefix frontend ci
 ```
 
-The frontend will be available at `http://localhost:5173` and will proxy API requests to the backend.
+Windows PowerShell：
 
-### Running with Docker
-
-```bash
-# Run the full application
-docker compose up -d --build
-
-# Run tests in Docker (mirrors CI)
-docker compose -f docker-compose.test.yml run --rm backend-test
-docker compose -f docker-compose.test.yml run --rm frontend-test
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+npm --prefix .\frontend ci
 ```
 
-## Making Changes
+使用隔离数据目录：
 
-1. **Create a branch** from `dev` for your changes:
-   ```bash
-   git checkout dev
-   git pull upstream dev
-   git checkout -b feature/your-feature-name
-   # or
-   git checkout -b fix/your-bug-fix
-   ```
-
-2. **Make your changes** following our code style guidelines
-
-3. **Test your changes** thoroughly
-
-4. **Commit your changes** with clear, descriptive messages:
-   ```bash
-   git commit -m "Add feature: description of what you added"
-   ```
-
-### Branch Naming
-
-- `feature/` - New features
-- `fix/` - Bug fixes
-- `docs/` - Documentation changes
-- `refactor/` - Code refactoring
-- `test/` - Test additions or fixes
-
-## Code Style
-
-### Backend (Python)
-
-We use [Ruff](https://github.com/astral-sh/ruff) for linting and formatting. Configuration is in `pyproject.toml`.
-
-```bash
-# Check linting
-ruff check backend/
-
-# Auto-fix issues
-ruff check --fix backend/
-
-# Format code
-ruff format backend/
-
-# Check formatting without changes
-ruff format --check backend/
+```powershell
+$env:DATA_DIR = "$PWD\data"
 ```
 
-### Frontend (TypeScript/React)
+不要让测试或本地开发读取 source-project `.env` / `.env.local`。
 
-We use ESLint for linting and TypeScript for type checking:
+## 代码边界
 
-```bash
-cd frontend
+- Bambuddy 负责打印机、Library、原生队列、认证、API Key、WebSocket、部署和传输。
+- BCA 负责创作会话、Provider 编排、产物、校准和 BCA task。
+- 不要复制原生 queue、printer、auth 或文件状态机。
+- Provider 通过现有 Protocol 与 `factory.py` 组合，不能让供应商类型泄漏到 `service.py`。
+- 外部可访问接口继续使用 Bambuddy 权限依赖。
 
-# Lint
-npm run lint
+## 明文 Provider 配置改动
 
-# Type check
-npx tsc --noEmit
+当前产品允许 Agent Services 持久化明文 Provider 凭据。涉及 `/api/v1/creator/config` 时必须保持：
+
+```text
+GET → SETTINGS_READ
+PUT → SETTINGS_UPDATE
+Cache-Control: private, no-store
 ```
 
-### Pre-commit Hooks
+同时更新：
 
-Pre-commit hooks run automatically on `git commit` and include Ruff linting/formatting, trailing whitespace fixes, YAML/JSON validation, and import shadowing checks. To run manually:
-
-```bash
-pre-commit run --all-files
+```text
+creator.py
+creator_integration.py
+CreatorSettingsPage.tsx
+README.md / README.en.md
+DEPLOYMENT_BCA.md / DEPLOYMENT_BCA.zh-CN.md
+测试
 ```
 
-## Internationalization (i18n)
+不要把凭据写到普通 creator snapshot、task、日志、公共下载路由或测试 fixture。
 
-The frontend uses [react-i18next](https://react.i18next.com/) for all user-facing text. **Never hardcode user-visible strings** — always use translation keys.
+## 付费和状态机改动
 
-### Locale Files
+- 图像、3D 与 Meshy 多色请求需要明确确认。
+- 付费 POST 不得自动重试。
+- 非 `healthy` 分析必须有独立问题确认；full smoke 应恢复同一 session，不能重跑图像/3D。
+- 新状态同步更新 contracts、service、API、frontend、测试和文档。
+- 取消必须持久化失败状态再抛出 `CancelledError`。
 
-Translations live in `frontend/src/i18n/locales/`. `en.ts` is the reference locale; every other `*.ts` file in that directory is checked against it. The parity check discovers the directory at runtime, so a new locale is picked up automatically — this file never needs updating when one is added.
+## 前端改动
 
-To see the current set of locales and check your work:
+- 使用现有 `Layout.tsx` 和 design tokens，不创建第二套 Shell/颜色语义。
+- `/creator`、`/tasks`、`/creator/settings` 的 API 类型与后端 response 同步。
+- 认证状态下图片预览必须带 Bearer token Blob fetch，并在 effect cleanup 中 abort/revoke。
+- Creator 卡片动作必须 POST。
+- BCA 文案与开发者文档必须同步中英文版本并保持首行语言互链。
 
-```bash
-cd frontend
-npm run check:i18n
+## 验证
+
+最低验证：
+
+```powershell
+$env:PYTHONPATH = "."
+.\.venv\Scripts\python.exe -m pytest backend\tests\integration\test_creator_config_api.py -q
+.\.venv\Scripts\ruff.exe check backend\app backend\tests
+npm --prefix .\frontend run lint
+npm --prefix .\frontend run test:run
+npm --prefix .\frontend run build
 ```
 
-### Adding New Strings
+变更影响更广时运行：
 
-1. Add the key to the appropriate section in **every** locale file
-2. Use the `useTranslation` hook in your component:
-
-```tsx
-import { useTranslation } from 'react-i18next';
-
-function MyComponent() {
-  const { t } = useTranslation();
-  return <span>{t('section.myNewKey')}</span>;
-}
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-3. Keys are organized by feature (e.g., `spoolman.`, `nav.`, `common.`)
+付费 Provider 只可在明确用户批准后使用 smoke runner。Docker 变更必须在 Docker 主机验证。UI 变更必须用浏览器验证桌面与 390px 宽度。
 
-### Important Notes
+## PR 清单
 
-- Every locale file must use the **same key structure** — same nesting, same key paths
-- Always add keys to **every** locale to maintain parity, with real translations rather than English placeholders — the check flags leaves that are identical to `en`
-- Run `npm run test:run` before pushing — it chains the parity check, which CI runs too. Plain `npm test` is vitest in watch mode and skips it
-- If you find structural inconsistencies between locales, fix them — different key paths cause silent fallback to English
+- 清楚描述 BCA 行为、边界和失败语义。
+- 列出执行的测试、构建、浏览器或 Docker 验证。
+- 说明是否发生付费 Provider 调用；未批准时不得调用。
+- 更新中英文配对开发者文档。
+- 对持久化字段、迁移、备份契约和回滚影响作出说明。
+- 不链接 upstream Wiki/website PR 作为 BCA 完成条件；本文档和仓库内 BCA 文档是当前 fork 的权威开发文档。
 
-## Authentication & Permissions
+## 相关文档
 
-Bambuddy has an optional authentication system. When auth is enabled, API endpoints are protected by granular permissions.
-
-### How It Works
-
-Authentication is **opt-in** — when disabled, all endpoints are open. The system uses `RequirePermissionIfAuthEnabled` which:
-
-- Checks if auth is enabled in settings
-- If disabled: allows the request through (no-op)
-- If enabled: validates JWT token/API key and checks the user has the required permission
-
-### Adding Auth to New Endpoints
-
-Use the `RequirePermissionIfAuthEnabled` dependency in your route:
-
-```python
-from backend.app.core.auth import RequirePermissionIfAuthEnabled
-from backend.app.core.permissions import Permission
-
-@router.get("/my-resource")
-async def get_my_resource(
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.RESOURCE_READ),
-):
-    ...
-```
-
-### Permission Convention
-
-Permissions follow the `resource:action` pattern (e.g., `filaments:read`, `printers:control`). Standard actions:
-
-| Action | Usage |
-|--------|-------|
-| `read` | View/list resources |
-| `create` | Create new resources |
-| `update` | Modify existing resources |
-| `delete` | Remove resources |
-
-Some resources have additional actions. Examples: `printers:control` for live printer controls
-such as stop/pause/resume, `printers:files` for printer storage access, `queue:create` for
-creating queue items that may dispatch immediately when scheduled ASAP, `library:upload` for
-File Manager uploads/imports, and `archives:reprint_own` / `archives:reprint_all` for archive
-reprint eligibility. Archive reprint still needs `queue:create` before it can enqueue a job.
-
-### Adding New Permissions
-
-1. Add the permission to the `Permission` enum in `backend/app/core/permissions.py`
-2. Add it to the appropriate category in `PERMISSION_CATEGORIES`
-3. Add it to the relevant default groups (`Administrators` gets all, `Operators` and `Viewers` as appropriate)
-4. Use it in your route with `RequirePermissionIfAuthEnabled`
-
-### Default Groups
-
-| Group | Access Level |
-|-------|-------------|
-| **Administrators** | All permissions |
-| **Operators** | Full control of printers, own items in archives/queue, read-only settings |
-| **Viewers** | Read-only access to all resources |
-
-## Testing
-
-The easiest way to run tests is with the provided scripts in the project root:
-
-```bash
-./test_frontend.sh    # TypeScript check + ESLint + Vitest
-./test_backend.sh     # Ruff lint/format + pytest (parallel)
-./test_docker.sh      # Full Docker build, unit tests, and integration tests
-./test_all.sh         # All of the above (frontend → backend → docker)
-./test_security.sh    # Security scans (bandit, pip-audit, npm-audit)
-```
-
-`test_docker.sh` supports flags like `--backend-only`, `--skip-integration`, `--fresh` — run with `--help` for details.
-
-`test_security.sh` runs fast scans by default. Use `--full` for the complete suite (CodeQL, Trivy, etc.) or specify individual scans like `./test_security.sh bandit codeql`.
-
-### Running Tests Individually
-
-**Backend** — tests are in `backend/tests/` with `unit/` and `integration/` subdirectories:
-
-```bash
-pytest backend/tests/ -v           # All tests
-pytest backend/tests/unit/         # Unit tests only
-pytest backend/tests/ --cov=backend  # With coverage
-```
-
-`conftest.py` redirects `DATABASE_URL` to a throwaway SQLite file before any app
-module is imported, and aborts the run if that redirect did not take. Your `.env`
-is ignored for the duration, so the suite cannot reach the database you develop
-against — it exercises code paths that open their own sessions, and some of those
-write. Don't undo that override to "test against real data": point `DATABASE_URL`
-at a copy instead.
-
-**Frontend** — tests use [Vitest](https://vitest.dev/) and are in `frontend/src/__tests__/`:
-
-```bash
-cd frontend
-npm run test:run       # Single run
-npm test               # Watch mode
-npm run test:coverage  # With coverage
-```
-
-## CI Pipeline
-
-Pull requests trigger automated CI checks via GitHub Actions (`.github/workflows/ci.yml`):
-
-- **Backend**: Ruff lint + format check, unit/integration tests, pip-audit
-- **Frontend**: ESLint, TypeScript type check, Vitest tests, production build
-- **Docker**: Full image build, backend/frontend tests in Docker, integration health checks
-- **Security**: CodeQL analysis, dependency audits
-
-All checks must pass before merging. Run `./test_all.sh` locally before pushing to catch issues early.
-
-## Submitting Changes
-
-1. **Push your branch** to your fork:
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-2. **Create a Pull Request** on GitHub:
-   - **Always target the `dev` branch** as the base branch (not `main`)
-   - Use a clear, descriptive title
-   - Fill out the PR template completely
-   - Link any related issues
-   - Include before/after screenshots for any visual changes
-
-3. **Wait for review** - maintainers will review your PR and may request changes
-
-### PR Guidelines
-
-- Keep PRs focused and reasonably sized
-- One feature or fix per PR
-- Update documentation if needed
-- Add tests for new functionality
-- Ensure all tests pass
-- Follow the existing code style
-- **Visual changes require screenshots** — if your PR changes any frontend UI, include before/after screenshots showing the old and new appearance
-
-## Reporting Bugs
-
-Use the [Bug Report template](https://github.com/maziggy/bambuddy/issues/new?template=bug_report.yml) and include:
-
-- Clear description of the bug
-- Steps to reproduce
-- Expected vs actual behavior
-- Your environment (OS, Python version, browser)
-- Printer model and firmware version
-- Relevant logs
-
-## Requesting Features
-
-Use the [Feature Request template](https://github.com/maziggy/bambuddy/issues/new?template=feature_request.yml) and include:
-
-- Clear description of the feature
-- Use case / problem it solves
-- Proposed solution
-- Alternatives considered
-
-## Questions?
-
-- Check the [Documentation](http://wiki.bambuddy.cool)
-- Open a [Discussion](https://github.com/maziggy/bambuddy/discussions)
-- Review existing [Issues](https://github.com/maziggy/bambuddy/issues)
-
----
-
-Thank you for contributing to Bambuddy!
+- [中文工程契约](AGENTS.zh-CN.md)
+- [中文架构说明](BCA_ARCHITECTURE.zh-CN.md)
+- [中文部署指南](DEPLOYMENT_BCA.zh-CN.md)
+- [文档审计](DOCUMENTATION_AUDIT.zh-CN.md)

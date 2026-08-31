@@ -1,8 +1,9 @@
 """Explicit BCA provider smoke runner.
 
-Runs no paid operation unless the operator supplies --confirm-paid. Secrets are
-read only from the process environment by the running BCA server; this client
-never reads .env files or prints credentials.
+Runs no paid operation unless the operator supplies --confirm-paid. The running
+BCA server supplies credentials from its initial environment values or Agent
+Services plaintext configuration; this client never reads .env files or prints
+credential values.
 """
 
 from __future__ import annotations

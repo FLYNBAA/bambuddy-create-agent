@@ -1,6 +1,23 @@
-# BCA Deployment
+# BCA Deployment Guide
 
-## Local Windows
+[中文](DEPLOYMENT_BCA.zh-CN.md) | **English**
+
+This guide is for deployment and operations developers. BCA is embedded in Bambuddy and shares its FastAPI process, database, and static frontend. Do not deploy it as a second standalone create-agent service.
+
+## 1. Prerequisites
+
+| Requirement | Detail |
+|---|---|
+| Python | Local development uses Python 3.11+ and the repository `.venv`. |
+| Node.js | Required only for local frontend builds; Docker handles the frontend in its multi-stage image build. |
+| Docker | Use Docker Compose for Linux production or Windows Docker Desktop. |
+| Networking | Linux host networking is preferred for discovery, Virtual Printer, camera, and printer LAN protocols. |
+| Authentication | Enable Bambuddy authentication and API-key management for public or tailnet access. |
+| Database | SQLite supports single-machine use; external PostgreSQL must be included in backup and recovery operations. |
+
+## 2. Local Windows development
+
+From the repository root:
 
 ```powershell
 python -m venv .venv
@@ -11,107 +28,170 @@ $env:DATA_DIR = "$PWD\data"
 .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Use the Agent Services page to hot-reload non-secret provider values. Provider base URLs must be valid LAN-service HTTP(S) URLs; unsafe values are rejected with HTTP `422`. Supply provider secrets through the process environment; do not put them in browser requests, database settings, committed files, or task records. BCA does not load source-project `.env` or `.env.local` files.
+Open:
 
-## Linux Docker
+```text
+http://127.0.0.1:8000
+```
 
-The existing multi-stage `Dockerfile` builds the React application into `/app/static` and installs the BCA additions from `requirements.txt`. The existing Compose file remains the deployment entry point.
+Complete Setup by creating an administrator or by applying your own authentication policy. Do not use multiple Uvicorn workers: BCA session locks and background stage work are process-local.
+
+## 3. Linux Docker
+
+From the repository root:
 
 ```bash
 docker compose up -d --build
+docker compose ps
+docker compose logs -f bambuddy
 ```
 
-Recommended production settings:
+The Linux Compose configuration defaults to host networking. It is the recommended model for printer discovery, SSDP, Virtual Printer, cameras, and LAN FTP/MQTT.
+
+At minimum set:
 
 ```text
 DATA_DIR=/app/data
 LOG_DIR=/app/logs
-BCA_PUBLIC_BASE_URL=https://bca.example.example
-DEEPSEEK_API_KEY=<secret manager value>
-IMAGE_API_KEY=<secret manager value>
-TENCENT_SECRET_ID=<secret manager value>
-TENCENT_SECRET_KEY=<secret manager value>
-MESHY_API_KEY=<secret manager value>
+BCA_PUBLIC_BASE_URL=https://bca.example.invalid
 ```
 
-### Windows Docker Desktop override
+Provider credentials may be injected as first-start environment values or entered after startup in Agent Services:
 
-Docker Desktop cannot use the Linux production `network_mode: host`. Use the committed override:
+```text
+DEEPSEEK_API_KEY
+IMAGE_API_KEY
+TENCENT_SECRET_ID
+TENCENT_SECRET_KEY
+MESHY_API_KEY
+```
+
+BCA does not read source-project `.env` or `.env.local`. `.env.bca.example` is a variable-name and default-value reference; do not commit real credentials.
+
+## 4. Windows Docker Desktop
+
+Docker Desktop cannot use the Linux production `network_mode: host`. Use the repository bridge override:
 
 ```powershell
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml build
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d
 curl http://127.0.0.1:8012/health
-curl http://127.0.0.1:8012/api/v1/creator/config
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
 ```
 
-`docker-compose.windows.yml` uses Compose `!reset null` to remove host networking and publishes host port `8012` by default. Override it with `BCA_DOCKER_PORT` if necessary. Do not set it to a port occupied by another local BCA/Bambuddy process.
+Use `down` for ordinary stops. `down -v` deletes named data volumes and is only appropriate for an intentionally disposable smoke stack.
 
-On Windows bridge networking, add printers by LAN IP. SSDP discovery and the full Virtual Printer passive FTP range require additional explicit mappings and are not covered by the single-port smoke override.
+The override contains:
 
-`BCA_PUBLIC_BASE_URL` is only required when Meshy is configured to fetch source GLB via a public URL. It must resolve to the reverse-proxied public origin and expose `GET /api/v1/creator/sessions/{session_id}/model.glb` over HTTPS. This high-entropy provider capability route is not returned in normal creator snapshots.
+```yaml
+network_mode: !reset null
+ports:
+  - "${BCA_DOCKER_PORT:-8012}:8000"
+```
 
-## Networking
+Do not replace `network_mode` with an empty string; it creates Docker's `none` network and prevents port publishing.
 
-- Linux `network_mode: host` is the default because printer discovery, Virtual Printer, camera and LAN transport work most reliably there.
-- Bridge mode is supported with the documented port mapping. It cannot perform SSDP discovery; add printers by IP and configure passive FTP ports.
-- Tailscale is optional. It is a network layer, not an application identity layer; keep Bambuddy authentication/API keys enabled for public or tailnet access.
+Bridge-mode limits:
 
-## Data and backup
+- Add printers by LAN IP; SSDP discovery is unavailable.
+- Full Virtual Printer passive FTP and additional camera/proxy capabilities require explicit extra mappings.
+- Set `BCA_DOCKER_PORT` if `8012` is already occupied.
+
+## 5. Agent Services plaintext configuration
+
+Agent Services (`/creator/settings`) reads, enters, persists, and hot-reloads:
 
 ```text
-DATA_DIR/bca-agent/  creator snapshots and model artifacts
-DATA_DIR/bca-tasks/  calibration artifacts awaiting a sliced file
-DATA_DIR/archive/    Bambuddy archives and Library files
+DeepSeek API Key / Base URL / Model
+Image API Key / Base URL / Model / Quality
+Tencent Secret ID / Secret Key / Region
+Meshy API Key / Input Mode
+BCA Public Base URL
 ```
 
-Back up `DATA_DIR`, the deployment secret configuration, **and the native Bambuddy database** as one recovery point. For SQLite, include the database file and any required WAL sidecars consistently. For PostgreSQL, take a complete PostgreSQL dump of the configured `DATABASE_URL` database.
-
-`bca_tasks` and persisted `bca_creator_*` service settings live in the native Bambuddy database, including when `DATABASE_URL` points to external PostgreSQL. Restoring only `DATA_DIR` loses task rows and configuration; restoring only the database loses creator artifacts. Restore the matching database snapshot and `DATA_DIR` together. Provider signed URLs are never backup artifacts: BCA persists validated files before exposing them.
-
-## Queue contract
-
-A BCA geometry or multi-color-calibrated model remains a model 3MF. Root must supply a slicer-produced `.gcode.3mf` containing `Metadata/plate_N.gcode` and `Metadata/slice_info.config` before BCA creates a Bambuddy `PrintQueueItem`.
-
-
-## Verified Windows Docker result
-
-Docker Desktop Engine and Compose successfully built the BCA image and started the Windows bridge override. The first Windows checkout exposed a CRLF shell-script problem: Linux interpreted the entrypoint shebang as `/bin/sh\r` and reported the script as missing. `Dockerfile` now normalizes `docker-entrypoint.sh` with `sed -i 's/\r$//'` before execution.
-
-The rebuilt container reached Docker health `healthy`; the host verified:
+Contract:
 
 ```text
-GET /health
-GET /api/v1/creator/config
+GET /api/v1/creator/config → SETTINGS_READ → plaintext configuration
+PUT /api/v1/creator/config → SETTINGS_UPDATE → database write + Agent Provider hot reload
+Cache-Control: private, no-store
 ```
 
-The smoke compose stack was removed with `down -v` after validation. The public Windows test mapping is `8012:8000`.
+Plaintext values are stored in `bca_creator_*` Bambuddy settings rows. Anyone able to read the database, its backups, or the Creator Config API can read the credentials. Use this mode only with controlled administrator browsers, API clients, databases, and backup locations.
 
-## Authorized provider result
+Provider base URLs remain restricted to safe LAN-service HTTP(S) addresses. Unsafe values return HTTP `422`.
 
-An explicitly approved full paid-chain smoke completed on 2026-08-29 after deployment-time provider credentials were injected. The runner persisted exactly four GPT Image candidates, a Hunyuan GLB, Meshy print analysis, a Meshy multi-color 3MF, its geometry-normalized 3MF, and a DeepSeek-calibrated 3MF. It created the related calibrated-artifact task. The temporary local PLA calibration spool was deleted after the run.
+## 6. Meshy public URL mode
 
-The successful session remained `completed`; `print_analysis`, `print_file`, `geometry_status`, and `color_calibration` all reached `succeeded`. The runner made no queue submission: a BCA-generated model 3MF must still be sliced to a validated `.gcode.3mf` before native Bambuddy queue handoff.
+Recommended default:
 
-The former image-relay HTTP 401 was resolved by the subsequent approved credential/base-URL configuration. Do not rely on that old relay credential; inject current rotated deployment credentials at runtime.
+```text
+MESHY_MODEL_INPUT_MODE=data_uri
+```
 
-## Provider smoke policy
+With:
 
-The safe default only reports provider configuration:
+```text
+MESHY_MODEL_INPUT_MODE=public_url
+```
+
+`BCA_PUBLIC_BASE_URL` must be a Meshy-reachable public HTTPS origin and reverse-proxy this controlled route:
+
+```text
+GET /api/v1/creator/sessions/{session_id}/model.glb
+```
+
+This is a high-entropy capability route used only for Meshy GLB retrieval and is not returned in ordinary creator snapshots.
+
+## 7. Reverse proxy and public access
+
+The reverse proxy must forward the static SPA, `/api/v1`, and WebSocket through the same origin to Bambuddy. In production:
+
+- Terminate HTTPS and set `BCA_PUBLIC_BASE_URL` to the external HTTPS origin.
+- Trust forwarded headers only from a controlled reverse proxy.
+- Never expose Provider credentials, the database, or `DATA_DIR` directly to the Internet.
+- Tailscale provides reachability, not application identity; retain Bambuddy authentication and API-key controls.
+
+## 8. Data and backup
+
+Back up these as **one recovery point**:
+
+```text
+DATA_DIR/bca-agent/  creator sessions and persisted artifacts
+DATA_DIR/bca-tasks/  task source files waiting for slicing
+DATA_DIR/archive/    archives and Library files
+```
+
+Also back up:
+
+1. The native Bambuddy database: the SQLite database and consistent WAL sidecars, or a complete dump of the PostgreSQL database referenced by `DATABASE_URL`.
+2. The `bca_creator_*` plaintext Provider settings, which are native Bambuddy database rows.
+3. Required first-start deployment environment and infrastructure configuration.
+
+Restoring only `DATA_DIR` loses `bca_tasks`, Library/queue relationships, and Provider configuration. Restoring only the database loses BCA artifacts. Restore matching database and `DATA_DIR` snapshots together.
+
+Provider signed URLs are not backups; BCA exposes only downloaded, validated, persisted files.
+
+## 9. Queue handoff
+
+BCA emits model 3MF, not a directly printable job. Root must upload a slicer-generated `.gcode.3mf` with:
+
+```text
+Metadata/plate_N.gcode
+Metadata/slice_info.config
+```
+
+After validation, BCA creates a native `LibraryFile`, then creates a native `PrintQueueItem` through `add_to_queue()` with `manual_start=True`. Bambuddy continues to own start/cancel, AMS mapping, printer state, and archival behavior.
+
+## 10. Paid Provider smoke policy
+
+Routine tests must never call billed providers. Non-billed readiness:
 
 ```powershell
 .\.venv\Scripts\python.exe .\backend\tools\bca_provider_smoke.py --base-url http://127.0.0.1:8000
 ```
 
-After a human explicitly approves only the billed GPT Image request and the running BCA process has deployment-time secrets, use:
-
-```powershell
-.\.venv\Scripts\python.exe .\backend\tools\bca_provider_smoke.py --base-url http://127.0.0.1:8000 --confirm-paid
-```
-
-The runner deliberately stops after the four-image paid request is accepted. It does not submit Hunyuan or Meshy work, so it cannot accidentally spend 3D or multi-color credits.
-
-For a separately approved full chain, use the full runner. It performs image and Hunyuan stages, then also submits Meshy multi-color work only when analysis is `healthy`:
+After explicit approval of the applicable charges, run the full flow:
 
 ```powershell
 .\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
@@ -120,9 +200,7 @@ For a separately approved full chain, use the full runner. It performs image and
   --seed-calibration-spool
 ```
 
-When analysis returns any status other than `healthy`, the initial full runner stops before the Meshy paid request. Review the session's report, then use the resume command below with `--acknowledge-print-issues` as a distinct approval. `--seed-calibration-spool` provides and then removes an isolated PLA candidate needed for DeepSeek calibration.
-
-If a non-healthy report stops a full run, do not repeat GPT Image or Hunyuan. After reviewing the existing session's report, resume only the paid Meshy stage:
+If analysis is not `healthy`, this command stops before the paid Meshy multi-color request. Review the same session's report and resume it instead of repeating GPT Image or Hunyuan:
 
 ```powershell
 .\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
@@ -133,8 +211,29 @@ If a non-healthy report stops a full run, do not repeat GPT Image or Hunyuan. Af
   --seed-calibration-spool
 ```
 
-## References
+## 11. Health checks and troubleshooting
 
-- Bilingual developer README: [`README.md`](README.md) / [`README.en.md`](README.en.md)
-- Architecture: [`BCA_ARCHITECTURE.md`](BCA_ARCHITECTURE.md)
-- Non-secret variable template: [`.env.bca.example`](.env.bca.example)
+```text
+GET /health                      process liveness
+GET /api/v1/creator/config       Creator configuration; plaintext + no-store
+```
+
+Useful commands:
+
+```powershell
+$env:PYTHONPATH = "."
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\ruff.exe check backend\app backend\tests
+npm --prefix .\frontend run lint
+npm --prefix .\frontend run test:run
+npm --prefix .\frontend run build
+```
+
+## 12. References
+
+- [Chinese README](README.md)
+- [English README](README.en.md)
+- [Chinese architecture](BCA_ARCHITECTURE.zh-CN.md)
+- [English architecture](BCA_ARCHITECTURE.md)
+- [Chinese engineering contract](AGENTS.zh-CN.md)
+- [Documentation audit](DOCUMENTATION_AUDIT.md)

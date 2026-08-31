@@ -7,7 +7,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,22 +61,34 @@ class CreatorRestartRequest(BaseModel):
     stage: str = Field(pattern="^(brief|images|model|print)$")
 
 class CreatorConfigResponse(BaseModel):
+    deepseek_api_key: str
     deepseek_base_url: str
     deepseek_model: str
+    image_api_key: str
     image_base_url: str
     image_model: str
     image_quality: str
+    tencent_secret_id: str
+    tencent_secret_key: str
+    tencent_region: str
+    meshy_api_key: str
     meshy_model_input_mode: str
     app_public_base_url: str
     configured: dict[str, bool]
 
 
 class CreatorConfigUpdate(BaseModel):
+    deepseek_api_key: str | None = None
     deepseek_base_url: str | None = None
     deepseek_model: str | None = None
+    image_api_key: str | None = None
     image_base_url: str | None = None
     image_model: str | None = None
     image_quality: str | None = None
+    tencent_secret_id: str | None = None
+    tencent_secret_key: str | None = None
+    tencent_region: str | None = None
+    meshy_api_key: str | None = None
     meshy_model_input_mode: str | None = None
     app_public_base_url: str | None = None
 
@@ -84,11 +96,17 @@ class CreatorConfigUpdate(BaseModel):
 def _config_response(controller) -> CreatorConfigResponse:
     config = controller.settings
     return CreatorConfigResponse(
+        deepseek_api_key=config.deepseek_api_key.get_secret_value(),
         deepseek_base_url=config.deepseek_base_url,
         deepseek_model=config.deepseek_model,
+        image_api_key=config.image_api_key.get_secret_value(),
         image_base_url=config.image_base_url,
         image_model=config.image_model,
         image_quality=config.image_quality,
+        tencent_secret_id=config.tencent_secret_id.get_secret_value(),
+        tencent_secret_key=config.tencent_secret_key.get_secret_value(),
+        tencent_region=config.tencent_region,
+        meshy_api_key=config.meshy_api_key.get_secret_value(),
         meshy_model_input_mode=config.meshy_model_input_mode,
         app_public_base_url=config.app_public_base_url,
         configured={
@@ -139,8 +157,10 @@ def _snapshot(request: Request, session_id: str) -> CreatorSessionResponse:
 @router.get("/config", response_model=CreatorConfigResponse)
 def get_creator_config(
     request: Request,
+    response: Response,
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_READ),
 ) -> CreatorConfigResponse:
+    response.headers["Cache-Control"] = "private, no-store"
     return _config_response(_controller(request))
 
 
@@ -148,21 +168,28 @@ def get_creator_config(
 async def update_creator_config(
     payload: CreatorConfigUpdate,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_UPDATE),
 ) -> CreatorConfigResponse:
     try:
         _validate_creator_provider_urls(payload)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail=str(exc), headers={"Cache-Control": "private, no-store"}) from exc
     controller = _controller(request)
     current = _config_response(controller)
     values = {
+        "deepseek_api_key": current.deepseek_api_key,
         "deepseek_base_url": current.deepseek_base_url,
         "deepseek_model": current.deepseek_model,
+        "image_api_key": current.image_api_key,
         "image_base_url": current.image_base_url,
         "image_model": current.image_model,
         "image_quality": current.image_quality,
+        "tencent_secret_id": current.tencent_secret_id,
+        "tencent_secret_key": current.tencent_secret_key,
+        "tencent_region": current.tencent_region,
+        "meshy_api_key": current.meshy_api_key,
         "meshy_model_input_mode": current.meshy_model_input_mode,
         "app_public_base_url": current.app_public_base_url,
     }
@@ -170,8 +197,9 @@ async def update_creator_config(
     try:
         controller.reconfigure(**values)
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=str(exc), headers={"Cache-Control": "private, no-store"}) from exc
     await persist_creator_config_overrides(db, values)
+    response.headers["Cache-Control"] = "private, no-store"
     return _config_response(controller)
 
 @router.get("/sessions", response_model=list[CreatorSessionResponse])

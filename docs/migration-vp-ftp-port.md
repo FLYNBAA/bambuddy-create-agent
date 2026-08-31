@@ -1,95 +1,25 @@
-# Migration: Virtual Printer Port Changes
+# BCA Virtual Printer FTP 端口迁移
 
-## FTP Port Change (9990 → 990)
+[English](migration-vp-ftp-port.en.md) | **中文**
 
-The Virtual Printer FTP server now binds **directly to port 990** instead of port 9990.
-Previously, an iptables `REDIRECT` rule was required to forward port 990 to 9990.
+Virtual Printer 属于 Bambuddy 原生功能，但 BCA task 最终会交给原生队列，因此端口迁移会影响 BCA 完整打印链路。
 
-### Why
+## 网络模型
 
-The iptables `REDIRECT` target rewrites the destination IP to the **primary address
-of the incoming network interface**. When running multiple virtual printers on
-different bind IPs (e.g. secondary interfaces or IP aliases), this caused FTP
-connections to be routed to the wrong virtual printer — breaking authentication
-when VPs have different access codes.
+- Linux host networking：Virtual Printer 可直接绑定所需端口。
+- Windows Docker Desktop bridge：需显式映射控制、MQTT、被动 FTP 与可选相机端口；默认 BCA smoke override 只发布 Web `8012:8000`，不等于完整 Virtual Printer 支持。
 
-By binding directly to port 990, iptables is no longer involved and each VP's
-FTP server correctly receives only its own traffic.
+## 迁移步骤
 
-## New Proxy Mode Ports (6000, 322)
+1. 在变更端口前备份数据库、`DATA_DIR` 和 `bca_creator_*` 配置。
+2. 停止原生/容器服务。
+3. 更新 Compose 或 Virtual Printer 配置，确保宿主端口不冲突。
+4. 对 bridge 模式映射所需 FTP passive 范围；非 proxy VP 每实例需要端口 slice，proxy VP 可能需要完整 printer passive 范围。
+5. 启动并检查 `/health`。
+6. 使用非付费的已切片 `.gcode.3mf` 验证原生队列上传、确认和取消。
 
-Proxy mode now requires two additional ports:
+## BCA 关系
 
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 6000 | TCP | File transfer tunnel (transparent proxy, end-to-end TLS) |
-| 322 | TCP | RTSP camera streaming (transparent proxy, end-to-end TLS) |
+BCA 不直接 FTP 上传模型 3MF。Creator → task → root 切片 → 原生 Queue 的末端由 Virtual Printer/原生 FTPS 接管。不要为 BCA 增加第二套 FTP 服务。
 
-These ports are proxied automatically — no iptables rules needed. If you have
-a firewall, ensure these ports are open between the slicer and Bambuddy.
-
-## Migration Steps
-
-### Linux (Native / systemd)
-
-1. **Remove old iptables rules:**
-   ```bash
-   sudo iptables -t nat -D PREROUTING -p tcp --dport 990 -j REDIRECT --to-port 9990
-   sudo iptables -t nat -D OUTPUT -o lo -p tcp --dport 990 -j REDIRECT --to-port 9990
-   ```
-   Repeat each command until it says "No chain/target/match by that name".
-
-2. **Remove persistent rules** (if saved):
-   - **Debian/Ubuntu:** `sudo netfilter-persistent save`
-   - **Fedora/RHEL:** `sudo service iptables save`
-   - **Arch:** `sudo iptables-save > /etc/iptables/iptables.rules`
-
-3. **Verify systemd service** has `AmbientCapabilities=CAP_NET_BIND_SERVICE`:
-   ```bash
-   systemctl cat bambuddy | grep AmbientCapabilities
-   ```
-   If missing, add it to the `[Service]` section.
-
-4. **Restart Bambuddy.** Verify FTP binds to port 990:
-   ```bash
-   grep "FTPS on" logs/bambuddy.log
-   # Should show: Starting virtual printer implicit FTPS on <IP>:990
-   ```
-
-### Docker (Host Network)
-
-1. **Remove old iptables rules** on the Docker host (same as above).
-2. **Update and restart** the container. No other changes needed —
-   the container binds directly to port 990 via `CAP_NET_BIND_SERVICE`.
-
-### Docker (Bridge Network)
-
-1. **Update port mapping** in `docker-compose.yml`:
-   ```yaml
-   # Old:
-   - "990:9990"
-   # New:
-   - "990:990"
-   ```
-2. **Recreate the container:** `docker compose up -d`
-
-### Unraid / Synology / TrueNAS / Proxmox LXC
-
-1. **Remove any iptables redirect rules** you added for `990 -> 9990`.
-   - **Unraid:** Remove the lines from `/boot/config/go`
-   - **Synology:** Remove the scheduled task that added the iptables rule
-2. **Update and restart** the container.
-
-## Verification
-
-After migration, confirm no redirect rules remain:
-```bash
-sudo iptables -t nat -L PREROUTING -n | grep 9990
-# Should return nothing
-```
-
-Check the FTP server is binding correctly:
-```bash
-grep "FTPS on" logs/bambuddy.log
-# Should show port 990, not 9990
-```
+参见 [中文部署指南](../DEPLOYMENT_BCA.zh-CN.md)。

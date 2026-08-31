@@ -2,6 +2,8 @@
 
 This file is the required entry point for all coding work in `bambuddy-create-agent`. Read it before modifying backend, frontend, provider, queue, storage, configuration, deployment, or tests.
 
+[中文](AGENTS.zh-CN.md) | **English**
+
 ## 1. Product Boundary
 
 BCA is a Bambuddy-centered, self-hosted 3D-creation and printing-management backend.
@@ -33,12 +35,12 @@ Bambuddy remains authoritative for:
 
 The embedded creator owns only creative sessions and artifacts. Do not create a second printer state machine, queue, auth system, API-key system, file store, static app, or standalone FastAPI app.
 
-## 2. Non-negotiable Security Rules
+## 2. Credential Storage and Paid-Provider Rules
 
-- Never read, copy, display, log, commit, serialize, document, or echo real secret values from `.env`, `.env.local`, conversation text, provider responses, screenshots, or process environment.
-- Provider credentials are deployment-only environment variables or Docker/Kubernetes Secrets. The UI may report `configured: true|false`; it must never expose the value.
+- Provider credentials may be entered, read, returned and hot-reloaded as plaintext through `/api/v1/creator/config` at the user's explicit product decision. They are persisted under `bca_creator_*` Bambuddy settings rows and appear in database backups.
+- The Agent Services page and config API are therefore restricted to Bambuddy settings permissions. Do not create an unauthenticated credential route.
+- Do not log credentials, include them in ordinary creator session snapshots, send them to third-party clients, or commit a populated `.env` file.
 - Any credentials supplied in a chat or issue are treated as exposed. Operators must rotate them before production use.
-- Do not put a provider API key, cloud SecretId/SecretKey, webhook secret, signed URL, absolute artifact path or supplier job ID in API responses, errors, documents, tests or frontend state.
 - Meshy webhook authenticity is not assumed. Do not add a webhook endpoint or accept webhook state transitions until a verified Meshy signature contract and replay policy exist.
 - Provider paid POSTs are never automatically retried. A network interruption may already have billed a request.
 - No paid image, 3D, repair, or multi-color call may be made for routine tests. The explicit smoke runner is the only approved manual entry point and requires `--confirm-paid`.
@@ -62,7 +64,7 @@ $env:DATA_DIR = "$PWD\data"
 .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Do not use source-project `.env` files as an input to BCA. Inject rotated production credentials directly into the BCA deployment environment.
+Environment variables supply initial Provider values, but Agent Services may replace and persist plaintext Provider credentials at runtime. BCA still does not read source-project `.env` or `.env.local` files.
 
 Windows Docker Desktop smoke uses the bridge override, not Linux host networking:
 
@@ -71,8 +73,10 @@ docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml build
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d
 curl http://127.0.0.1:8012/health
 curl http://127.0.0.1:8012/api/v1/creator/config
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down -v
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
 ```
+
+Use `down -v` only for an explicitly disposable smoke stack; it deletes named data volumes.
 
 The override uses `network_mode: !reset null`; do not replace it with an empty string, which creates Docker's `none` network and prevents host port publishing. Bridge mode requires manual printer IP setup.
 
@@ -234,19 +238,25 @@ GET /api/v1/creator/config
 PUT /api/v1/creator/config
 ```
 
-Persisted, non-secret values:
+Persisted plaintext Creator configuration includes Provider credentials and runtime values:
 
 ```text
+bca_creator_deepseek_api_key
 bca_creator_deepseek_base_url
 bca_creator_deepseek_model
+bca_creator_image_api_key
 bca_creator_image_base_url
 bca_creator_image_model
 bca_creator_image_quality
+bca_creator_tencent_secret_id
+bca_creator_tencent_secret_key
+bca_creator_tencent_region
+bca_creator_meshy_api_key
 bca_creator_meshy_model_input_mode
 bca_creator_app_public_base_url
 ```
 
-They are restored during FastAPI lifespan startup. Provider secrets remain environment-only.
+They are restored during FastAPI lifespan startup. `GET /api/v1/creator/config` returns the stored plaintext credentials to callers with Bambuddy `SETTINGS_READ`; `PUT` persists and hot-reloads them for callers with `SETTINGS_UPDATE`. Database backups therefore contain these values.
 
 Native Bambuddy API keys, webhook routes, camera routes and printer-control routes remain the external integration mechanism. Add BCA-specific external routes under `/api/v1/creator` or `/api/v1/bca-tasks`, then apply existing Bambuddy permission dependencies. Do not create an unauthenticated BCA API surface.
 
@@ -283,7 +293,7 @@ The React `useWebSocket` hook dispatches `bca:creator-session`; `CreatorPage` re
 frontend/src/
 ├─ pages/CreatorPage.tsx             creator session/chat/canvas
 ├─ pages/TaskListPage.tsx            task intake, slice upload, printer picker
-├─ pages/CreatorSettingsPage.tsx     non-secret provider configuration
+├─ pages/CreatorSettingsPage.tsx     plaintext Provider configuration and hot reload
 ├─ hooks/useWebSocket.ts             BCA event dispatch integration
 ├─ components/Layout.tsx             sidebar entries
 ├─ api/client.ts                     native auth-token access
@@ -334,7 +344,7 @@ Manual, non-billed provider readiness check:
 .\.venv\Scripts\python.exe .\backend\tools\bca_provider_smoke.py --base-url http://127.0.0.1:8000
 ```
 
-Paid image smoke, only after explicit operator approval and deployment-secret injection:
+Paid image smoke, only after explicit operator approval and configured Provider credentials (from deployment environment or Agent Services):
 
 ```powershell
 .\.venv\Scripts\python.exe .\backend\tools\bca_provider_smoke.py `
@@ -377,6 +387,5 @@ Before reporting work complete:
 - [ ] Model-only 3MF was never queued without a validated sliced `.gcode.3mf`.
 - [ ] All creator artifacts remain downloadable through controlled BCA routes only.
 - [ ] Native Bambuddy queue/mapping logic has not been duplicated or bypassed.
-- [ ] `ruff`, focused pytest and frontend build pass.
+- [ ] Docker build/start is run on a Docker-capable host after deployment configuration or Agent Services plaintext credentials are supplied.
 - [ ] New persistent DB state has a migration path.
-- [ ] Docker build/start is run on a Docker-capable host after deployment environment secrets are injected.

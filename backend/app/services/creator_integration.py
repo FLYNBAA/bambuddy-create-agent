@@ -30,11 +30,17 @@ from backend.app.three_d_agent.service import ThreeDPrintAgent
 
 _CONFIG_KEYS = frozenset(
     {
+        "deepseek_api_key",
         "deepseek_base_url",
         "deepseek_model",
+        "image_api_key",
         "image_base_url",
         "image_model",
         "image_quality",
+        "tencent_secret_id",
+        "tencent_secret_key",
+        "tencent_region",
+        "meshy_api_key",
         "meshy_model_input_mode",
         "app_public_base_url",
     }

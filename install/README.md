@@ -1,373 +1,64 @@
-# BamBuddy Installation Scripts
+# BCA 安装脚本说明
 
-Interactive installation scripts for BamBuddy with support for both native and Docker deployments.
+[English](README.en.md) | **中文**
 
-## Quick Start
+此目录的脚本来自 Bambuddy 安装基础。BCA 部署应使用当前 BCA fork 工作树、当前 BCA Compose 文件和仓库内开发/部署文档；不要下载 upstream `maziggy/bambuddy` 的安装脚本并期待获得 BCA 功能。
 
-### Docker Installation (Recommended)
+## 推荐安装方式
 
-**Linux/macOS:**
+### Linux Docker
+
+在 BCA fork 工作树中：
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maziggy/bambuddy/main/install/docker-install.sh -o docker-install.sh && chmod +x docker-install.sh && ./docker-install.sh
-```
-
-**Windows (Command Prompt or PowerShell):**
-```cmd
-powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/maziggy/bambuddy/main/install/docker-install.ps1 -OutFile docker-install.ps1; .\docker-install.ps1"
-```
-
-> Requires Docker Desktop running. Printer auto-discovery is unavailable in Docker Desktop — add printers manually by IP.
-
-### Native Installation
-
-**Linux/macOS:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/maziggy/bambuddy/main/install/install.sh -o install.sh && chmod +x install.sh && ./install.sh
-```
-
-### Windows Native Installation
-
-**Windows PowerShell:**
-
-```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/maziggy/bambuddy/main/install/windows-installer.ps1 -OutFile windows-installer.ps1; .\windows-installer.ps1"
-```
-
-**Unattended:**
-```powershell
-.\windows-installer.ps1 -InstallDir C:\Bambuddy -Port 8000 -Yes
-```
----
-
-## Scripts Overview
-
-| Script | Platform | Method |
-|--------|----------|--------|
-| `install.sh` | Linux, macOS | Native (Python venv) |
-| `docker-install.sh` | Linux, macOS | Docker |
-| `docker-install.ps1` | Windows (Docker Desktop) | Docker |
-| `windows-installer.ps1` | Windows (Native) | Windows Service |
-| `update.sh` | Linux (systemd) | Native update helper |
-
----
-
-## Native Installation Scripts
-
-### `install.sh` (Linux/macOS)
-
-Installs BamBuddy with Python virtual environment and optional systemd/launchd service.
-
-**Supported Systems:**
-- Debian/Ubuntu (apt)
-- RHEL/Fedora/CentOS (dnf/yum)
-- Arch Linux (pacman)
-- openSUSE (zypper)
-- macOS (Homebrew)
-
-**Options:**
-```
---path PATH        Installation directory (default: /opt/bambuddy)
---port PORT        Port to listen on (default: 8000)
---tz TIMEZONE      Timezone (default: system timezone)
---data-dir PATH    Data directory (default: INSTALL_PATH/data)
---log-dir PATH     Log directory (default: INSTALL_PATH/logs)
---debug            Enable debug mode
---log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)
---no-service       Skip systemd/launchd service setup
---yes, -y          Non-interactive mode, accept defaults
-```
-
-**Examples:**
-```bash
-# Interactive installation
-./install.sh
-
-# Unattended with custom settings
-./install.sh --path /srv/bambuddy --port 3000 --tz America/New_York --yes
-
-# Minimal unattended
-./install.sh -y
-
-# Skip service setup
-./install.sh --no-service -y
-```
-### `windows-installer.ps1` (Windows)
-
-Windows PowerShell (run as Administrator — the installer self-elevates via UAC if not):
-
-```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/maziggy/bambuddy/main/install/windows-installer.ps1 -OutFile windows-installer.ps1; .\windows-installer.ps1"
-```
-
-> Installs Bambuddy natively on Windows using Git, Python, a virtual environment, and optional NSSM Windows Service registration. See the [Windows Installer Guide](https://wiki.bambuddy.cool/getting-started/windows-installer/) for full parameter reference.
-
-**Parameters:**
-```powershell
--InstallDir PATH  Installation directory (default: C:\Bambuddy)
--Port PORT        Port to listen on (default: 8000)
--Yes              Non-interactive mode, accept defaults
--Silent           Non-interactive mode with reduced console output
--NoService        Skip Windows Service setup
--NoStart          Do not start Bambuddy at the end
--LocalOnly        Bind to 127.0.0.1 instead of all LAN interfaces
-```
-
-The installer stores the Git checkout in `INSTALL_DIR\bambuddy`, user data in
-`INSTALL_DIR\data`, and application logs in `INSTALL_DIR\logs` so updates and
-re-clones do not delete runtime data. If an earlier Windows installer run left
-runtime data in the Git checkout, the installer moves known data and log paths
-to the new locations before starting Bambuddy.
-
----
-
-## Docker Installation Scripts
-
-### `docker-install.sh` (Linux/macOS)
-
-Installs BamBuddy using Docker containers.
-
-**Options:**
-```
---path PATH        Installation directory (default: ~/bambuddy)
---port PORT        Port to expose (default: 8000)
---tz TIMEZONE      Timezone (default: system timezone)
---build            Build from source instead of using pre-built image
---yes, -y          Non-interactive mode, accept defaults
-```
-
-**Examples:**
-```bash
-# Interactive installation
-./docker-install.sh
-
-# Unattended with custom settings
-./docker-install.sh --path /srv/bambuddy --port 3000 --tz Europe/Berlin --yes
-
-# Build from source
-./docker-install.sh --build --yes
-```
-
-### `docker-install.ps1` (Windows)
-
-PowerShell mirror of `docker-install.sh` for Windows + Docker Desktop. Verifies
-Docker Desktop is running, downloads `docker-compose.yml`, rewrites it to use
-port mappings instead of host networking (Docker Desktop doesn't support host
-networking), and starts the container.
-
-**Requirements:**
-- Docker Desktop installed and running ([download](https://www.docker.com/products/docker-desktop))
-- PowerShell 5.1+ (ships with Windows 10/11) or PowerShell 7+
-
-**Parameters:**
-```
--InstallPath PATH    Installation directory (default: %USERPROFILE%\bambuddy)
--Port PORT           Port to expose (default: 8000)
--TimeZone TZ         IANA timezone (default: derived from Get-TimeZone or UTC)
--Build               Build from source instead of pulling pre-built image
--Yes                 Non-interactive mode, accept defaults
--Help                Show full help (Get-Help)
-```
-
-**Examples:**
-```powershell
-# Interactive
-.\docker-install.ps1
-
-# Unattended
-.\docker-install.ps1 -InstallPath C:\bambuddy -Port 8080 -TimeZone Europe/Berlin -Yes
-
-# Build from source
-.\docker-install.ps1 -Build -Yes
-```
-
-> **Limitations on Windows / Docker Desktop:** Printer auto-discovery (SSDP)
-> does not work — add printers manually by IP. The Virtual Printer feature
-> requires manually uncommenting the relevant port mappings in
-> `docker-compose.yml` (the script leaves them commented because most users
-> don't need them).
-
----
-
-## Configuration Options
-
-All scripts support these configuration options:
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| Install Path | Where BamBuddy is installed | `/opt/bambuddy` (Linux/Docker) |
-| Port | HTTP port for web interface | `8000` |
-| Timezone | Server timezone | System timezone or `UTC` |
-| Data Directory | Database and archives | `INSTALL_PATH/data` |
-| Log Directory | Application logs | `INSTALL_PATH/logs` |
-| Debug Mode | Enable verbose logging | `false` |
-| Log Level | INFO, WARNING, ERROR, DEBUG | `INFO` |
-
----
-
-## Post-Installation
-
-### Accessing BamBuddy
-
-After installation, open your browser to:
-```
-http://localhost:8000
-```
-
-Or use the port you specified during installation.
-
-### Service Management
-
-**Linux (systemd):**
-```bash
-sudo systemctl status bambuddy    # Check status
-sudo systemctl start bambuddy     # Start
-sudo systemctl stop bambuddy      # Stop
-sudo systemctl restart bambuddy   # Restart
-sudo journalctl -u bambuddy -f    # View logs
-```
-
-**macOS (launchd):**
-```bash
-launchctl list | grep bambuddy                              # Check status
-launchctl load ~/Library/LaunchAgents/com.bambuddy.app.plist    # Start
-launchctl unload ~/Library/LaunchAgents/com.bambuddy.app.plist  # Stop
-```
-
-**Windows (NSSM service):**
-```powershell
-Get-Service Bambuddy        # Check status
-Start-Service Bambuddy      # Start
-Stop-Service Bambuddy       # Stop
-Restart-Service Bambuddy    # Restart
-Get-Content "C:\Bambuddy\bambuddy-runtime.log" -Tail 100 -Wait  # View logs
-```
-
-**Docker:**
-```bash
-docker compose ps           # Check status
-docker compose up -d        # Start
-docker compose down         # Stop
-docker compose restart      # Restart
-docker compose logs -f      # View logs
-```
-
-### Updating
-
-**Native installation:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/maziggy/bambuddy/main/install/update.sh -o update.sh
-chmod +x update.sh
-sudo ./update.sh
-```
-
-The updater performs:
-- Root permission check (fails fast before any work)
-- Optional built-in backup API call (`/api/v1/settings/backup`) before update
-- Keeps only the newest 5 local backup ZIP files
-- Local-change warning + confirmation before `git reset --hard`
-- If remote has no new commits, updater exits early without stopping the service
-- Service stop/start with code rollback + service restart attempt if update fails
-
-Useful environment overrides:
-```bash
-# Typical native install defaults
-INSTALL_DIR=/opt/bambuddy SERVICE_NAME=bambuddy sudo ./update.sh
-
-# Require backup to succeed (abort update if backup fails)
-BACKUP_MODE=require sudo ./update.sh
-
-# Skip backup API call
-BACKUP_MODE=skip sudo ./update.sh
-
-# Auth-enabled instances: provide API key for backup endpoint
-BAMBUDDY_API_KEY=bb_xxx BACKUP_MODE=require sudo ./update.sh
-```
-
-**Docker (pre-built image):**
-```bash
-cd ~/bambuddy
-docker compose pull
-docker compose up -d
-```
-
-**Docker (from source):**
-```bash
-cd ~/bambuddy
-git pull
 docker compose up -d --build
 ```
 
-**Windows (native):** rerun the installer; it detects the existing checkout and offers `git pull`, leaving `INSTALL_DIR\data` and `INSTALL_DIR\logs` untouched. Stop the service first if it is registered:
-```powershell
-Stop-Service Bambuddy
-.\windows-installer.ps1 -Yes
-Start-Service Bambuddy
-```
+生产 Linux 默认 host networking，支持发现、Virtual Printer、相机和 LAN 协议。
 
----
-
-## Troubleshooting
-
-### Permission Denied (Linux)
-Run with `sudo` or ensure your user has appropriate permissions:
-```bash
-sudo ./install.sh
-```
-
-### Docker: Printer Discovery Not Working
-Docker Desktop for macOS doesn't support host networking. Add printers manually by IP address in the BamBuddy web interface.
-
-### Service Won't Start
-Check logs for errors:
-```bash
-# Linux
-sudo journalctl -u bambuddy -n 50
-
-# Docker
-docker compose logs bambuddy
-```
-
-### Port Already in Use
-Choose a different port during installation or stop the conflicting service:
-```bash
-# Find what's using port 8000
-sudo lsof -i :8000  # Linux/macOS
-```
+### Windows Docker Desktop
 
 ```powershell
-# Windows
-Get-NetTCPConnection -LocalPort 8000 -State Listen
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
+curl http://127.0.0.1:8012/health
 ```
 
-### Windows: Service Won't Start
-Test the start script manually first:
+Windows bridge 模式需要通过 LAN IP 添加打印机。正常停止：
+
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File "C:\Bambuddy\Start-Bambuddy.ps1"
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
 ```
 
-Then check the NSSM runtime logs:
+不要对保留数据的部署使用 `down -v`。
+
+### 本地 Python 开发/测试
+
 ```powershell
-Get-Content "C:\Bambuddy\bambuddy-runtime-error.log" -Tail 100
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+npm --prefix .\frontend ci
+npm --prefix .\frontend run build
+$env:DATA_DIR = "$PWD\data"
+.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
----
+## 当前脚本范围
 
-## Requirements
+| 脚本 | 原生职责 | BCA 使用说明 |
+|---|---|---|
+| `install.sh` | Linux/macOS 原生 Bambuddy 安装 | 只有在本 BCA fork 工作树中运行并验证 BCA 依赖与静态构建后使用。 |
+| `docker-install.sh` | Linux/macOS Docker 引导 | 不下载 upstream compose；使用当前 fork 的 `docker-compose.yml`。 |
+| `docker-install.ps1` | Windows Docker Desktop 引导 | BCA 需要同时使用 `docker-compose.windows.yml` override。 |
+| `windows-installer.ps1` | 原生 Windows 服务安装 | 需要 BCA fork、BCA 依赖和当前前端构建；详见仓库根部署指南。 |
+| `update.sh` | systemd 原生更新 | 更新前备份原生数据库与 `DATA_DIR`，详见 [更新指南](../UPDATING.md)。 |
 
-### Native Installation
-- Python 3.10+ (automatically installed if missing)
-- Node.js 18+ (automatically installed if missing)
-- Git (automatically installed if missing)
-- ~500MB disk space
+## BCA 安装后配置
 
-### Docker Installation
-- Docker Engine 20+ or Docker Desktop
-- ~1GB disk space (includes image)
+1. 完成 Bambuddy Setup，建立受控管理员访问。
+2. 在 `/creator/settings` 填入或确认 Provider 参数和明文凭据。
+3. 记录这些配置会写入 Bambuddy 数据库的 `bca_creator_*`。
+4. 添加打印机与耗材。
+5. 在 `/creator` 建立会话并遵守付费确认门。
+6. 在 `/tasks` 上传 root 切片后的 `.gcode.3mf`，再交给原生队列。
 
----
-
-## Support
-
-- **Documentation:** https://wiki.bambuddy.cool
-- **Discord:** https://discord.gg/aFS3ZfScHM
-- **Issues:** https://github.com/maziggy/bambuddy/issues
+BCA 安装、网络、反向代理、备份、PostgreSQL 和付费 smoke 的完整说明见 [中文部署指南](../DEPLOYMENT_BCA.zh-CN.md)。

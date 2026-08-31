@@ -1,5 +1,7 @@
 # Bambuddy Frontend
 
+
+[中文](README.zh-CN.md) | **English**
 The Bambuddy frontend is a React + TypeScript + Vite single-page administration UI. It is built into the repository-level `static/` directory and served by the FastAPI application; it is not deployed as an independent frontend service.
 
 ## Development
@@ -29,7 +31,7 @@ The embedded Bambuddy Create Agent UI lives in these pages:
 |---|---|---|
 | `/creator` | `pages/CreatorPage.tsx` | Agent conversation, concept-image selection, workflow canvas, artifact download, calibration, and task handoff. |
 | `/tasks` | `pages/TaskListPage.tsx` | BCA model tasks, sliced-file attachment, printer selection, and native queue handoff. |
-| `/creator/settings` | `pages/CreatorSettingsPage.tsx` | Non-secret Creator Service settings and provider configured state. |
+| `/creator/settings` | `pages/CreatorSettingsPage.tsx` | Plaintext Provider credentials, runtime configuration, and hot reload. |
 
 Creator image previews use an authenticated Blob fetch rather than a raw `<img>` source, so they work when Bambuddy authentication is enabled. Do not replace them with unauthenticated provider or artifact URLs.
 

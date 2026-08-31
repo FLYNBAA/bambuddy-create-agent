@@ -1,84 +1,73 @@
-# Bambuddy Windows Installer
+# BCA Windows 安装包构建
 
-Builds a self-contained Windows installer (`.exe`) for Bambuddy: embedded
-Python 3.13 distribution + pre-built frontend + NSSM-supervised Windows
-service. No Python or Node installation required on the target machine.
+[English](README.en.md) | **中文**
 
-## Architecture
+此目录构建 BCA 的 Windows `.exe` 安装包。安装包必须从当前 `bambuddy-create-agent` 工作树构建，不能从 upstream Bambuddy 预构建包获得 BCA 功能。
 
-- **Install target:** `C:\Program Files\Bambuddy\`
-- **Data target:** `C:\ProgramData\Bambuddy\data\` (preserved on uninstall by default)
-- **Logs target:** `C:\ProgramData\Bambuddy\logs\`
-- **Service:** registered via NSSM, runs as `LocalSystem`, autostart on boot
-- **Service command:** `python.exe -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --loop asyncio` (`--loop asyncio` avoids a uvloop TLS bug that can truncate VP FTP uploads, #1896)
-- **Bundled binaries:** Python 3.13 embeddable, NSSM, ffmpeg static build
+## 安装包架构
 
-Browser is the UI. Start Menu shortcut opens `http://localhost:8000`.
+```text
+安装目录：C:\Program Files\Bambuddy\
+数据目录：C:\ProgramData\Bambuddy\data\
+日志目录：C:\ProgramData\Bambuddy\logs\
+服务：NSSM 管理的 FastAPI/Uvicorn
+浏览器入口：http://localhost:8000
+```
 
-## Why these choices
+BCA 产物随 `DATA_DIR` 保存：
 
-See `memory/windows-installer-decision.md` for the full reasoning. Short
-version: PowerShell install scripts can't survive environmental drift
-across the Windows host fleet, so we ship a self-contained bundle that
-depends on nothing on the host. Inno Setup + embedded Python is the
-lowest-maintenance path that delivers native-app UX. No Tauri/Electron
-launcher in v1 — browser-as-UI matches every other Bambuddy platform.
+```text
+bca-agent/   creator session 与产物
+bca-tasks/   等待切片的 task 源文件
+```
 
-## Build prerequisites
+Provider 明文配置保存于 Bambuddy 原生数据库 `bca_creator_*` settings；卸载、更新、迁移或备份时必须连同数据库与 data 一起处理。
 
-The build runs on Windows (or in a Windows GitHub Actions runner). Cross-
-building from Linux is possible via Wine but not officially supported.
+## 构建前提
 
-- Windows 10/11 x64 (or `windows-latest` GitHub Actions runner)
-- Python 3.11+ (for running `build.py`; the embedded Python that ships
-  in the installer is downloaded fresh by the build script)
-- Node.js 22 LTS + npm (for building the frontend bundle)
-- [Inno Setup 6](https://jrsoftware.org/isdl.php) (for compiling
-  `bambuddy.iss` → `.exe`)
+- Windows 10/11 x64 或 GitHub Windows runner；
+- Python 3.11+；
+- Node.js 22 LTS 与 npm；
+- Inno Setup 6；
+- 当前 BCA fork 工作树；
+- 已安装 BCA Python 依赖与前端依赖。
 
-The build script downloads everything else automatically (embedded Python,
-NSSM, ffmpeg).
+## 构建步骤
 
-## Build steps
+从仓库根目录：
 
 ```cmd
-:: From the repo root on a Windows machine
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm --prefix frontend ci
+npm --prefix frontend run build
 cd installers\windows
 python build.py
-:: Then open bambuddy.iss in Inno Setup Compiler and click Build → Compile
-:: (or invoke ISCC.exe directly:)
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" bambuddy.iss
 ```
 
-Output: `installers\windows\build\output\bambuddy-windows-setup.exe`
+输出：
 
-## Testing without signing
+```text
+installers\windows\build\output\bambuddy-windows-setup.exe
+```
 
-The installer can be built and run unsigned. Windows SmartScreen will
-show "Windows protected your PC" on first run. Click **More info** →
-**Run anyway** to proceed. This is expected and harmless for testing.
-Production builds will be signed via SignPath OSS (application in
-flight as of 2026-06-10) and won't show this warning after reputation
-accrues.
+## 安装后检查
 
-## CI build
+1. 打开 `http://localhost:8000` 并完成管理员 Setup。
+2. 在 `/creator/settings` 填入或确认 Provider 明文配置。
+3. 检查 `/health`。
+4. 按 Windows 网络限制手动使用 LAN IP 添加打印机。
+5. 不要通过安装程序自动触发付费 Provider；需要时按部署指南使用明确批准 smoke。
 
-See `.github/workflows/windows-installer.yml` for the automated build.
-The workflow runs on every tag matching `v*` and uploads the installer
-as a release asset.
+## Windows 限制
 
-## Known limitations / open questions
+- Virtual Printer 的 322/990/8883 等端口会触发 Firewall 规则。
+- SSDP 自动发现和 Docker bridge 不是同一网络模型；Docker Desktop 见 [中文部署指南](../../DEPLOYMENT_BCA.zh-CN.md)。
+- 数据恢复必须同时恢复原生数据库、`DATA_DIR` 和 `bca_creator_*` 配置。
 
-- **VP feature on Windows:** the Virtual Printer needs to bind 322/990/8883
-  (privileged ports). Service runs as LocalSystem which can bind these
-  ports, but the user's Windows Firewall will prompt on first VP enable.
-  Documenting this is TBD.
-- **Spoolman:** explicitly NOT bundled in v1. Users who want Spoolman
-  install it separately. Bambuddy internal-inventory mode is the default
-  on Windows.
-- **Bundle size:** estimated 250–350MB installed (mostly opencv +
-  ffmpeg + matplotlib). Acceptable for a v1; can investigate slimming
-  later if users complain.
-- **Updates:** v1 ships as a fresh install / uninstall + install cycle.
-  In-place upgrade via the same installer is supported by Inno Setup but
-  needs end-to-end testing before we promise it.
+## 相关文档
+
+- [中文部署指南](../../DEPLOYMENT_BCA.zh-CN.md)
+- [中文更新指南](../../UPDATING.md)
+- [中文工程契约](../../AGENTS.zh-CN.md)

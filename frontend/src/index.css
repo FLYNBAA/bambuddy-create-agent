@@ -656,4 +656,7 @@ body {
 .bca-config-status .ready { color: var(--status-ok); }.bca-config-status .missing { color: var(--status-warning); }
 .bca-config-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: .8rem; padding: 1rem; margin-bottom: 1rem; border: 1px solid var(--border-color); border-radius: 12px; background: var(--bg-secondary); }
 .bca-config-form label { display: grid; gap: .35rem; color: var(--text-secondary); font-size: .78rem; }.bca-config-form input { padding: .5rem .6rem; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-primary); color: var(--text-primary); }
+.bca-config-section { display: grid; align-content: start; gap: .7rem; }
+.bca-config-section h2 { margin: 0; font-size: 1rem; }
+.bca-config-section p { margin: -.3rem 0 .1rem; color: var(--text-muted); font-size: .78rem; line-height: 1.45; }
 .bca-secret-note { display: flex; align-items: center; gap: .5rem; margin-top: 1rem; color: var(--text-muted); font-size: .8rem; }

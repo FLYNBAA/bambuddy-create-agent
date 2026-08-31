@@ -52,7 +52,7 @@ Metadata/slice_info.config
 |---|---|---|
 | 3D Creator | `/creator` | Session list, Agent chat, four-stage canvas, candidate selection, artifact downloads, calibration, and task handoff. |
 | BCA Tasks | `/tasks` | Model download, sliced-file attachment, `name (model)` printer selection, native queue handoff, and permanent deletion. |
-| Agent Services | `/creator/settings` | Hot-reload non-secret provider URLs/model names; show only configured/unconfigured secret state. |
+| Agent Services | `/creator/settings` | Enter, read, persist, and hot-reload every Provider parameter and plaintext credential. |
 | Native Bambuddy pages | Printers, inventory, queue, and others | Preserve native behavior and permission semantics. |
 
 When authentication is enabled, candidate previews are loaded through Bearer-authenticated Blob requests. Do not replace this with raw controlled artifact URLs in `<img src>`.
@@ -70,14 +70,15 @@ $env:DATA_DIR = "$PWD\data"
 
 Open `http://127.0.0.1:8000`. On first use, create a local administrator and configure authentication according to your security policy.
 
-## Configuration and secrets
+## Configuration and plaintext credentials
 
-- Use the **variable names** from [`.env.bca.example`](.env.bca.example) in a deployment environment, Docker Secret, Kubernetes Secret, or another secret manager.
-- BCA does not read the source-project `.env` or `.env.local` files.
-- Never put real provider secrets in browser requests, database settings, task records, documentation, or source code.
-- Agent Services can modify non-secret settings only. Unsafe provider base URLs return HTTP `422`.
+- Agent Services directly enters, reads, persists, and hot-reloads all DeepSeek, image-provider, Tencent Hunyuan, and Meshy credentials.
+- `GET /api/v1/creator/config` returns plaintext credentials to callers with `SETTINGS_READ`; `PUT` requires `SETTINGS_UPDATE` and immediately rebuilds Agent Providers.
+- Plaintext values are stored as `bca_creator_*` Bambuddy database settings, so database readers and database backups can read them.
+- BCA does not read source-project `.env` or `.env.local`. Environment variables supply only first-start values and the web configuration can replace them.
+- Do not put credentials in ordinary creator sessions, task records, source code, public documentation, or uncontrolled clients.
 
-Required secret variables:
+Provider credentials available in Agent Services:
 
 ```text
 DEEPSEEK_API_KEY
@@ -106,18 +107,18 @@ Windows Docker Desktop:
 ```powershell
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
 curl http://127.0.0.1:8012/health
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down -v
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
 ```
 
-Linux defaults to host networking for discovery, Virtual Printer, cameras, and printer LAN protocols. The Windows bridge override uses `network_mode: !reset null`; add printers by LAN IP and map extra ports for SSDP or the full passive FTP range.
+Use `down` for ordinary stops; do not use `down -v` for a deployment with data because it removes named data volumes. Linux defaults to host networking for discovery, Virtual Printer, cameras, and printer LAN protocols. The Windows bridge override uses `network_mode: !reset null`; add printers by LAN IP and map extra ports for SSDP or the full passive FTP range.
 
 ## Backup and restore
 
 Back up and restore these as **one recovery point**:
 
 1. `DATA_DIR`: BCA creator sessions/artifacts in `bca-agent`, task source files in `bca-tasks`, archives, and Library data.
-2. The native Bambuddy database: the SQLite database file or a complete external PostgreSQL dump.
-3. Deployment secret configuration: Secret manager values, Docker Secrets, or deployment environment declarations.
+2. The native Bambuddy database: the SQLite database file plus consistent WAL sidecars, or a complete external PostgreSQL dump.
+3. Plaintext Provider configuration: the `bca_creator_*` Bambuddy settings rows and any required first-start deployment environment declarations.
 
 If `DATABASE_URL` targets PostgreSQL, `DATA_DIR` alone is insufficient. `bca_tasks` and persisted `bca_creator_*` settings live in the native Bambuddy database. Restore the database together with its matching `DATA_DIR` snapshot to prevent BCA task rows, LibraryFile rows, queue rows, and creator artifacts from diverging.
 

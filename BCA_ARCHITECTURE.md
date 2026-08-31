@@ -1,5 +1,7 @@
 # BCA Architecture
 
+
+[中文](BCA_ARCHITECTURE.zh-CN.md) | **English**
 ## Scope
 
 BCA is a Bambuddy-centered, single-process backend and administration surface. Bambuddy remains the authority for printers, native queue dispatch, library files, API keys, authentication, WebSocket connections, and deployment. The embedded creator owns only creative sessions and model artifacts.
@@ -67,11 +69,11 @@ These routes use Bambuddy permission dependencies; no create-agent standalone ap
 
 The existing Bambuddy Dockerfile builds React into `/static` and runs one FastAPI process. BCA adds LangChain/LangGraph/provider dependencies to `requirements.txt`; BCA artifacts are stored under `DATA_DIR/bca-agent`, and BCA task source files under `DATA_DIR/bca-tasks`.
 
-`BCA_PUBLIC_BASE_URL` is the namespaced public origin used only when Meshy public-URL input mode needs a reachable callback path. Secrets remain runtime environment or secret-manager inputs. BCA settings do not load source-project `.env` files; deployment injects provider secrets directly into the process environment.
+`BCA_PUBLIC_BASE_URL` is the namespaced public origin used only when Meshy public-URL input mode needs a reachable callback path. Environment variables provide initial Provider values, but Agent Services can replace them at runtime. BCA settings do not load source-project `.env` files.
 
 ### Configuration persistence
 
-Non-secret Creator Service values are stored under `bca_creator_*` entries in Bambuddy's existing settings table and restored during FastAPI lifespan startup. API keys remain deployment-only environment/Secret values and are intentionally not persisted in the database. Provider base URLs are LAN-service URL validated before hot reconfiguration; malformed or unsafe values return HTTP `422`.
+All Creator Service values, including plaintext Provider credentials, are stored under `bca_creator_*` entries in Bambuddy's existing settings table and restored during FastAPI lifespan startup. `GET /api/v1/creator/config` returns plaintext values to `SETTINGS_READ` callers; `PUT` persists and hot-reloads values for `SETTINGS_UPDATE` callers. Provider base URLs remain LAN-service URL validated; malformed or unsafe values return HTTP `422`. Database backups contain persisted credentials.
 
 ## Next integration layers
 

@@ -1,189 +1,67 @@
-# Security Policy
+# BCA 安全策略
 
-## Reporting a Vulnerability
+[English](SECURITY.en.md) | **中文**
 
-The Bambuddy team takes security seriously. We appreciate your efforts to responsibly disclose your findings.
+本策略适用于 `bambuddy-create-agent`。安全问题应通过当前 BCA fork 的私有维护渠道报告；不要在公开 issue、截图、日志或文档中粘贴真实 Provider 凭据、打印机访问码、数据库备份或产物 URL。
 
-### How to Report
+## 报告内容
 
-**Please DO NOT report security vulnerabilities through public GitHub.**
+请包含：
 
-Instead, please report them via email to:
+- 漏洞描述与影响范围；
+- 可复现步骤与最小 PoC；
+- 受影响的 BCA/Bambuddy 版本和部署方式；
+- 是否需要认证、特定权限、网络位置或数据库访问；
+- 建议修复方案（如有）。
 
-**security@bambuddy.cool**
+## BCA 安全边界
 
-### What to Include
+### 路由与权限
 
-Please include the following information in your report:
+- 认证与权限采用 Bambuddy 原生模型。
+- `/api/v1/creator/config`：GET 需要 `SETTINGS_READ`，PUT 需要 `SETTINGS_UPDATE`。
+- Creator 普通产物下载使用受控路由与权限；Meshy `public_url` GLB capability route 是例外，不返回普通会话快照。
+- 新路由必须有显式 auth dependency，或在公共路由 allowlist 中注明理由。
 
-- **Description** of the vulnerability
-- **Steps to reproduce** the issue
-- **Affected versions** of Bambuddy
-- **Potential impact** of the vulnerability
-- **Any suggested fixes** (if you have them)
+### 明文 Provider 配置
 
-### What to Expect
+当前产品允许网页、API 与 Bambuddy 数据库存储明文 Provider 值：
 
-- **Acknowledgment**: We will acknowledge receipt of your report within 48 hours
-- **Assessment**: We will investigate and validate the issue within 7 days
-- **Updates**: We will keep you informed of our progress
-- **Resolution**: We aim to release a fix within 30 days for critical issues
-- **Credit**: We will credit you in our release notes (unless you prefer to remain anonymous)
+```text
+DeepSeek API Key
+Image API Key
+Tencent Secret ID / Secret Key
+Meshy API Key
+```
 
-## Supported Versions
+安全边界不等于保密存储：拥有 `SETTINGS_READ`、数据库读取权或数据库备份的人可读取值。为降低缓存泄露风险，config GET/PUT 响应必须设置：
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| 0.2.x   | :white_check_mark: |
+```text
+Cache-Control: private, no-store
+```
 
-## Security Considerations
+禁止将凭据写入普通会话快照、task、Provider 错误、日志、测试 fixture、公开文档或未受控客户端。
 
-### Network Security
+### 网络与下载
 
-Bambuddy communicates with your printers over your local network using:
+- Provider Base URL 必须经过 LAN-service HTTP(S) URL 安全检查；危险 scheme、metadata endpoint、数值编码 IP 等必须拒绝。
+- 用户和 Provider URL 下载必须保持域名/重定向/路径安全边界。
+- `MESHY_MODEL_INPUT_MODE=public_url` 只能通过配置的 HTTPS `BCA_PUBLIC_BASE_URL` 和受控 GLB route 暴露。
+- 公网、反向代理或 Tailnet 部署必须启用 Bambuddy 认证；Tailscale 不取代应用身份认证。
 
-- **MQTT over TLS** (port 8883) - Encrypted printer communication
-- **FTPS** (port 990) - Encrypted file transfers
+### 文件与 3MF
 
-### Recommendations
+- 路径拼接使用 `safe_join_under` 或显式 resolve/containment 检查。
+- 上传必须验证内容；BCA 3MF 上传限制 100 MB 并检查 ZIP 成员、压缩比、解压大小、重复成员和必需文件。
+- 模型 3MF 必须经过 `.gcode.3mf` 验证后才能进入原生打印队列。
 
-1. **Run on trusted network**: Bambuddy should only be accessible on your local network
-2. **Use reverse proxy**: If exposing to the internet, use a reverse proxy with HTTPS
-3. **Keep updated**: Always run the latest version for security patches
-4. **Secure API keys**: Treat API keys like passwords; don't share them publicly
-5. **Developer Mode**: Use your printer's Developer Mode access code; don't share it
+### 付费与 Provider
 
-### Known Security Features
+- 图像、3D、多色阶段必须人工明确确认。
+- 付费 POST 不自动重试。
+- 非健康打印分析必须有独立确认，且 smoke 恢复使用相同 session。
+- 不要把真实付费凭据或请求/响应复制到公开报告。
 
-- API key authentication for external access
-- No default credentials
-- Local-only by default (no cloud dependency)
-- TLS encryption for printer communication
+## 贡献者检查
 
-## Scope
-
-The following are **in scope** for security reports:
-
-- Authentication/authorization bypasses
-- Remote code execution
-- SQL injection
-- Cross-site scripting (XSS)
-- Cross-site request forgery (CSRF)
-- Sensitive data exposure
-- Insecure direct object references
-
-The following are **out of scope**:
-
-- Issues in dependencies (report to the upstream project)
-- Social engineering attacks
-- Physical attacks
-- Denial of service (DoS) attacks
-- Issues requiring physical access to the server
-
-## Bambuddy Security Stance
-
-The following rules apply to every PR that touches authentication,
-authorization, permission gating, secret handling, or any code that
-decides whether to allow or deny an action. They are not aspirational —
-each one is enforced by a CI test that fails the build on violation.
-
-### 1. Default-deny, allowlist over denylist
-
-At any security boundary, the safe default is to deny and the
-exceptions are listed explicitly. Denylists fail open on growth — every
-new resource added to the codebase is implicitly granted access until
-someone remembers to deny it. Allowlists fail closed: an unmapped new
-resource gets a 403, which is loud and recoverable.
-
-Concretely:
-
-- `_APIKEY_SCOPE_BY_PERMISSION` in `backend/app/core/auth.py` is the
-  load-bearing API-key authorization map. Every `Permission` enum value
-  must be either present here with a scope flag, or present in
-  `_APIKEY_DENIED_PERMISSIONS`. Unmapped permissions return 403.
-- Route auth dependencies are explicit, not implicit. A route without a
-  `Depends(require_*)` decorator must be listed in the route-audit
-  `PUBLIC_ROUTES` allowlist with a justification comment, or CI fails.
-
-### 2. Fail-closed in auth code
-
-No `except Exception:` (or bare `except:`) in authentication,
-authorization, or permission code may return a permissive value
-(`None`, `True`, an admin user, an empty filter that lets everything
-through, etc.). The catch-all either re-raises or returns a denial.
-This is CWE-636 "Not Failing Securely" — see
-<https://cwe.mitre.org/data/definitions/636.html>.
-
-The lint scope is `backend/app/core/auth.py`,
-`backend/app/core/permissions.py`,
-`backend/app/api/routes/auth*.py`. Any `except Exception:` block in
-those files must be tagged `# SEC-AUTH-EXC: <reason>` on the same
-line; CI fails otherwise. (We use a standalone marker rather than
-`# noqa: ...` because ruff reserves the latter syntax for its own
-error codes.)
-
-### 3. No hardcoded fallback secrets
-
-Production secrets (JWT signing keys, encryption keys, OAuth client
-secrets, API tokens) have no string-literal fallback in source. The
-codebase reads them from env vars or generates them on first run; if a
-secret is missing AND cannot be generated, the app refuses to start
-rather than booting with a known value. CI greps the source for
-`-change-in-production`-shaped strings and fails on any hit.
-
-### 4. Negative-path tests required for any auth change
-
-Any PR that adds or modifies an auth dependency, permission check, or
-scope flag includes tests for the negative paths:
-
-- "No credentials → 401"
-- "Wrong credentials → 401"
-- "Right credentials, wrong scope → 403"
-- "Expired / revoked credentials → 401"
-
-A test asserting the happy path passes is necessary but not sufficient.
-The failure modes are where the vulnerabilities live. The structural
-backstops above catch *categories* of regression; the negative-path
-tests catch *specific* regressions in the new code.
-
-### 5. Path joins under a trusted parent use the safe-join helper
-
-Anywhere a Bambuddy code path joins a string from outside the function's
-scope (request body, query/path param, `UploadFile.filename`, ZIP
-`namelist()` entry, tarfile member, **printer FTP-listing entry**) under
-a trusted directory, the join must route through
-`backend.app.utils.safe_path.safe_join_under(parent, *parts)`. The helper
-resolves the joined path and asserts it is a descendant of the parent —
-defeating both absolute-path collapse (`Path("/a") / "/b"` → `Path("/b")`)
-and `..` traversal.
-
-Sites that have an inline guard (an explicit resolve + `is_relative_to`,
-a basename-stripping helper like `_safe_filename`, or a pre-validated
-alphanumeric filter) carry a `# SEC-PATH-OK: <reason>` marker on the
-same line. CI walks **both** `backend/app/api/routes/` and
-`backend/app/services/` and fails the build on any
-``<dir-like> / <variable>`` join without either the helper or the
-marker. The services layer is in scope because it receives values from
-the routes verbatim and from external sources Bambuddy has no control
-over (the compromised-printer threat model: a malicious printer can
-serve crafted FTP-listing entries that flow straight into a path join).
-
-### Where these rules live in the codebase
-
-| Rule | Enforcement | Location |
-|------|-------------|----------|
-| 1. Allowlist over denylist (Permission) | `test_every_permission_has_a_classification` | `backend/tests/integration/test_auth_apikey_rbac.py` |
-| 1. Allowlist over denylist (routes) | `test_routes_have_explicit_auth_deps` | `backend/tests/unit/test_route_auth_coverage.py` |
-| 2. Fail-closed in auth code | `test_no_fail_open_in_auth_modules` | `backend/tests/unit/test_no_fail_open_in_auth.py` |
-| 3. No hardcoded fallback secrets | `test_no_hardcoded_secrets` | `backend/tests/unit/test_no_hardcoded_secrets.py` |
-| 4. Negative-path tests required | Reviewer responsibility (no automated CI gate yet) | PR review |
-| 5. Safe-join under trusted parent | `test_route_path_arithmetic_is_safe_joined_or_marked` | `backend/tests/unit/test_no_unsafe_path_joins.py` |
-
-If you are adding a CI rule, update this table. If you are removing a
-CI rule, you are removing a security backstop and the PR description
-must explain why.
-
----
-
-Thank you for helping keep Bambuddy and its users safe!
+安全相关修改必须包含负路径测试：无权限、权限不足、不安全 URL、路径逃逸、状态越权或缓存头缺失。详情见 [中文工程契约](AGENTS.zh-CN.md) 与 [中文贡献指南](CONTRIBUTING.md)。

@@ -52,7 +52,7 @@ Metadata/slice_info.config
 |---|---|---|
 | 3D Creator | `/creator` | 会话列表、Agent 对话、四阶段画布、候选选择、产物下载、校准和任务交接。 |
 | BCA Tasks | `/tasks` | 下载模型、上传切片文件、选择 `命名（型号）` 打印机、提交原生队列、永久删除。 |
-| Agent Services | `/creator/settings` | 热更新非密钥 Provider 地址和模型名；仅显示密钥是否已配置。 |
+| Agent Services | `/creator/settings` | 填写、读取、持久化并热加载所有 Provider 参数和明文密钥。 |
 | 原生 Bambuddy 页面 | 打印机、耗材、队列等 | 保持 Bambuddy 原生行为和权限模型。 |
 
 认证开启时，效果图预览通过带 Bearer token 的 Blob 请求加载；不要将受控效果图路由直接放到 `<img src>`。
@@ -70,14 +70,15 @@ $env:DATA_DIR = "$PWD\data"
 
 浏览器访问 `http://127.0.0.1:8000`。首次使用请按你的安全策略创建本地管理员并配置认证。
 
-## 配置与密钥
+## 配置与明文密钥
 
-- 参照 [`.env.bca.example`](.env.bca.example) 的**变量名**将 Provider 密钥注入部署环境、Docker Secret、Kubernetes Secret 或其他秘密管理器。
-- BCA 不会读取 source-project 的 `.env` 或 `.env.local`。
-- 不要在浏览器、数据库设置、任务记录、文档或源码中保存真实 Provider 密钥。
-- Agent Services 页面仅允许修改非密钥设置；非法 Provider 基础 URL 返回 HTTP `422`。
+- Agent Services 可直接填写、读取、持久化并热加载 DeepSeek、图像 Provider、腾讯混元和 Meshy 的全部 Provider 密钥。
+- `GET /api/v1/creator/config` 会向拥有 `SETTINGS_READ` 的调用方返回明文密钥；`PUT` 要求 `SETTINGS_UPDATE` 并立即重建 Agent Provider。
+- 明文值保存为 Bambuddy 数据库中的 `bca_creator_*` settings 行，因此数据库读取者和数据库备份持有者可读取它们。
+- BCA 不会读取 source-project 的 `.env` 或 `.env.local`。环境变量仅提供首次启动值，之后可由网页配置覆盖。
+- 不要将密钥写入普通 creator 会话、任务记录、源代码、公开文档或非受控客户端。
 
-需要的密钥变量：
+可在 Agent Services 网页填写的 Provider 密钥：
 
 ```text
 DEEPSEEK_API_KEY
@@ -106,18 +107,18 @@ Windows Docker Desktop：
 ```powershell
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
 curl http://127.0.0.1:8012/health
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down -v
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
 ```
 
-Linux 默认使用 host networking，以支持发现、Virtual Printer、相机与打印机 LAN 协议。Windows bridge override 使用 `network_mode: !reset null`，请使用打印机 LAN IP，并为 SSDP 或完整被动 FTP 范围额外映射端口。
+普通停止使用 `down`；不要在已有数据的部署中使用 `down -v`，它会删除命名数据卷。Linux 默认使用 host networking，以支持发现、Virtual Printer、相机与打印机 LAN 协议。Windows bridge override 使用 `network_mode: !reset null`，请使用打印机 LAN IP，并为 SSDP 或完整被动 FTP 范围额外映射端口。
 
 ## 备份与恢复
 
 必须将下列内容作为**同一恢复点**备份和恢复：
 
 1. `DATA_DIR`：包含 `bca-agent` 会话和产物、`bca-tasks` 源文件、归档和 Library 数据。
-2. Bambuddy 原生数据库：SQLite 数据文件，或外部 PostgreSQL 的完整 dump。
-3. 部署密钥配置：Secret manager、Docker Secret 或部署环境声明。
+2. Bambuddy 原生数据库：SQLite 数据文件及一致的 WAL sidecar，或外部 PostgreSQL 的完整 dump。
+3. 明文 Provider 配置：Bambuddy 数据库中的 `bca_creator_*` settings 行，以及首次启动时需要的部署环境声明。
 
 如果 `DATABASE_URL` 指向 PostgreSQL，仅备份 `DATA_DIR` 不足以恢复 BCA：`bca_tasks` 和持久化的 `bca_creator_*` 服务配置位于 Bambuddy 原生数据库。恢复时必须同时恢复数据库与对应 `DATA_DIR` 快照，避免任务行、LibraryFile、队列行与 BCA 产物脱节。
 

@@ -1,44 +1,27 @@
-# Storage Locations (#1004)
+# BCA 存储位置与数据布局
 
-Structured storage locations let you manage physical shelves, drawers, and dryboxes as a catalog instead of free-text only.
+[English](storage-locations.en.md) | **中文**
 
-## Architecture
+BCA 使用 Bambuddy `DATA_DIR` 与原生数据库。部署与迁移时不要只移动其中一部分。
 
-- **`locations` table** — catalog of named storage spots (`name` + case-insensitive `name_key`).
-- **`spool.location_id`** — source of truth for structured assignment.
-- **`spool.storage_location`** — denormalized display string and Spoolman wire format; always derived on write via `location_service.resolve_spool_location_fields()`.
-- **Frontend** — spool form sends only `location_id`; backend fills `storage_location`.
+```text
+DATA_DIR/
+├─ bca-agent/       creator session SQLite、上传图、概念图、GLB、3MF
+├─ bca-tasks/       等待 root 切片的模型 3MF
+├─ archive/         Bambuddy archive 与 Library 相关数据
+├─ sessions.sqlite3 / 原生数据库（SQLite 部署时依配置）
+└─ virtual_printer/ Virtual Printer 数据
+```
 
-## Location vs Storage Location vs AMS Location
+数据库还保存：
 
-| UI label | Meaning |
-|----------|---------|
-| **Location** (inventory table column) | AMS slot or printer assignment (e.g. `H2D-1 B4`) |
-| **Storage Location** | Physical shelf/drawer where the spool lives when not in AMS |
-| **Locations page** | Catalog of named storage spots with spool counts |
+```text
+bca_tasks
+bca_creator_*
+```
 
-## Managing locations
+`bca_creator_*` 包含明文 Provider 配置。SQLite 必须连同一致的 WAL sidecar 备份；PostgreSQL 必须 dump `DATABASE_URL` 对应数据库。任何恢复都必须把数据库与 `DATA_DIR` 的匹配快照一起恢复。
 
-1. Open **Inventory → Locations**
-2. Click **Add Location** and enter a name (e.g. `Regal Etage 2`)
-3. Assign spools via the spool edit form **Storage Location** dropdown
-4. Click a location row to filter inventory by that shelf
+文件系统路径不应通过 API 返回。Creator 产物由受控路由下载；Meshy public URL 仅用受控 GLB capability route。
 
-## Spoolman mode
-
-Bambuddy keeps a local location catalog. When Spoolman integration is enabled:
-
-- Assigning a location writes the location **name** to Spoolman's `location` field
-- Listing locations syncs distinct names from Spoolman into the catalog
-- Renaming a location bulk-renames spools in Spoolman via `PATCH /location/{old}`
-
-## Upgrade migration
-
-Existing free-text `storage_location` values are automatically imported into the location catalog and linked on upgrade (case-insensitive dedup via `name_key`).
-
-## Testing before release
-
-1. `./test_frontend.sh` — i18n parity, lint, Vitest
-2. `./test_backend.sh` — Ruff, pytest (includes `test_locations_api.py`, `test_location_service.py`)
-3. Manual: assign a spool to a location → open **Locations** → spool count updates without reload
-4. Companion PR in [bambuddy-wiki](https://github.com/maziggy/bambuddy-wiki) (user-facing guide)
+参见 [中文部署指南](../DEPLOYMENT_BCA.zh-CN.md)。

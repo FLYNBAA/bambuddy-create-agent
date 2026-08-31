@@ -1,99 +1,123 @@
-# Updating Bambuddy
+# BCA 更新指南
 
-> **0.2.3 note:** the in-app **Update** button is unreliable when upgrading from
-> older releases. Use the commands below instead — they cover every supported
-> install path and are safe to run repeatedly.
+[English](UPDATING.en.md) | **中文**
 
-Pick the section that matches how Bambuddy was installed.
+本指南适用于 `bambuddy-create-agent` 二次开发仓库。不要按照 upstream Bambuddy 仓库 URL、历史版本 tag 或 upstream 安装脚本更新；它们不包含 BCA 代码、文档和配置契约。
 
----
+## 更新前必须备份
 
-## Docker
+更新前创建同一恢复点：
+
+```text
+DATA_DIR
+Bambuddy 原生数据库（SQLite + WAL，或 PostgreSQL dump）
+bca_creator_* 明文 Provider 配置
+必要的部署环境配置
+```
+
+`bca_tasks` 与 `bca_creator_*` 存于原生数据库，BCA 会话与产物存于 `DATA_DIR`。必须使用匹配快照恢复两者。
+
+## 从 Git 工作树更新
+
+在 BCA 仓库根目录：
 
 ```bash
-# 1. Make sure your compose file isn't pinned to an old version.
-#    The image line should read one of:
-#      image: ghcr.io/maziggy/bambuddy:latest
-#      image: ghcr.io/maziggy/bambuddy:0.2.3
-#    If it pins an older tag (e.g. :0.2.2.2), edit it first.
+# 先确认当前工作树和远程都是你的 BCA fork
+pwd
+git remote -v
+git status
 
-# 2. Pull and restart
-docker compose pull
+# 拉取并审查要合入的 BCA fork 提交
+# 不要盲目 hard reset 未提交的部署改动。
+git fetch origin
+git log --oneline HEAD..origin/main
+
+# 在确认无需要保留的本地改动后更新
+# 分支名按你的 fork 实际分支替换。
+git merge --ff-only origin/main
+```
+
+然后更新依赖并构建：
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+npm --prefix frontend ci
+npm --prefix frontend run build
+```
+
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+npm --prefix .\frontend ci
+npm --prefix .\frontend run build
+```
+
+启动时数据库迁移由应用执行。更新后检查：
+
+```text
+GET /health
+GET /api/v1/creator/config
+```
+
+`/api/v1/creator/config` 返回明文 Provider 值；只在受控管理员浏览器或 API 客户端访问，响应为 `private, no-store`。
+
+## Docker 更新
+
+从 BCA 仓库根目录：
+
+```bash
+# 先备份数据和数据库
+# 然后使用当前 BCA checkout 构建，而不是拉 upstream 镜像。
+docker compose build
 docker compose up -d
+docker compose ps
+docker compose logs -f bambuddy
 ```
 
-**If your `docker-compose.yml` is older than 0.2.3,** also refresh it from the
-repo — recent releases added `cap_add: NET_BIND_SERVICE`, extra virtual-printer
-ports for bridge mode, and an optional Postgres block:
+Windows Docker Desktop：
+
+```powershell
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml build
+docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d
+curl http://127.0.0.1:8012/health
+```
+
+正常停止用：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maziggy/bambuddy/main/docker-compose.yml \
-  -o docker-compose.yml.new
-# Diff against yours, merge by hand, then:
-docker compose up -d
+docker compose down
 ```
 
----
+不要在已有数据的环境中使用 `docker compose down -v`；它会删除命名数据卷。只有明确可丢弃的 smoke 测试栈才允许使用。
 
-## Native install (`install.sh` or manual `git clone`)
+## 更新后验证
 
-Both paths produce a git working tree at the install directory, so the update
-is the same. Preferred:
-
-```bash
-sudo /opt/bambuddy/install/update.sh
+```powershell
+$env:PYTHONPATH = "."
+.\.venv\Scripts\python.exe -m pytest backend\tests\integration\test_creator_config_api.py -q
+.\.venv\Scripts\ruff.exe check backend\app backend\tests
+npm --prefix .\frontend run lint
+npm --prefix .\frontend run build
 ```
 
-`update.sh` stops the service, snapshots the database via the built-in backup
-API, fast-forwards to `origin/main`, installs Python deps, rebuilds the
-frontend, and restarts the service. It rolls back automatically if any step
-fails.
+生产运行验证：
 
-### Manual equivalent
+1. 打开 `/creator/settings`，确认 Provider 参数和明文凭据按预期恢复。
+2. 检查 `/tasks`，确认任务清单与切片交接状态存在。
+3. 检查打印机与原生队列页面。
+4. 不要通过更新后自动运行付费 Provider；按 [部署指南](DEPLOYMENT_BCA.zh-CN.md) 的批准 smoke 策略执行。
 
-If you'd rather run the steps yourself:
+## 回滚
 
-```bash
-cd /opt/bambuddy
-sudo systemctl stop bambuddy
-sudo -u bambuddy git fetch origin
-sudo -u bambuddy git reset --hard origin/main
-sudo -u bambuddy venv/bin/pip install -r requirements.txt
-sudo systemctl start bambuddy
-```
+1. 停止当前进程/容器。
+2. 检出或构建已知可用的 BCA 版本。
+3. 将数据库和 `DATA_DIR` 同时恢复到同一备份点。
+4. 使用受控管理员访问确认 Agent Services 配置和 Provider 凭据。
+5. 启动后检查 `/health`、creator、tasks 和原生队列。
 
-Replace `/opt/bambuddy` with your install path if different. Database schema
-migrations run automatically on startup — no Alembic step is required.
+## 相关文档
 
----
-
-## Installed from a GitHub ZIP or tarball download
-
-These installs have no `.git` directory, so neither `update.sh` nor a plain
-`git pull` will work. Reinstall cleanly:
-
-```bash
-# 1. Back up your stateful data
-sudo systemctl stop bambuddy
-sudo tar czf ~/bambuddy-backup.tgz -C /opt/bambuddy \
-  data bambuddy.db bambuddy.db-shm bambuddy.db-wal \
-  virtual_printer archive projects icons .env 2>/dev/null || true
-
-# 2. Remove the old install and reinstall via install.sh
-sudo rm -rf /opt/bambuddy
-curl -fsSL https://raw.githubusercontent.com/maziggy/bambuddy/main/install/install.sh \
-  -o /tmp/install.sh && sudo bash /tmp/install.sh --path /opt/bambuddy
-
-# 3. Restore your data
-sudo systemctl stop bambuddy
-sudo tar xzf ~/bambuddy-backup.tgz -C /opt/bambuddy
-sudo systemctl start bambuddy
-```
-
----
-
-## Before you upgrade
-
-Take a backup. Settings → Backup → **Create Backup** downloads a ZIP containing
-the database and all stateful directories. Any bare-metal update via
-`update.sh` does this automatically; Docker and manual upgrades do not.
+- [中文 README](README.md)
+- [中文部署指南](DEPLOYMENT_BCA.zh-CN.md)
+- [中文工程契约](AGENTS.zh-CN.md)
