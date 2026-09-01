@@ -1,0 +1,77 @@
+# Linux development stack. Keep production deployments on docker-compose.yml.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command:
+      [
+        "python",
+        "-m",
+        "uvicorn",
+        "backend.app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+        "--reload-dir",
+        "backend",
+      ]
+    env_file:
+      - path: .env.bca
+        required: false
+    environment:
+      DEBUG: "true"
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+      PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./:/app
+      - bca_dev_data:/app/data
+      - bca_dev_logs:/app/logs
+    ports:
+      - "${BCA_BACKEND_BIND:-127.0.0.1}:${BCA_BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  frontend:
+    image: node:22-bookworm-slim
+    working_dir: /app/frontend
+    command:
+      - sh
+      - -c
+      - |
+        lock_hash="$$(sha256sum package-lock.json | cut -d ' ' -f 1)"
+        if [ ! -x node_modules/.bin/vite ] || [ "$$(cat node_modules/.bca-package-lock.sha256 2>/dev/null || true)" != "$$lock_hash" ]; then
+          npm ci
+          printf '%s' "$$lock_hash" > node_modules/.bca-package-lock.sha256
+        fi
+        exec npm run dev -- --host 0.0.0.0 --port 5173
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: "8000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/app/frontend
+      - frontend_node_modules:/app/frontend/node_modules
+    ports:
+      - "${BCA_FRONTEND_BIND:-127.0.0.1}:${BCA_FRONTEND_PORT:-5173}:5173"
+
+volumes:
+  bca_dev_data:
+  bca_dev_logs:
+  frontend_node_modules:

@@ -23,6 +23,18 @@ $env:DATA_DIR = "$PWD\data"
 npm --prefix .\frontend run dev
 ```
 
+### Linux Docker Compose development
+
+From the repository root, use the development Compose stack instead of starting the frontend and backend commands separately:
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+This is the development-only two-service exception: `frontend` runs Vite with HMR at `http://127.0.0.1:5173`, while `backend` runs Uvicorn with reload at `http://127.0.0.1:8000`. Compose sets `BACKEND_HOST=backend` and `BACKEND_PORT=8000`, so both `/api` and `/api/v1/ws` proxy through Docker service DNS. Native development leaves both variables unset and continues to proxy to `localhost:8000`. The frontend service is not an independently deployable production application.
+
+Use `docker compose -f docker-compose.dev.yml down` to stop the stack. See the repository README for optional Provider environment injection and volume-reset guidance.
+
 ## BCA surfaces
 
 The embedded Bambuddy Create Agent UI lives in these pages:

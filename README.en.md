@@ -94,6 +94,32 @@ With `MESHY_MODEL_INPUT_MODE=public_url`, `BCA_PUBLIC_BASE_URL` must be publicly
 /api/v1/creator/sessions/{session_id}/model.glb
 ```
 
+## Linux Docker Compose development
+
+`docker-compose.dev.yml` separates the backend and Vite frontend into hot-reloading services and bind-mounts the source tree. It does not use host networking or expose Virtual Printer ports; do not use it for printer-LAN integration or production deployments.
+
+Optionally create a Provider environment file used only by the development backend before its first start:
+
+```bash
+cp .env.bca.example .env.bca
+chmod 600 .env.bca
+# Edit .env.bca: remove unused <inject-secret> placeholders and supply real values.
+```
+
+Compose injects `.env.bca` only into the `backend` service; the frontend container never receives Provider credentials, and the file is excluded from Git and Docker build contexts. Set `BCA_PUBLIC_BASE_URL` to a publicly reachable HTTPS origin only with `MESHY_MODEL_INPUT_MODE=public_url`; local development should retain `data_uri` or remove that variable.
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+Develop at `http://127.0.0.1:5173`; Vite proxies API and WebSocket traffic through `BACKEND_HOST=backend` and `BACKEND_PORT=8000`. Native development retains `localhost:8000` when neither variable is set. The backend health endpoint is `http://127.0.0.1:8000/health`. Ports bind to loopback by default. To deliberately allow LAN access, set `BCA_FRONTEND_BIND=0.0.0.0` and/or `BCA_BACKEND_BIND=0.0.0.0` before starting.
+
+```bash
+docker compose -f docker-compose.dev.yml down
+```
+
+`down -v` deletes this development stack's SQLite, log, and frontend-dependency volumes; use it only when intentionally resetting development data.
+
 ## Docker and networking
 
 Recommended Linux deployment:

@@ -94,6 +94,33 @@ MESHY_API_KEY
 /api/v1/creator/sessions/{session_id}/model.glb
 ```
 
+## Linux Docker Compose 开发
+
+`docker-compose.dev.yml` 将后端和 Vite 前端拆为两个热重载服务；源代码通过 bind mount 提供。它不使用 host networking，也不暴露虚拟打印机端口，因此不要将它用于打印机 LAN 集成或生产部署。
+
+可选地在首次启动前创建仅供开发后端使用的 Provider 环境文件：
+
+```bash
+cp .env.bca.example .env.bca
+chmod 600 .env.bca
+# 编辑 .env.bca：删除未使用的 <inject-secret> 占位符，并填写实际值
+```
+
+Compose 只将 `.env.bca` 注入 `backend` 服务，前端容器不会获得 Provider 凭据；该文件同时被 Git 和 Docker build context 忽略。仅在 `MESHY_MODEL_INPUT_MODE=public_url` 时设置可公网访问的 HTTPS `BCA_PUBLIC_BASE_URL`，本地开发应保留 `data_uri` 或删除该变量。
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+访问 `http://127.0.0.1:5173` 开发前端；Vite 通过 `BACKEND_HOST=backend` 和 `BACKEND_PORT=8000` 将 API 和 WebSocket 请求代理到后端，未设置时原生开发仍使用 `localhost:8000`。后端健康检查为 `http://127.0.0.1:8000/health`。默认端口仅绑定 loopback；需要从 LAN 访问时，在启动前显式设置 `BCA_FRONTEND_BIND=0.0.0.0` 和/或 `BCA_BACKEND_BIND=0.0.0.0`。
+
+```bash
+docker compose -f docker-compose.dev.yml down
+```
+
+`down -v` 会删除该开发栈的 SQLite、日志和前端依赖卷；仅在确实要重置开发数据时使用。
+
+
 ## Docker 与网络
 
 Linux 推荐：

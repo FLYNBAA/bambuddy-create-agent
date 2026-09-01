@@ -23,6 +23,18 @@ $env:DATA_DIR = "$PWD\data"
 npm --prefix .\frontend run dev
 ```
 
+### Linux Docker Compose 开发
+
+在仓库根目录使用开发 Compose 栈，不要再分别启动前端和后端命令：
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+这是仅用于开发的双服务例外：`frontend` 以 Vite HMR 运行在 `http://127.0.0.1:5173`，`backend` 以 Uvicorn reload 运行在 `http://127.0.0.1:8000`。Compose 设置 `BACKEND_HOST=backend` 和 `BACKEND_PORT=8000`，使 `/api` 与 `/api/v1/ws` 均通过 Docker 服务 DNS 代理；原生开发不设置这两个变量，仍代理到 `localhost:8000`。前端服务不是可独立部署的生产应用。
+
+使用 `docker compose -f docker-compose.dev.yml down` 停止开发栈。Provider 环境注入和开发卷重置说明见仓库根 README。
+
 ## BCA 页面
 
 | 路由 | 组件 | 用途 |

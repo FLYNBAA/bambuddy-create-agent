@@ -20,6 +20,9 @@ venv/
 ENV/
 env/
 .env
+# Development-only Provider credentials must never enter a Docker build context.
+.env.bca
+!.env.bca.example
 *.egg-info/
 .eggs/
 dist/

@@ -1,0 +1,27 @@
+# Development-only backend image. Source is bind-mounted by docker-compose.dev.yml.
+FROM python:3.13-slim-trixie
+
+WORKDIR /app
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    DATA_DIR=/app/data \
+    LOG_DIR=/app/logs \
+    PORT=8000
+
+# Keep the runtime tools used by the application available during development.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --root-user-action=ignore --upgrade 'pip>=26.1.2' \
+    && pip install --root-user-action=ignore -r requirements.txt
+
+COPY backend/ ./backend/
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "backend"]

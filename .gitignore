@@ -16,6 +16,7 @@ venv/
 .venv/
 env/
 .env
+/.env.bca
 docker-compose.override.yml
 *.egg-info/
 dist/

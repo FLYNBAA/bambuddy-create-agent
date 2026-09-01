@@ -2,9 +2,10 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
-// Backend port for dev server proxy (default: 8000)
+// Backend address for the dev-server proxy (local backend by default).
+const backendHost = process.env.BACKEND_HOST || 'localhost'
 const backendPort = process.env.BACKEND_PORT || '8000'
-const backendUrl = `http://localhost:${backendPort}`
+const backendUrl = `http://${backendHost}:${backendPort}`
 
 
 export default defineConfig({
