@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from typing import Literal
-from typing_extensions import NotRequired, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from typing_extensions import NotRequired, TypedDict
 
 from .contracts import BriefEnricher, ClarificationQuestion, CreativeBrief
 from .prompts import build_print_aware_image_prompt, clarification_questions

@@ -82,8 +82,9 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/archives/{archive_id}/source-dl/{token}/{filename}"),
         ("GET", "/api/v1/library/files/{file_id}/dl/{token}/{filename}"),
         # Obico cached frame — one-time nonce embedded in <img> tags.
-        # Meshy public-url model input — the high-entropy creator session ID is the provider capability; the route exposes only its confined GLB.
-        ("GET", "/api/v1/creator/sessions/{session_id}/{artifact}.glb"),
+        # Meshy public-url capabilities use an independent, unguessable token and route-level artifact confinement.
+        ("GET", "/api/v1/creator/sessions/{session_id}/provider/{capability_token}/model.glb"),
+        ("GET", "/api/v1/creator/sessions/{session_id}/provider/{capability_token}/calibrated.3mf"),
         ("GET", "/api/v1/obico/cached-frame/{nonce}"),
         # MakerWorld thumbnail proxy — fetches external URL; no Bambuddy data exposed.
         ("GET", "/api/v1/makerworld/thumbnail"),

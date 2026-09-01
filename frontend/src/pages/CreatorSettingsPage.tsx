@@ -14,6 +14,7 @@ type Config = {
   tencent_secret_key: string;
   tencent_region: string;
   meshy_api_key: string;
+  meshy_base_url: string;
   meshy_model_input_mode: string;
   app_public_base_url: string;
   configured: Record<string, boolean>;
@@ -34,6 +35,7 @@ const providerFields = [
   ['image_model', 'Image Model'],
   ['image_quality', 'Image Quality'],
   ['tencent_region', 'Tencent Region'],
+  ['meshy_base_url', 'Meshy Base URL'],
   ['meshy_model_input_mode', 'Meshy Input Mode'],
   ['app_public_base_url', 'BCA Public Base URL'],
 ] as const;

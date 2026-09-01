@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
-from typing import Awaitable, Callable, Literal, Protocol
+from secrets import token_urlsafe
+from typing import Literal, Protocol
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field, field_validator
 
 
 class SessionStatus(StrEnum):
     NEEDS_INPUT = "needs_input"
-    AWAITING_IMAGE_CONFIRMATION = "awaiting_image_confirmation"
+    READY_FOR_IMAGES = "ready_for_images"
     QUEUED_IMAGE = "queued_image"
     GENERATING_IMAGES = "generating_images"
     AWAITING_IMAGE_SELECTION = "awaiting_image_selection"
-    AWAITING_3D_CONFIRMATION = "awaiting_3d_confirmation"
     QUEUED_3D = "queued_3d"
     GENERATING_3D = "generating_3d"
     COMPLETED = "completed"
@@ -56,6 +57,8 @@ class PrintabilityReport(BaseModel):
 class PrintAnalysisState(BaseModel):
     status: SubworkflowStatus = SubworkflowStatus.NOT_STARTED
     report: PrintabilityReport | None = None
+    score: int | None = Field(default=None, ge=0, le=100)
+    insights: list[str] = Field(default_factory=list, max_length=8)
     error: str | None = None
 
 
@@ -67,9 +70,10 @@ class ModelRepairState(BaseModel):
 
 
 class PrintFileState(BaseModel):
+    """Internal Meshy conversion state; only calibration publishes an artifact."""
+
     status: SubworkflowStatus = SubworkflowStatus.NOT_STARTED
-    max_colors: int | None = Field(default=None, ge=1, le=16)
-    issues_acknowledged: bool = False
+    max_colors: int | None = Field(default=None, ge=1, le=8)
     error: str | None = None
 
 class ColorMatchAssignment(BaseModel):
@@ -84,6 +88,7 @@ class ColorMatchAssignment(BaseModel):
 
 class ColorCalibrationState(BaseModel):
     status: SubworkflowStatus = SubworkflowStatus.NOT_STARTED
+    mode: Literal["white", "multicolor"] | None = None
     source_colors: list[str] = Field(default_factory=list)
     assignments: list[ColorMatchAssignment] = Field(default_factory=list)
     error: str | None = None
@@ -91,7 +96,7 @@ class ColorCalibrationState(BaseModel):
 
 
 class CreativeBrief(BaseModel):
-    """The three required creative decisions collected before paid generation."""
+    """The three required decisions for creative generation."""
 
     subject: str | None = Field(default=None, max_length=500)
     style: str | None = Field(default=None, max_length=120)
@@ -133,10 +138,6 @@ class StageEvent(BaseModel):
     message: str
     at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-class ConversationMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=4000)
-    at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class SessionSnapshot(BaseModel):
@@ -144,6 +145,7 @@ class SessionSnapshot(BaseModel):
 
     session_id: str
     status: SessionStatus
+    provider_capability_token: str = Field(default_factory=lambda: token_urlsafe(32), min_length=32, max_length=128)
     brief: CreativeBrief = Field(default_factory=CreativeBrief)
     questions: list[ClarificationQuestion] = Field(default_factory=list)
     image_prompt: str | None = None
@@ -162,7 +164,6 @@ class SessionSnapshot(BaseModel):
     color_calibration: ColorCalibrationState = Field(default_factory=ColorCalibrationState)
     calibrated_print_file_path: str | None = None
     geometry_print_file_path: str | None = None
-    conversation: list[ConversationMessage] = Field(default_factory=list)
 
     error: str | None = None
     events: list[StageEvent] = Field(default_factory=list)
@@ -187,9 +188,20 @@ class GeneratedModel(BaseModel):
 class ColorMatchResponse(BaseModel):
     assignments: list[ColorMatchAssignment] = Field(
         min_length=1,
-        max_length=16,
+        max_length=8,
         validation_alias=AliasChoices("assignments", "matches"),
     )
+
+
+class PrintAssessment(BaseModel):
+    """A concise quality assessment, intentionally without remediation advice."""
+
+    score: int = Field(ge=0, le=100)
+    insights: list[str] = Field(min_length=1, max_length=8)
+
+
+class GeneratedTaskTitle(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
 
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]
@@ -235,7 +247,8 @@ class PrintProvider(Protocol):
         self,
         session_id: str,
         model_path: Path,
-        public_route: Literal["model", "repaired-model"] = "model",
+        public_route: str = "model",
+        capability_token: str | None = None,
     ) -> PrintabilityReport: ...
 
     async def repair(self, session_id: str, model_path: Path) -> str: ...
@@ -245,4 +258,5 @@ class PrintProvider(Protocol):
         session_id: str,
         model_path: Path,
         max_colors: int,
+        capability_token: str | None = None,
     ) -> str: ...

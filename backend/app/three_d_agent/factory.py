@@ -11,14 +11,16 @@ def create_agent(
     *,
     inventory_colors=None,
 ) -> ThreeDPrintAgent:
+    from .filament_inventory import FilamentInventoryRepository
     from .providers import (
         DeepSeekBriefEnricher,
         DeepSeekColorMatcher,
+        DeepSeekPrintAssessor,
+        DeepSeekTaskTitleGenerator,
         MeshyPrintProvider,
         OpenAICompatibleImageGenerator,
         TencentHunyuan3DGenerator,
     )
-    from .filament_inventory import FilamentInventoryRepository
     from .storage import ArtifactStore, SessionRepository
 
     resolved_settings = settings if settings is not None else get_settings()
@@ -31,6 +33,8 @@ def create_agent(
         three_d_generator=TencentHunyuan3DGenerator(resolved_settings),
         print_provider=MeshyPrintProvider(resolved_settings),
         color_matcher=DeepSeekColorMatcher(resolved_settings),
+        print_assessor=DeepSeekPrintAssessor(resolved_settings),
+        task_title_provider=DeepSeekTaskTitleGenerator(resolved_settings),
         filament_inventory=FilamentInventoryRepository(inventory_url) if inventory_url else None,
         inventory_colors=inventory_colors,
     )

@@ -134,11 +134,26 @@ class TestDiscoveryAPI:
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_subnet_scan_invalid_subnet(self, async_client: AsyncClient):
-        """Verify invalid subnet format is rejected."""
+        """Reject an invalid scan CIDR before a background scan can start."""
         response = await async_client.post("/api/v1/discovery/scan", json={"subnet": "invalid-subnet", "timeout": 1.0})
 
-        # Should return 422 validation error or 200 with empty results
-        assert response.status_code in [200, 422]
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"subnet": "8.8.8.0/24", "timeout": 1.0},
+            {"subnet": "10.0.0.0/8", "timeout": 1.0},
+            {"subnet": "192.168.1.0/24", "timeout": 0.01},
+            {"subnet": "192.168.1.0/24", "timeout": 10.1},
+        ],
+    )
+    async def test_subnet_scan_rejects_unsafe_request_before_scheduling(self, async_client: AsyncClient, payload: dict):
+        response = await async_client.post("/api/v1/discovery/scan", json=payload)
+
+        assert response.status_code == 422
 
 
 class TestDiscoveryService:

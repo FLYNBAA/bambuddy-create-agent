@@ -1,5 +1,8 @@
+import hashlib
 import json
 import logging
+from datetime import datetime, timezone
+from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -416,6 +419,62 @@ class ColorEntryUpdate(BaseModel):
         return normalize_effect_type(v)
 
 
+
+class BambuddyColorCatalogEntry(BaseModel):
+    """A built-in Bambu Lab color that can be safely imported by selection key."""
+
+    selection_key: str
+    manufacturer: str
+    color_name: str
+    hex_color: str
+    material: str
+    exists: bool
+
+
+class BambuddyColorImportRequest(BaseModel):
+    selection_keys: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(
+        ..., min_length=1, max_length=500
+    )
+
+
+class BambuddyColorImportResult(BaseModel):
+    imported: int
+    skipped: int
+
+def _color_catalog_identity(
+    manufacturer: str, color_name: str, hex_color: str, material: str | None
+) -> tuple[str, str, str, str]:
+    """Normalize the user-facing fields used to identify one catalog color."""
+    return (
+        manufacturer.strip().casefold(),
+        color_name.strip().casefold(),
+        hex_color.strip().lstrip("#").casefold(),
+        (material or "").strip().casefold(),
+    )
+
+
+def _bambuddy_color_selection_key(
+    manufacturer: str, color_name: str, hex_color: str, material: str
+) -> str:
+    """Return a stable opaque key derived solely from the built-in color fields."""
+    identity = _color_catalog_identity(manufacturer, color_name, hex_color, material)
+    digest = hashlib.sha256("\0".join(identity).encode("utf-8")).hexdigest()
+    return f"bambuddy:{digest}"
+
+
+def _bambuddy_default_colors() -> dict[str, tuple[str, str, str, str]]:
+    """Index the built-in Bambu Lab dataset by its stable selection keys."""
+    return {
+        _bambuddy_color_selection_key(manufacturer, color_name, hex_color, material): (
+            manufacturer,
+            color_name,
+            hex_color,
+            material,
+        )
+        for manufacturer, color_name, hex_color, material in DEFAULT_COLOR_CATALOG
+        if manufacturer.strip().casefold() == "bambu lab"
+    }
+
 class ColorLookupResult(BaseModel):
     found: bool
     hex_color: str | None = None
@@ -715,6 +774,89 @@ async def delete_location(
     return {"status": "deleted"}
 
 
+
+
+@router.get("/colors/bambuddy", response_model=list[BambuddyColorCatalogEntry])
+async def get_bambuddy_color_catalog(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_READ),
+):
+    """List built-in Bambu Lab colors with their current catalog availability."""
+    defaults = _bambuddy_default_colors()
+    result = await db.execute(
+        select(
+            ColorCatalogEntry.manufacturer,
+            ColorCatalogEntry.color_name,
+            ColorCatalogEntry.hex_color,
+            ColorCatalogEntry.material,
+        )
+    )
+    existing = {
+        _color_catalog_identity(manufacturer, color_name, hex_color, material)
+        for manufacturer, color_name, hex_color, material in result.all()
+    }
+    return [
+        BambuddyColorCatalogEntry(
+            selection_key=selection_key,
+            manufacturer=manufacturer,
+            color_name=color_name,
+            hex_color=hex_color,
+            material=material,
+            exists=_color_catalog_identity(manufacturer, color_name, hex_color, material) in existing,
+        )
+        for selection_key, (manufacturer, color_name, hex_color, material) in defaults.items()
+    ]
+
+
+@router.post("/colors/bambuddy/import", response_model=BambuddyColorImportResult)
+async def import_bambuddy_color_catalog(
+    data: BambuddyColorImportRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+):
+    """Atomically add selected built-in Bambu colors without touching existing rows."""
+    defaults = _bambuddy_default_colors()
+    selection_keys = list(dict.fromkeys(data.selection_keys))
+    unknown = next((selection_key for selection_key in selection_keys if selection_key not in defaults), None)
+    if unknown is not None:
+        raise HTTPException(status_code=422, detail="Unknown Bambu color selection")
+
+    try:
+        result = await db.execute(
+            select(
+                ColorCatalogEntry.manufacturer,
+                ColorCatalogEntry.color_name,
+                ColorCatalogEntry.hex_color,
+                ColorCatalogEntry.material,
+            )
+        )
+        existing = {
+            _color_catalog_identity(manufacturer, color_name, hex_color, material)
+            for manufacturer, color_name, hex_color, material in result.all()
+        }
+        imported = 0
+        for selection_key in selection_keys:
+            manufacturer, color_name, hex_color, material = defaults[selection_key]
+            identity = _color_catalog_identity(manufacturer, color_name, hex_color, material)
+            if identity in existing:
+                continue
+            db.add(
+                ColorCatalogEntry(
+                    manufacturer=manufacturer,
+                    color_name=color_name,
+                    hex_color=hex_color,
+                    material=material,
+                    is_default=True,
+                )
+            )
+            existing.add(identity)
+            imported += 1
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    return BambuddyColorImportResult(imported=imported, skipped=len(selection_keys) - imported)
 # ── Color Catalog CRUD ─────────────────────────────────────────────────────
 
 
@@ -1121,7 +1263,6 @@ async def export_spools_csv(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_READ),
 ):
     """Export the active inventory as CSV (same schema the importer accepts)."""
-    from datetime import datetime, timezone
 
     query = select(Spool).where(Spool.archived_at.is_(None)).order_by(Spool.material, Spool.brand, Spool.color_name)
     result = await db.execute(query)
@@ -1353,7 +1494,6 @@ async def archive_spool(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
 ):
     """Soft-delete a spool by setting archived_at."""
-    from datetime import datetime, timezone
 
     result = await db.execute(select(Spool).where(Spool.id == spool_id))
     spool = result.scalar_one_or_none()
@@ -1520,7 +1660,6 @@ async def bulk_archive_spools(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
 ):
     """Soft-archive every listed spool (sets archived_at). Already-archived spools are left alone and counted in already_archived."""
-    from datetime import datetime, timezone
 
     result = await db.execute(select(Spool).where(Spool.id.in_(payload.ids)))
     spools = list(result.scalars().all())
@@ -2373,7 +2512,6 @@ async def update_shopping_list_status(
     ),
 ):
     """Update the purchase status of a shopping list item."""
-    from datetime import datetime, timezone
 
     from backend.app.models.shopping_list import ShoppingListItem
 

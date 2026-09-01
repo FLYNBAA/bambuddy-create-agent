@@ -2,7 +2,7 @@ import { Fragment, useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Palette, Plus, Trash2, RotateCcw, Loader2, Pencil, Check, X, Search, Download, Upload, Cloud } from 'lucide-react';
 import { api, getAuthToken } from '../api/client';
-import type { ColorCatalogEntry } from '../api/client';
+import type { BambuddyColorCatalogEntry, ColorCatalogEntry } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
 import { Card, CardHeader, CardContent } from './Card';
 import { ConfirmModal } from './ConfirmModal';
@@ -36,6 +36,13 @@ export function ColorCatalogSettings() {
   // Sync state
   const [syncing, setSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<{ fetched: number; total: number } | null>(null);
+  const [showBambuddyChooser, setShowBambuddyChooser] = useState(false);
+  const [bambuddyColors, setBambuddyColors] = useState<BambuddyColorCatalogEntry[]>([]);
+  const [bambuddyLoading, setBambuddyLoading] = useState(false);
+  const [bambuddyImporting, setBambuddyImporting] = useState(false);
+  const [bambuddyError, setBambuddyError] = useState<string | null>(null);
+  const [bambuddySearch, setBambuddySearch] = useState('');
+  const [selectedBambuddyKeys, setSelectedBambuddyKeys] = useState<Set<string>>(new Set());
 
   // Confirmation modals
   const [deleteEntry, setDeleteEntry] = useState<ColorCatalogEntry | null>(null);
@@ -52,6 +59,24 @@ export function ColorCatalogSettings() {
     }
   }, [showToast, t]);
 
+  const loadBambuddyColors = useCallback(async () => {
+    setBambuddyLoading(true);
+    setBambuddyError(null);
+    try {
+      const entries = await api.getBambuddyColorCatalog();
+      setBambuddyColors(entries);
+      setSelectedBambuddyKeys(prev => new Set(
+        [...prev].filter(key => entries.some(entry => entry.selection_key === key && !entry.exists)),
+      ));
+    } catch {
+      setBambuddyError(t('settings.colorCatalog.bambuddyLoadFailed', {
+        defaultValue: 'Could not load Bambu Lab colors. Try again.',
+      }));
+    } finally {
+      setBambuddyLoading(false);
+    }
+  }, [t]);
+
   useEffect(() => {
     loadCatalog();
   }, [loadCatalog]);
@@ -66,6 +91,75 @@ export function ColorCatalogSettings() {
     const matchesManufacturer = filterManufacturer === '' || entry.manufacturer === filterManufacturer;
     return matchesSearch && matchesManufacturer;
   });
+
+  const filteredBambuddyColors = bambuddyColors.filter(entry => {
+    const query = bambuddySearch.trim().toLowerCase();
+    return !query || [entry.manufacturer, entry.material, entry.color_name, entry.hex_color]
+      .some(value => value.toLowerCase().includes(query));
+  });
+
+  const selectableBambuddyColors = filteredBambuddyColors.filter(entry => !entry.exists);
+
+  const toggleBambuddyChooser = async () => {
+    const willShow = !showBambuddyChooser;
+    setShowBambuddyChooser(willShow);
+    if (willShow && bambuddyColors.length === 0 && !bambuddyLoading) {
+      await loadBambuddyColors();
+    }
+  };
+
+  const toggleBambuddyColor = (selectionKey: string) => {
+    setSelectedBambuddyKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(selectionKey)) next.delete(selectionKey);
+      else next.add(selectionKey);
+      return next;
+    });
+  };
+
+  const toggleAllBambuddyColors = () => {
+    setSelectedBambuddyKeys(prev => {
+      const next = new Set(prev);
+      const allSelected = selectableBambuddyColors.length > 0 && selectableBambuddyColors
+        .every(entry => next.has(entry.selection_key));
+      for (const entry of selectableBambuddyColors) {
+        if (allSelected) next.delete(entry.selection_key);
+        else next.add(entry.selection_key);
+      }
+      return next;
+    });
+  };
+
+  const handleBambuddyImport = async () => {
+    const selectionKeys = [...selectedBambuddyKeys];
+    if (selectionKeys.length === 0) return;
+    setBambuddyImporting(true);
+    setBambuddyError(null);
+    try {
+      const result = await api.importBambuddyColorCatalog(selectionKeys);
+      setSelectedBambuddyKeys(new Set());
+      await Promise.all([loadCatalog(), loadBambuddyColors()]);
+      showToast(
+        result.imported > 0
+          ? t('settings.colorCatalog.bambuddyImportSuccess', {
+            count: result.imported,
+            defaultValue: `Imported ${result.imported} Bambu Lab color${result.imported === 1 ? '' : 's'}.`,
+          })
+          : t('settings.colorCatalog.bambuddyUpToDate', {
+            defaultValue: 'All selected Bambu Lab colors are already available.',
+          }),
+        'success',
+      );
+    } catch {
+      const message = t('settings.colorCatalog.bambuddyImportFailed', {
+        defaultValue: 'Could not import Bambu Lab colors. Try again.',
+      });
+      setBambuddyError(message);
+      showToast(message, 'error');
+    } finally {
+      setBambuddyImporting(false);
+    }
+  };
 
   const resetForm = () => {
     setFormManufacturer('');
@@ -366,6 +460,16 @@ export function ColorCatalogSettings() {
             </span>
           </button>
           <button
+            type="button"
+            onClick={toggleBambuddyChooser}
+            aria-expanded={showBambuddyChooser}
+            aria-controls="bambuddy-color-import"
+            className="px-3 py-1.5 text-sm bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-bambu-gray hover:text-white transition-colors flex items-center gap-1.5"
+          >
+            <Palette className="w-4 h-4" />
+            <span>{t('settings.colorCatalog.bambuddyImport', { defaultValue: 'Bambu Lab colors' })}</span>
+          </button>
+          <button
             onClick={() => setShowResetConfirm(true)}
             className="px-3 py-1.5 text-sm bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-bambu-gray hover:text-white transition-colors flex items-center gap-1.5"
           >
@@ -405,6 +509,137 @@ export function ColorCatalogSettings() {
         <p className="text-sm text-bambu-gray">
           {t('settings.colorCatalog.description')}
         </p>
+
+        {showBambuddyChooser && (
+          <section
+            id="bambuddy-color-import"
+            aria-labelledby="bambuddy-color-import-heading"
+            className="p-4 bg-bambu-dark rounded-lg border border-bambu-dark-tertiary space-y-3"
+          >
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <h3 id="bambuddy-color-import-heading" className="text-sm font-medium text-white">
+                  {t('settings.colorCatalog.bambuddyImportHeading', { defaultValue: 'Import Bambu Lab colors' })}
+                </h3>
+                <p className="text-sm text-bambu-gray mt-1">
+                  {t('settings.colorCatalog.bambuddyImportDescription', {
+                    defaultValue: 'Select missing built-in colors to add them without changing catalog entries you already have.',
+                  })}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={loadBambuddyColors}
+                disabled={bambuddyLoading || bambuddyImporting}
+                className="px-3 py-1.5 text-sm border border-bambu-dark-tertiary rounded-lg text-bambu-gray hover:text-white disabled:opacity-50 transition-colors"
+              >
+                {t('common.refresh', { defaultValue: 'Refresh' })}
+              </button>
+            </div>
+
+            <label htmlFor="bambuddy-color-search" className="sr-only">
+              {t('settings.colorCatalog.bambuddySearch', { defaultValue: 'Search Bambu Lab colors' })}
+            </label>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-bambu-gray" />
+              <input
+                id="bambuddy-color-search"
+                type="search"
+                value={bambuddySearch}
+                onChange={(event) => setBambuddySearch(event.target.value)}
+                placeholder={t('settings.colorCatalog.bambuddySearch', { defaultValue: 'Search Bambu Lab colors' })}
+                className="w-full pl-10 pr-3 py-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:border-bambu-green focus:outline-none"
+              />
+            </div>
+
+            {bambuddyLoading ? (
+              <div className="flex items-center py-4 text-sm text-bambu-gray" role="status">
+                <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                {t('common.loading')}
+              </div>
+            ) : bambuddyError ? (
+              <p className="text-sm text-red-400" role="alert">{bambuddyError}</p>
+            ) : (
+              <>
+                <div className="flex items-center justify-between gap-3 flex-wrap text-sm">
+                  <span className="text-bambu-gray">
+                    {t('settings.colorCatalog.bambuddyShowing', {
+                      count: filteredBambuddyColors.length,
+                      defaultValue: `${filteredBambuddyColors.length} built-in colors`,
+                    })}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={toggleAllBambuddyColors}
+                    disabled={selectableBambuddyColors.length === 0 || bambuddyImporting}
+                    className="text-bambu-green hover:text-white disabled:text-bambu-gray disabled:cursor-not-allowed transition-colors"
+                  >
+                    {t('settings.colorCatalog.bambuddySelectVisible', { defaultValue: 'Select all visible missing colors' })}
+                  </button>
+                </div>
+                <div className="max-h-64 overflow-auto border border-bambu-dark-tertiary rounded-lg divide-y divide-bambu-dark-tertiary">
+                  {filteredBambuddyColors.length === 0 ? (
+                    <p className="px-3 py-6 text-sm text-center text-bambu-gray">
+                      {t('settings.colorCatalog.bambuddyNoMatch', { defaultValue: 'No Bambu Lab colors match this search.' })}
+                    </p>
+                  ) : (
+                    filteredBambuddyColors.map(entry => (
+                      <label
+                        key={entry.selection_key}
+                        className={`flex items-center gap-3 px-3 py-2 ${entry.exists ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-bambu-dark-secondary'}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedBambuddyKeys.has(entry.selection_key)}
+                          disabled={entry.exists || bambuddyImporting}
+                          onChange={() => toggleBambuddyColor(entry.selection_key)}
+                          aria-label={`${entry.material} ${entry.color_name}${entry.exists ? ' (already available)' : ''}`}
+                          className="w-4 h-4 accent-bambu-green cursor-pointer disabled:cursor-not-allowed"
+                        />
+                        <FilamentSwatch
+                          rgba={`${entry.hex_color.replace(/^#/, '')}FF`}
+                          className="w-7 h-7 shrink-0"
+                          shape="square"
+                          title={entry.hex_color}
+                          effectSize="table"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm text-white truncate">{entry.color_name}</span>
+                          <span className="block text-xs text-bambu-gray truncate">{entry.material} · {entry.hex_color}</span>
+                        </span>
+                        {entry.exists && (
+                          <span className="text-xs text-bambu-gray whitespace-nowrap">
+                            {t('settings.colorCatalog.bambuddyAvailable', { defaultValue: 'Already available' })}
+                          </span>
+                        )}
+                      </label>
+                    ))
+                  )}
+                </div>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <p className="text-sm text-bambu-gray" aria-live="polite">
+                    {t('settings.colorCatalog.bambuddySelected', {
+                      count: selectedBambuddyKeys.size,
+                      defaultValue: `${selectedBambuddyKeys.size} color${selectedBambuddyKeys.size === 1 ? '' : 's'} selected`,
+                    })}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleBambuddyImport}
+                    disabled={selectedBambuddyKeys.size === 0 || bambuddyImporting}
+                    className="px-3 py-2 text-sm bg-bambu-green text-white rounded-lg hover:bg-bambu-green/80 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                  >
+                    {bambuddyImporting && <Loader2 className="w-4 h-4 animate-spin" />}
+                    {t('settings.colorCatalog.bambuddyImportSelected', {
+                      count: selectedBambuddyKeys.size,
+                      defaultValue: `Import ${selectedBambuddyKeys.size} selected color${selectedBambuddyKeys.size === 1 ? '' : 's'}`,
+                    })}
+                  </button>
+                </div>
+              </>
+            )}
+          </section>
+        )}
 
         {/* Search and filter */}
         <div className="flex gap-2 flex-wrap">

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from .contracts import ClarificationQuestion, CreativeBrief
 
-
 _QUESTION_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "subject",

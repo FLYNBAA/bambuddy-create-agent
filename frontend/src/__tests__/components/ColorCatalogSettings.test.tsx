@@ -25,6 +25,8 @@ vi.mock('../../api/client', async () => {
     api: {
       ...actual.api,
       getColorCatalog: vi.fn(),
+      getBambuddyColorCatalog: vi.fn(),
+      importBambuddyColorCatalog: vi.fn(),
       addColorEntry: vi.fn(),
       updateColorEntry: vi.fn(),
       deleteColorEntry: vi.fn(),
@@ -182,5 +184,64 @@ describe('ColorCatalogSettings — inline edit (#1154)', () => {
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     const effectSelect = selects.find((s) => s.value === 'galaxy');
     expect(effectSelect).toBeDefined();
+  });
+});
+
+
+describe('ColorCatalogSettings — Bambu Lab built-in import', () => {
+  const bambuddyColors = [
+    {
+      selection_key: 'bambuddy:jade-white',
+      manufacturer: 'Bambu Lab',
+      color_name: 'Jade White',
+      hex_color: '#FFFFFF',
+      material: 'PLA Basic',
+      exists: false,
+    },
+    {
+      selection_key: 'bambuddy:black',
+      manufacturer: 'Bambu Lab',
+      color_name: 'Black',
+      hex_color: '#000000',
+      material: 'PLA Basic',
+      exists: true,
+    },
+  ];
+
+  it('only selects missing built-ins and submits their stable keys', async () => {
+    vi.mocked(api.getColorCatalog).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    vi.mocked(api.getBambuddyColorCatalog)
+      .mockResolvedValueOnce(bambuddyColors)
+      .mockResolvedValueOnce(bambuddyColors.map(entry => ({ ...entry, exists: true })));
+    vi.mocked(api.importBambuddyColorCatalog).mockResolvedValueOnce({ imported: 1, skipped: 0 });
+
+    render(<ColorCatalogSettings />);
+    await waitFor(() => expect(api.getColorCatalog).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Bambu Lab colors' }));
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'PLA Basic Jade White' })).toBeInTheDocument());
+
+    const existing = screen.getByRole('checkbox', { name: 'PLA Basic Black (already available)' });
+    expect(existing).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'PLA Basic Jade White' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 selected color' }));
+
+    await waitFor(() => expect(api.importBambuddyColorCatalog).toHaveBeenCalledWith(['bambuddy:jade-white']));
+  });
+
+  it('filters built-ins and imports all visible missing selections', async () => {
+    vi.mocked(api.getColorCatalog).mockResolvedValueOnce([]);
+    vi.mocked(api.getBambuddyColorCatalog).mockResolvedValueOnce(bambuddyColors);
+
+    render(<ColorCatalogSettings />);
+    await waitFor(() => expect(api.getColorCatalog).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Bambu Lab colors' }));
+    await waitFor(() => expect(screen.getByPlaceholderText('Search Bambu Lab colors')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText('Search Bambu Lab colors'), { target: { value: 'Jade' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Select all visible missing colors' }));
+
+    expect(screen.getByRole('checkbox', { name: 'PLA Basic Jade White' })).toBeChecked();
+    expect(screen.getByRole('button', { name: 'Import 1 selected color' })).toBeEnabled();
   });
 });

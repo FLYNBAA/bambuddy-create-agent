@@ -1,17 +1,29 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Download, FileUp, ListPlus, Loader2, Send, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Download, Expand, FileUp, ListPlus, Loader2, Send, Trash2, X } from 'lucide-react';
 import { getAuthToken } from '../api/client';
+import { ModelViewer } from '../components/ModelViewer';
 
 type Task = {
   id: number;
   filename: string;
+  title?: string | null;
+  username?: string | null;
+  created_by: string;
+  created_at: string;
   status: string;
   sliced_library_file_id: number | null;
   print_queue_item_id: number | null;
-  created_by: string;
-  created_at: string;
+  customer_name?: string | null;
+  phone?: string | null;
+  address?: string | null;
+  notes?: string | null;
+  price?: string | null;
+  style_image_preview_url?: string | null;
+  model_preview_url?: string | null;
+  source_3mf_url?: string | null;
 };
 type PrinterOption = { id: number; name: string; model?: string | null };
+type Preview = { url: string; type: 'image' | 'glb' | '3mf'; title: string };
 
 const BASE = '/api/v1/bca-tasks';
 
@@ -21,7 +33,6 @@ function authHeaders(init?: HeadersInit) {
   if (token) headers.set('Authorization', `Bearer ${token}`);
   return headers;
 }
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${BASE}${path}`, { ...init, headers: authHeaders(init?.headers) });
   if (!response.ok) {
@@ -30,13 +41,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
-
 async function listPrinters(): Promise<PrinterOption[]> {
   const response = await fetch('/api/v1/printers/', { headers: authHeaders() });
   if (!response.ok) throw new Error('Unable to load printers');
   return response.json() as Promise<PrinterOption[]>;
 }
-
 async function downloadTaskSource(task: Task) {
   const response = await fetch(`${BASE}/${task.id}/source`, { headers: authHeaders() });
   if (!response.ok) {
@@ -51,6 +60,45 @@ async function downloadTaskSource(task: Task) {
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
+function PreviewDialog({ preview, onClose }: { preview: Preview; onClose: () => void }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return;
+      const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+        .filter((element) => !element.hasAttribute('disabled'));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onClose]);
+
+  return <div className="creator-preview-backdrop" role="presentation" onMouseDown={onClose}>
+    <section ref={dialogRef} className="creator-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="task-preview-title" onMouseDown={(event) => event.stopPropagation()}>
+      <header><h2 id="task-preview-title">{preview.title}</h2><button className="icon-button" onClick={onClose} aria-label="关闭预览" autoFocus><X size={18} /></button></header>
+      {preview.type === 'image' ? <img className="bca-preview-image-large" src={preview.url} alt="" /> : <div className="creator-preview-large"><ModelViewer url={preview.url} fileType={preview.type} /></div>}
+    </section>
+  </div>;
+}
+
 export function TaskListPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [printers, setPrinters] = useState<PrinterOption[]>([]);
@@ -59,6 +107,8 @@ export function TaskListPage() {
   const [printer, setPrinter] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [stylePreviews, setStylePreviews] = useState<Record<string, string>>({});
+  const [expandedPreview, setExpandedPreview] = useState<Preview | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -67,6 +117,24 @@ export function TaskListPage() {
     } catch (err) { setError(err instanceof Error ? err.message : 'Unable to load task list'); }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    const urls = [...new Set(tasks.flatMap((task) => task.style_image_preview_url ? [task.style_image_preview_url] : []))];
+    if (!urls.length) { setStylePreviews({}); return; }
+    const controller = new AbortController();
+    const objectUrls: string[] = [];
+    let disposed = false;
+    void Promise.allSettled(urls.map(async (url) => {
+      const response = await fetch(url, { headers: authHeaders(), signal: controller.signal });
+      if (!response.ok) throw new Error(`Style preview failed (${response.status})`);
+      const objectUrl = URL.createObjectURL(await response.blob());
+      if (disposed) { URL.revokeObjectURL(objectUrl); return null; }
+      objectUrls.push(objectUrl);
+      return [url, objectUrl] as const;
+    })).then((results) => {
+      if (!disposed) setStylePreviews(Object.fromEntries(results.flatMap((result) => result.status === 'fulfilled' && result.value ? [result.value] : [])));
+    });
+    return () => { disposed = true; controller.abort(); objectUrls.forEach(URL.revokeObjectURL); };
+  }, [tasks]);
 
   async function upload() {
     if (!model) return;
@@ -75,7 +143,6 @@ export function TaskListPage() {
     catch (err) { setError(err instanceof Error ? err.message : 'Upload failed'); }
     finally { setBusy(false); }
   }
-
   async function attachSliced(taskId: number) {
     const file = sliced[taskId]; if (!file) return;
     setBusy(true); setError(null);
@@ -83,7 +150,6 @@ export function TaskListPage() {
     catch (err) { setError(err instanceof Error ? err.message : 'Sliced file validation failed'); }
     finally { setBusy(false); }
   }
-
   async function queue(taskId: number) {
     const printerId = Number(printer[taskId]);
     if (!Number.isInteger(printerId) || printerId <= 0) { setError('请选择打印机'); return; }
@@ -92,14 +158,12 @@ export function TaskListPage() {
     catch (err) { setError(err instanceof Error ? err.message : 'Queue submission failed'); }
     finally { setBusy(false); }
   }
-
   async function download(task: Task) {
     setBusy(true); setError(null);
     try { await downloadTaskSource(task); }
     catch (err) { setError(err instanceof Error ? err.message : 'Task download failed'); }
     finally { setBusy(false); }
   }
-
   async function remove(taskId: number) {
     if (!window.confirm('永久删除此任务及其待处理源文件？')) return;
     setBusy(true); setError(null);
@@ -109,9 +173,25 @@ export function TaskListPage() {
   }
 
   return <main className="bca-task-page">
-    <header><div><span className="eyebrow">BCA TASK LIST</span><h1>任务清单</h1><p>仅将校准后的模型放入任务；root 上传切片后的 `.gcode.3mf` 后才能进入原生打印队列。</p></div></header>
-    <section className="bca-task-upload"><label><FileUp size={18} />添加已校准模型 3MF<input type="file" accept=".3mf" onChange={(event) => setModel(event.target.files?.[0] || null)} /></label><button className="primary-button" disabled={!model || busy} onClick={() => void upload()}>{busy ? <Loader2 className="spin" size={16} /> : <ListPlus size={16} />}添加任务</button></section>
+    <header><div><h1>任务清单</h1><p>校准后的 3MF、风格图和模型预览会随任务保存。上传切片文件后，任务才可进入打印队列。</p></div></header>
+    <section className="bca-task-upload"><label><FileUp size={18} />添加已有校准 3MF<input type="file" accept=".3mf" onChange={(event) => setModel(event.target.files?.[0] || null)} /></label><button className="primary-button" disabled={!model || busy} onClick={() => void upload()}>{busy ? <Loader2 className="spin" size={16} /> : <ListPlus size={16} />}添加任务</button></section>
     {error && <p className="creator-error" role="alert">{error}</p>}
-    <section className="bca-task-list">{tasks.map((task) => <article key={task.id} className="bca-task-card"><div className="bca-task-meta"><div><h2>{task.filename}</h2><p>{task.created_by || 'root'} · {new Date(task.created_at).toLocaleString()} · {task.status.replaceAll('_', ' ')}</p></div><div className="bca-task-actions"><button onClick={() => void download(task)}><Download size={16} />下载</button><button onClick={() => void remove(task.id)} aria-label="删除任务"><Trash2 size={16} /></button></div></div>{task.status !== 'queued' && <div className="bca-task-process"><label><FileUp size={16} />{sliced[task.id]?.name || '上传切片 .gcode.3mf'}<input type="file" accept=".3mf" onChange={(event) => setSliced((current) => ({ ...current, [task.id]: event.target.files?.[0] || null }))} /></label><button disabled={!sliced[task.id] || busy || task.status === 'ready_for_queue'} onClick={() => void attachSliced(task.id)}>处理并验证切片</button>{task.status === 'ready_for_queue' && <div className="bca-task-queue"><select value={printer[task.id] || ''} onChange={(event) => setPrinter((current) => ({ ...current, [task.id]: event.target.value }))}><option value="">选择打印机</option>{printers.map((item) => <option key={item.id} value={item.id}>{item.name}{item.model ? `（${item.model}）` : ''}</option>)}</select><button disabled={busy} onClick={() => void queue(task.id)}><Send size={16} />提交原生队列</button></div>}</div>}{task.status === 'queued' && <p className="bca-task-queued">已交给 Bambuddy 原生队列处理。</p>}</article>)}</section>
+    <section className="bca-task-list">{tasks.map((task) => {
+      const sourceUrl = task.source_3mf_url || `${BASE}/${task.id}/source`;
+      const styleUrl = task.style_image_preview_url ? stylePreviews[task.style_image_preview_url] : null;
+      const hasSliced = Boolean(task.sliced_library_file_id);
+      const queued = Boolean(task.print_queue_item_id);
+      return <article key={task.id} className="bca-task-card">
+        <div className="bca-task-meta"><div><p className="bca-task-owner">{task.username || task.created_by || 'root'}</p><h2>{task.title || task.filename}</h2><p>{task.status.replaceAll('_', ' ')} · {new Date(task.created_at).toLocaleString()}</p></div><div className="bca-task-actions"><button onClick={() => void download(task)}><Download size={16} />下载源文件</button><button onClick={() => void remove(task.id)} disabled={busy} aria-label={`删除任务 ${task.title || task.filename}`}><Trash2 size={16} /></button></div></div>
+        <div className="bca-task-previews">
+          {styleUrl && <button className="bca-task-preview bca-style-preview" onClick={() => setExpandedPreview({ url: styleUrl, type: 'image', title: '已选风格图' })}><img src={styleUrl} alt="已选风格图" /><span><Expand size={15} />风格图</span></button>}
+          {task.model_preview_url && <button className="bca-task-preview" onClick={() => setExpandedPreview({ url: task.model_preview_url!, type: 'glb', title: 'GLB 模型预览' })}><div><ModelViewer url={task.model_preview_url} fileType="glb" showControls={false} /></div><span><Expand size={15} />GLB 模型</span></button>}
+          <button className="bca-task-preview" onClick={() => setExpandedPreview({ url: sourceUrl, type: '3mf', title: '源 3MF 预览' })}><div><ModelViewer url={sourceUrl} fileType="3mf" showControls={false} /></div><span><Expand size={15} />源 3MF</span></button>
+        </div>
+        <details className="bca-task-details"><summary>配置 · 订单详情</summary><dl><div><dt>客户</dt><dd>{task.customer_name || '未填写'}</dd></div><div><dt>电话</dt><dd>{task.phone || '未填写'}</dd></div><div><dt>地址</dt><dd>{task.address || '未填写'}</dd></div><div><dt>价格</dt><dd>{task.price || '待定'}</dd></div>{task.notes && <div><dt>备注</dt><dd>{task.notes}</dd></div>}</dl></details>
+        <div className="bca-task-process">{hasSliced ? <p className="bca-task-queued">切片文件已关联{queued ? '，已进入打印队列。' : '，请选择打印机后加入队列。'}</p> : <label><FileUp size={16} />上传切片后的 .gcode.3mf<input type="file" accept=".gcode.3mf,.3mf" onChange={(event) => setSliced((current) => ({ ...current, [task.id]: event.target.files?.[0] || null }))} /></label>}{!hasSliced && <button disabled={!sliced[task.id] || busy} onClick={() => void attachSliced(task.id)}>验证并关联切片文件</button>}{hasSliced && !queued && <><select value={printer[task.id] || ''} onChange={(event) => setPrinter((current) => ({ ...current, [task.id]: event.target.value }))} aria-label={`选择 ${task.title || task.filename} 的打印机`}><option value="">选择打印机</option>{printers.map((item) => <option key={item.id} value={item.id}>{item.name}{item.model ? ` · ${item.model}` : ''}</option>)}</select><button disabled={busy} onClick={() => void queue(task.id)}><Send size={16} />加入队列</button></>}</div>
+      </article>;
+    })}{!tasks.length && <div className="creator-empty">还没有任务。完成创作流程后可在此查看任务。</div>}</section>
+    {expandedPreview && <PreviewDialog preview={expandedPreview} onClose={() => setExpandedPreview(null)} />}
   </main>;
 }

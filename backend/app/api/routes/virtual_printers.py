@@ -275,10 +275,10 @@ async def create_virtual_printer(
 async def get_tailscale_status(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_READ),
 ) -> TailscaleStatusResponse:
-    """Return current Tailscale availability and machine identity.
+    """Return current Tailscale reachability and machine identity.
 
-    Used by the frontend to indicate whether virtual printer TLS is backed
-    by a trusted Let's Encrypt certificate or a self-signed CA.
+    This status endpoint does not enroll the host, advertise routes, or issue
+    certificates. Virtual Printer TLS continues to use Bambuddy's own CA.
     """
     status = await tailscale_service.get_status()
     return TailscaleStatusResponse(

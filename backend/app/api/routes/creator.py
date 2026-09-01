@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import shutil
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.routes._url_safety import assert_safe_lan_service_url
+from backend.app.api.routes.bca_tasks import _validate_model_3mf
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.config import settings
 from backend.app.core.database import get_db
@@ -21,41 +23,55 @@ from backend.app.models.bca_task import BCATask
 from backend.app.models.user import User
 from backend.app.services.creator_integration import (
     CreatorSessionResponse,
-    ImageSelectionRequest,
     confined_artifact,
     controller_for,
     file_response,
     image_artifact,
     persist_creator_config_overrides,
 )
-from backend.app.three_d_agent.conversation import CreatorCommand
+from backend.app.three_d_agent.contracts import SubworkflowStatus
 from backend.app.three_d_agent.providers.exceptions import ProviderConfigurationError, ProviderError
 
 router = APIRouter(prefix="/creator", tags=["creator"])
 
 
-class PrintGenerationRequest(BaseModel):
+class ModelGenerationRequest(BaseModel):
+    image_index: int = Field(ge=0, le=3)
+
+
+class PrintCalibrationRequest(BaseModel):
+    mode: str = Field(pattern="^(white|multicolor)$")
     max_colors: int = Field(default=8, ge=1, le=8)
-    acknowledge_issues: bool = False
 
 
 class CreatorTaskRequest(BaseModel):
-    mode: str = Field(pattern="^(multicolor|geometry)$")
+    title: str | None = Field(default=None, max_length=120)
+    customer_name: str = Field(min_length=1, max_length=120)
+    phone: str = Field(min_length=1, max_length=40)
+    address: str = Field(min_length=1, max_length=500)
+    notes: str | None = Field(default=None, max_length=2000)
 
+
+    @field_validator("customer_name", "phone", "address")
+    @classmethod
+    def required_text_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+    @field_validator("title", "notes")
+    @classmethod
+    def optional_text_is_normalized(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
 class CreatorTaskResponse(BaseModel):
     task_id: int
     status: str
 
 
-class CreatorChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=4000)
-
-
-class CreatorChatResponse(BaseModel):
-    session: CreatorSessionResponse
-    action: str
-    reply: str
 
 class CreatorRestartRequest(BaseModel):
     stage: str = Field(pattern="^(brief|images|model|print)$")
@@ -72,6 +88,7 @@ class CreatorConfigResponse(BaseModel):
     tencent_secret_key: str
     tencent_region: str
     meshy_api_key: str
+    meshy_base_url: str
     meshy_model_input_mode: str
     app_public_base_url: str
     configured: dict[str, bool]
@@ -89,6 +106,7 @@ class CreatorConfigUpdate(BaseModel):
     tencent_secret_key: str | None = None
     tencent_region: str | None = None
     meshy_api_key: str | None = None
+    meshy_base_url: str | None = None
     meshy_model_input_mode: str | None = None
     app_public_base_url: str | None = None
 
@@ -107,6 +125,7 @@ def _config_response(controller) -> CreatorConfigResponse:
         tencent_secret_key=config.tencent_secret_key.get_secret_value(),
         tencent_region=config.tencent_region,
         meshy_api_key=config.meshy_api_key.get_secret_value(),
+        meshy_base_url=config.meshy_base_url,
         meshy_model_input_mode=config.meshy_model_input_mode,
         app_public_base_url=config.app_public_base_url,
         configured={
@@ -121,23 +140,6 @@ def _config_response(controller) -> CreatorConfigResponse:
 def _controller(request: Request):
     return controller_for(request)
 
-def _print_issues_require_acknowledgment(snapshot) -> bool:
-    report = snapshot.print_analysis.report
-    return report is not None and report.status != "healthy"
-
-
-def _message_acknowledges_print_issues(message: str) -> bool:
-    normalized = "".join(message.split())
-    return any(
-        phrase in normalized
-        for phrase in (
-            "已了解打印分析报告中的问题",
-            "已了解报告中的问题",
-            "已知悉打印问题",
-            "已知悉风险",
-            "接受打印风险",
-        )
-    )
 
 
 def _validate_creator_provider_urls(payload: CreatorConfigUpdate) -> None:
@@ -145,6 +147,8 @@ def _validate_creator_provider_urls(payload: CreatorConfigUpdate) -> None:
         assert_safe_lan_service_url(payload.deepseek_base_url, label="DeepSeek base URL")
     if payload.image_base_url is not None:
         assert_safe_lan_service_url(payload.image_base_url, label="image-provider base URL")
+    if payload.meshy_base_url is not None:
+        assert_safe_lan_service_url(payload.meshy_base_url, label="Meshy base URL")
 
 
 def _snapshot(request: Request, session_id: str) -> CreatorSessionResponse:
@@ -158,7 +162,7 @@ def _snapshot(request: Request, session_id: str) -> CreatorSessionResponse:
 def get_creator_config(
     request: Request,
     response: Response,
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_READ),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_UPDATE),
 ) -> CreatorConfigResponse:
     response.headers["Cache-Control"] = "private, no-store"
     return _config_response(_controller(request))
@@ -190,6 +194,7 @@ async def update_creator_config(
         "tencent_secret_key": current.tencent_secret_key,
         "tencent_region": current.tencent_region,
         "meshy_api_key": current.meshy_api_key,
+        "meshy_base_url": current.meshy_base_url,
         "meshy_model_input_mode": current.meshy_model_input_mode,
         "app_public_base_url": current.app_public_base_url,
     }
@@ -249,12 +254,14 @@ def delete_creator_session(
 async def prepare_creator_session(
     session_id: str,
     request: Request,
-    message: str = Form(""),
+    message: str = Form("", max_length=4000),
     reference_image: UploadFile | None = File(default=None),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE),
 ) -> CreatorSessionResponse:
     controller = _controller(request)
-    content = await reference_image.read() if reference_image else None
+    content = await reference_image.read(controller.settings.max_upload_bytes + 1) if reference_image else None
+    if content is not None and len(content) > controller.settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Reference image exceeds the upload limit")
     try:
         controller.agent.get_session(session_id)
         await controller.agent.prepare(
@@ -271,10 +278,10 @@ async def prepare_creator_session(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-async def _queue_stage(session_id: str, request: Request, stage: str, queue, run) -> CreatorSessionResponse:
+async def _queue_stage(session_id: str, request: Request, stage: str, queue, run, *args, **kwargs) -> CreatorSessionResponse:
     controller = _controller(request)
     try:
-        await queue(session_id)
+        await queue(session_id, *args, **kwargs)
         controller.schedule(session_id, stage, run(session_id))
         return controller.snapshot(session_id)
     except KeyError as exc:
@@ -283,80 +290,8 @@ async def _queue_stage(session_id: str, request: Request, stage: str, queue, run
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/sessions/{session_id}/chat", response_model=CreatorChatResponse)
-async def creator_chat(
-    session_id: str,
-    payload: CreatorChatRequest,
-    request: Request,
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE),
-) -> CreatorChatResponse:
-    controller = _controller(request)
-    try:
-        controller.agent.record_conversation_message(session_id, "user", payload.message)
-        snapshot = controller.agent.get_session(session_id)
-        command: CreatorCommand = await controller.planner.plan(snapshot, payload.message)
-        paid_actions = {"confirm_images", "confirm_3d", "generate_print_file"}
-        if command.action in paid_actions and (not command.explicit_confirmation or "确认" not in payload.message):
-            command = command.model_copy(
-                update={
-                    "action": "restart_question",
-                    "reply": "这是付费阶段。请明确回复“确认”并说明要继续的阶段，或直接点击工作卡片上的确认按钮。",
-                }
-            )
-        if command.action == "generate_print_file" and _print_issues_require_acknowledgment(snapshot):
-            if not (command.acknowledge_issues and _message_acknowledges_print_issues(payload.message)):
-                command = command.model_copy(
-                    update={
-                        "action": "restart_question",
-                        "reply": "打印分析发现问题。请先明确回复“我已了解打印分析报告中的问题，确认继续生成多色 3MF”，或在工作卡片勾选确认。",
-                    }
-                )
-        if command.action == "prepare":
-            await controller.agent.prepare(session_id, payload.message)
-        elif command.action == "confirm_images":
-            await controller.agent.queue_image_generation(session_id)
-            controller.schedule(session_id, "images", controller.agent.run_image_generation(session_id))
-        elif command.action == "select_image":
-            if command.image_index is None:
-                raise ValueError("请选择一张候选图后再继续。")
-            await controller.agent.select_image(session_id, command.image_index)
-        elif command.action == "confirm_3d":
-            await controller.agent.queue_3d_generation(session_id)
-            controller.schedule(session_id, "model", controller.agent.run_3d_generation(session_id))
-        elif command.action == "analyze":
-            await controller.agent.queue_print_analysis(session_id)
-            controller.schedule(session_id, "analysis", controller.agent.run_print_analysis(session_id))
-        elif command.action == "generate_print_file":
-            await controller.agent.queue_print_file(
-                session_id,
-                max_colors=8,
-                acknowledge_issues=_print_issues_require_acknowledgment(snapshot),
-            )
-            controller.schedule(session_id, "print-file", controller.agent.run_print_file(session_id))
-        elif command.action == "geometry":
-            controller.schedule(session_id, "geometry", controller.agent.generate_geometry_print_file(session_id))
-        elif command.action == "calibrate":
-            await controller.agent.queue_color_calibration(session_id)
-            controller.schedule(session_id, "calibration", controller.agent.run_color_calibration(session_id))
-        controller.agent.record_conversation_message(session_id, "assistant", command.reply)
-        return CreatorChatResponse(session=controller.snapshot(session_id), action=command.action, reply=command.reply)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Creator session not found") from exc
-    except ProviderConfigurationError as exc:
-        raise HTTPException(status_code=503, detail="Creator chat provider is not configured") from exc
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail="Creator chat provider request failed") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
 @router.post("/sessions/{session_id}/restart", response_model=CreatorSessionResponse)
-async def restart_creator_session(
-    session_id: str,
-    payload: CreatorRestartRequest,
-    request: Request,
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE),
-) -> CreatorSessionResponse:
+async def restart_creator_session(session_id: str, payload: CreatorRestartRequest, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)) -> CreatorSessionResponse:
     controller = _controller(request)
     try:
         await controller.agent.restart_from_stage(session_id, payload.stage)
@@ -366,93 +301,36 @@ async def restart_creator_session(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-@router.post("/sessions/{session_id}/confirm-image", response_model=CreatorSessionResponse, status_code=202)
-async def confirm_creator_image(
-    session_id: str, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)
-) -> CreatorSessionResponse:
+
+@router.post("/sessions/{session_id}/images/generate", response_model=CreatorSessionResponse, status_code=202)
+async def generate_creator_images(session_id: str, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)) -> CreatorSessionResponse:
     controller = _controller(request)
     return await _queue_stage(session_id, request, "images", controller.agent.queue_image_generation, controller.agent.run_image_generation)
 
 
-@router.post("/sessions/{session_id}/select-image", response_model=CreatorSessionResponse)
-async def select_creator_image(
-    session_id: str,
-    selection: ImageSelectionRequest,
-    request: Request,
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE),
-) -> CreatorSessionResponse:
+@router.post("/sessions/{session_id}/model/generate", response_model=CreatorSessionResponse, status_code=202)
+async def generate_creator_model(session_id: str, payload: ModelGenerationRequest, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)) -> CreatorSessionResponse:
     controller = _controller(request)
-    try:
-        await controller.agent.select_image(session_id, selection.image_index)
-        return controller.snapshot(session_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Creator session not found") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await _queue_stage(session_id, request, "model", controller.agent.queue_3d_generation, controller.agent.run_3d_generation, payload.image_index)
 
 
-@router.post("/sessions/{session_id}/confirm-3d", response_model=CreatorSessionResponse, status_code=202)
-async def confirm_creator_3d(
-    session_id: str, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)
-) -> CreatorSessionResponse:
+@router.post("/sessions/{session_id}/print/calibrate", response_model=CreatorSessionResponse, status_code=202)
+async def calibrate_creator_print_file(session_id: str, payload: PrintCalibrationRequest, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)) -> CreatorSessionResponse:
     controller = _controller(request)
-    return await _queue_stage(session_id, request, "model", controller.agent.queue_3d_generation, controller.agent.run_3d_generation)
+    return await _queue_stage(session_id, request, "calibration", controller.agent.queue_color_calibration, controller.agent.run_color_calibration, mode=payload.mode, max_colors=payload.max_colors)
 
 
 @router.post("/sessions/{session_id}/print/analyze", response_model=CreatorSessionResponse, status_code=202)
-async def analyze_creator_model(
-    session_id: str, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)
-) -> CreatorSessionResponse:
+async def analyze_creator_model(session_id: str, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)) -> CreatorSessionResponse:
     controller = _controller(request)
     return await _queue_stage(session_id, request, "analysis", controller.agent.queue_print_analysis, controller.agent.run_print_analysis)
 
 
-@router.post("/sessions/{session_id}/print/generate", response_model=CreatorSessionResponse, status_code=202)
-async def generate_creator_print_file(
-    session_id: str,
-    generation: PrintGenerationRequest,
-    request: Request,
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE),
-) -> CreatorSessionResponse:
-    controller = _controller(request)
-    try:
-        await controller.agent.queue_print_file(
-            session_id,
-            max_colors=generation.max_colors,
-            acknowledge_issues=generation.acknowledge_issues,
-        )
-        controller.schedule(session_id, "print-file", controller.agent.run_print_file(session_id))
-        return controller.snapshot(session_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Creator session not found") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@router.post("/sessions/{session_id}/print/geometry", response_model=CreatorSessionResponse, status_code=202)
-async def geometry_creator_print_file(
-    session_id: str, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)
-) -> CreatorSessionResponse:
-    controller = _controller(request)
-    try:
-        controller.agent.get_session(session_id)
-        controller.schedule(session_id, "geometry", controller.agent.generate_geometry_print_file(session_id))
-        return controller.snapshot(session_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Creator session not found") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@router.post("/sessions/{session_id}/print/calibrate", response_model=CreatorSessionResponse, status_code=202)
-async def calibrate_creator_print_file(
-    session_id: str, request: Request, _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_CREATE)
-) -> CreatorSessionResponse:
-    controller = _controller(request)
-    return await _queue_stage(session_id, request, "calibration", controller.agent.queue_color_calibration, controller.agent.run_color_calibration)
-
+def _validate_task_source(path: Path) -> None:
+    _validate_model_3mf(path.read_bytes())
 
 @router.post("/sessions/{session_id}/task", response_model=CreatorTaskResponse, status_code=201)
+
 async def push_calibrated_creator_task(
     session_id: str,
     payload: CreatorTaskRequest,
@@ -465,53 +343,106 @@ async def push_calibrated_creator_task(
         snapshot = controller.agent.get_session(session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Creator session not found") from exc
-    source_value = snapshot.calibrated_print_file_path if payload.mode == "multicolor" else snapshot.geometry_print_file_path
-    if not source_value:
-        raise HTTPException(status_code=409, detail="The selected calibration output is not complete")
-    source = Path(source_value).resolve()
+    if (
+        not snapshot.calibrated_print_file_path
+        or snapshot.selected_image_index is None
+        or not snapshot.model_path
+        or snapshot.print_analysis.status is not SubworkflowStatus.SUCCEEDED
+    ):
+        raise HTTPException(status_code=409, detail="Final calibration, print analysis, and immutable previews must be complete")
     agent_root = (Path(settings.base_dir) / "bca-agent").resolve()
-    try:
-        source.relative_to(agent_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Creator artifact not found") from exc
-    if not source.is_file():
-        raise HTTPException(status_code=404, detail="Creator artifact not found")
+    sources = [
+        Path(snapshot.calibrated_print_file_path).resolve(),
+        Path(snapshot.generated_image_paths[snapshot.selected_image_index]).resolve(),
+        Path(snapshot.model_path).resolve(),
+    ]
+    for source in sources:
+        try:
+            source.relative_to(agent_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Creator artifact not found") from exc
+        if not source.is_file():
+            raise HTTPException(status_code=404, detail="Creator artifact not found")
+    await asyncio.to_thread(_validate_task_source, sources[0])
+    title = (payload.title or "").strip()
+    if not title:
+        try:
+            title = await controller.agent.generate_task_title(session_id)
+        except ProviderConfigurationError as exc:
+            raise HTTPException(status_code=503, detail="Task title provider is not configured") from exc
+        except ProviderError as exc:
+            raise HTTPException(status_code=502, detail="Task title generation failed") from exc
     task_root = Path(settings.base_dir) / "bca-tasks"
     task_root.mkdir(parents=True, exist_ok=True)
-    destination = task_root / f"{uuid.uuid4().hex}.3mf"
-    await asyncio.to_thread(shutil.copyfile, source, destination)
-    task = BCATask(
-        session_id=session_id,
-        filename=f"{source.stem}.3mf",
-        source_path=str(destination),
-        status="awaiting_slice",
-        created_by_id=current_user.id if current_user else None,
-    )
-    db.add(task)
-    await db.commit()
-    await db.refresh(task)
-    return CreatorTaskResponse(task_id=task.id, status=task.status)
+    token = uuid.uuid4().hex
+    destinations = [task_root / f"{token}.3mf", task_root / f"{token}.png", task_root / f"{token}.glb"]
+    committed = False
+    try:
+        for source, destination in zip(sources, destinations, strict=True):
+            await asyncio.to_thread(shutil.copyfile, source, destination)
+        task = BCATask(
+            session_id=session_id,
+            filename="calibrated-model.3mf",
+            source_path=str(destinations[0]),
+            style_image_path=str(destinations[1]),
+            model_preview_path=str(destinations[2]),
+            username=current_user.username if current_user else "root",
+            title=title,
+            customer_name=payload.customer_name,
+            phone=payload.phone,
+            address=payload.address,
+            notes=payload.notes,
+            price=None,
+            status="awaiting_slice",
+            created_by_id=current_user.id if current_user else None,
+        )
+        db.add(task)
+        await db.flush()
+        task_id = task.id
+        await db.commit()
+        committed = True
+    except Exception:
+        if not committed:
+            await db.rollback()
+            for destination in destinations:
+                await asyncio.to_thread(destination.unlink, missing_ok=True)
+        raise
+    return CreatorTaskResponse(task_id=task_id, status="awaiting_slice")
 
-@router.get("/sessions/{session_id}/{artifact}.glb", include_in_schema=False)
-def download_creator_public_glb(
+@router.get("/sessions/{session_id}/provider/{capability_token}/model.glb", include_in_schema=False)
+def download_creator_provider_glb(
     session_id: str,
-    artifact: str,
+    capability_token: str,
     request: Request,
 ) -> FileResponse:
-    """Provider-facing capability route for Meshy's public-url model input.
-
-    This route intentionally accepts no user credential: the high-entropy session
-    ID is the provider capability, and the only accepted artifacts are GLBs
-    confined to the creator's artifact root. It is never surfaced in snapshots.
-    """
-    if artifact not in {"model", "repaired-model"}:
-        raise HTTPException(status_code=404, detail="Creator artifact not found")
+    """Provider-only GLB capability independent from the browser-visible session ID."""
     controller = _controller(request)
     try:
-        path = confined_artifact(controller.agent.get_session(session_id), artifact)
+        snapshot = controller.agent.get_session(session_id)
+        if not secrets.compare_digest(snapshot.provider_capability_token, capability_token):
+            raise FileNotFoundError("capability")
+        path = confined_artifact(snapshot, "model")
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail="Creator artifact not found") from exc
-    return file_response(path, "model/gltf-binary", f"{session_id}-{artifact}.glb")
+    return file_response(path, "model/gltf-binary", f"{session_id}-model.glb")
+
+
+@router.get("/sessions/{session_id}/provider/{capability_token}/calibrated.3mf", include_in_schema=False)
+def download_creator_provider_calibrated_print_file(
+    session_id: str,
+    capability_token: str,
+    request: Request,
+) -> FileResponse:
+    """Provider-only final-3MF capability independent from browser artifact URLs."""
+    controller = _controller(request)
+    try:
+        snapshot = controller.agent.get_session(session_id)
+        if not secrets.compare_digest(snapshot.provider_capability_token, capability_token):
+            raise FileNotFoundError("capability")
+        path = confined_artifact(snapshot, "calibrated-print-file")
+    except (KeyError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail="Creator artifact not found") from exc
+    return file_response(path, "model/3mf", f"{session_id}-calibrated.3mf")
 
 
 @router.get("/sessions/{session_id}/images/{image_index}")
@@ -536,7 +467,7 @@ def download_creator_artifact(
     request: Request,
     _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_READ_ALL),
 ) -> FileResponse:
-    if artifact not in {"model", "print-file", "calibrated-print-file", "geometry-print-file"}:
+    if artifact not in {"model", "calibrated-print-file"}:
         raise HTTPException(status_code=404, detail="Creator artifact not found")
     controller = _controller(request)
     try:

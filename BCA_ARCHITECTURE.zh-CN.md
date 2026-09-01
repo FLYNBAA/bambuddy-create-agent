@@ -2,114 +2,61 @@
 
 [English](BCA_ARCHITECTURE.md) | **中文**
 
-## 范围与职责
+## 范围
 
-BCA 是嵌入 Bambuddy 的单进程 3D 创作与打印管理模块。Bambuddy 是打印机、原生队列、Library、认证、用户、API Key、WebSocket 与部署的唯一权威；BCA 只管理创作会话和创作产物。
+BCA 是 Bambuddy 内嵌的单进程创作工作流。身份、打印机、耗材、Library 文件、原生队列交接、认证、WebSocket 传输和部署均由 Bambuddy 唯一负责。BCA 管理创作状态、生成产物、校准、分析和订单任务交接；它不是独立服务，也不是独立 Agent 对话 UI。
 
-```text
-Creator 会话
-  → 持久化 GLB
-  → Meshy 模型 3MF
-  → 几何白模 或 耗材校准 3MF
-  → BCA 任务清单
-  → root 上传 .gcode.3mf
-  → Bambuddy LibraryFile
-  → Bambuddy PrintQueueItem
-  → 原生 FTPS + MQTT project_file
-```
-
-BCA 产物绝不直接进打印机。root 上传的切片文件必须包含：
+## 工作流与交接
 
 ```text
-Metadata/plate_N.gcode
-Metadata/slice_info.config
+创意展示（DeepSeek）
+  → 风格图（Image2）
+  → 3D 概念图/模型（Hunyuan）
+  → 校准：白色或 1–8 色多色
+      Meshy + Bambuddy 耗材颜色匹配 → 颜色校准 3MF
+  → 分析：Meshy + DeepSeek 评分与洞察，不提供建议
+  → 订单任务提交
+  → root 附加通过验证的切片 .gcode.3mf
+  → Bambuddy LibraryFile 与原生 PrintQueueItem
 ```
 
-## 模块边界
+任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、可空价格（当前留空），以及模型/风格预览。Creator 模型 3MF 绝不直接发送到打印机。root 提供的切片包必须包含 `Metadata/plate_N.gcode` 与 `Metadata/slice_info.config`，BCA 才能交给原生队列。
 
-| 模块 | 职责 |
+## Creator 与任务职责
+
+| 范围 | 职责 |
 |---|---|
-| `backend/app/three_d_agent/` | 创作状态机、Provider Protocol、产物验证、颜色与几何转换。 |
-| `backend/app/services/creator_integration.py` | BCA/Bambuddy 组合边界、配置持久化、后台阶段与 WebSocket 事件。 |
-| `backend/app/api/routes/creator.py` | `/api/v1/creator` 的会话、配置、付费门与受控下载。 |
-| `backend/app/models/bca_task.py` | BCA 任务持久化模型。 |
-| `backend/app/api/routes/bca_tasks.py` | 模型上传、切片验证和明确队列交接。 |
-| `library.py`、`print_queue.py`、`print_scheduler.py` | Bambuddy 原生 Library、队列、映射和运输权威实现。 |
+| Creator 卡片 | 运行直接分阶段工作流；展示风格和模型预览；创建校准产物、分析和订单任务。 |
+| 校准 | 生成白色 3MF，或以 Meshy 与 Bambuddy 耗材颜色匹配生成 1–8 色 3MF；最终多色输出是颜色校准 3MF。 |
+| 分析 | 获取 Meshy 数据及 DeepSeek 评分/洞察；不生成面向用户的建议。 |
+| BCA 任务 | 在 root 附加已验证切片并选择打印机前保留标题、用户、订单和预览。 |
+| Bambuddy | 负责 Library 文件、打印机选择、队列生命周期、派发、取消和打印机状态。 |
 
-## 创作不变量
+## API 与配置边界
 
-1. 图像和 3D Provider 只能在明确确认后调用。
-2. 四张概念图使用四个串行的付费 `n=1` 请求，不做付费自动重试。
-3. 每张图返回后立即持久化与展示；认证打开时前端通过带 Bearer token 的 Blob URL 预览，不直接把受控路由赋给 `<img>`。
-4. BCA 不暴露 Meshy topology repair。
-5. 多色转换只允许 1–8 个颜色槽；分析不是 `healthy` 时，多色请求前必须显式确认已了解问题。
-6. 几何模式将可支持颜色元数据归一为白色，保留面/属性引用和几何。取消或进程重启恢复后状态必须是 `failed`，不能永久停在 `running`。
-7. 多色校准从活动、未归档的 Bambuddy 手动耗材读取有效 RGB；没有候选耗材时失败，不使用本地近似色回退。
-8. 只有成功的几何白模或多色校准 3MF 能创建 `BCATask`。
-9. 重做 `brief`、`images` 或 `model` 时，必须清空下游路径、状态、修复 GLB、待下载 Meshy repair/print URL。仅重做同一模型的 `print` 时保留待下载 URL。
-10. 删除 creator 会话只删除 BCA 自有文件；删除 BCA 任务不会删除已创建的 LibraryFile 或原生队列项。
+Creator 和任务路由仍在 Bambuddy 应用与其授权模型中。普通产物下载受控；Provider 临时 URL 和服务器文件系统路径不是前端契约。
 
-## 任务状态机
+Creator 配置页（`/creator/settings`）可更新 DeepSeek、Image2、Hunyuan 与 Meshy 的 Provider 凭据、模型和请求端点/Base URL，包括 Meshy Base URL。部署值通过显式 `.env.bca` 提供初始配置；BCA 不会发现或读取 source-project `.env` / `.env.local`。持久化 Provider 设置是敏感 Bambuddy 数据库数据。
 
-```text
-awaiting_slice
-  → root 上传通过验证的 .gcode.3mf → ready_for_queue
-  → root 选择 printer_id → queued
-```
+## 批准与安全边界
 
-交接通过原生 `add_to_queue()` 创建 `manual_start=True` 的 `PrintQueueItem`。后续开始、取消、AMS、材料匹配、FTPS、MQTT、打印状态和归档全部仍由 Bambuddy 处理。
+产品 UI 没有付费确认门或问题确认门。日常验证不会调用计费 Provider。任何计费 Provider 运行都必须在执行点由人对该次调用及其费用明确批准。这一运维批准不是工作流卡片门。打印分析只提供评分和洞察，不提供建议。
 
-## HTTP 边界
+## 部署边界
 
-- `/api/v1/creator/*`：creator 会话、聊天、确认门、分析/校准、受控产物下载和任务交接。
-- `/api/v1/bca-tasks/*`：任务列表、源文件下载、切片附加、队列提交和永久删除。
-- 正常 creator/BCA 路由使用 Bambuddy 权限依赖；不得暴露服务器绝对路径、Provider 临时 URL 或 Provider job ID。
-- Meshy `public_url` 输入仅使用高熵能力路由：
+Linux Compose 从本地源码构建 `bambuddy-bca:local` 并使用显式 `.env.bca`。Linux host networking 保留 SSDP 发现。Windows Docker Desktop 和其他 bridge 网络使用声明的 `BCA_DISCOVERY_SUBNETS` CIDR 与单播扫描。
 
-```text
-GET /api/v1/creator/sessions/{session_id}/model.glb
-```
+公网 origin 或 Meshy public-URL 输入使用 `deploy/nginx/bca.conf` 生产反向代理模板。它保留上游认证，并转发 WebSocket 与 forwarded-request 头。Tailscale 只提供网络连通性：打印机 LAN 访问需要外部子网路由器，或将 BCA 与打印机部署在同一 LAN。BCA 不会自动注册为子网路由器，也不提供证书。
 
-该路由不出现在普通会话快照中；普通产物下载仍需要权限。
+## 持久化、恢复与限制
 
-## 明文 Provider 配置
+必须将匹配的 `DATA_DIR` 与 Bambuddy 数据库一起备份和恢复：Creator 产物、任务源文件、持久化配置和 Library/队列关系不得脱节。仅回滚到已知兼容的本地源码修订；若兼容性不明确，恢复匹配恢复点。
 
-环境变量提供初始值，Agent Services 可以运行时替换所有 Provider 参数和明文凭据。BCA 不读取 source-project `.env` / `.env.local`。
-
-所有 Creator 配置均保存在 Bambuddy settings 表的 `bca_creator_*` 行，并在 FastAPI lifespan 启动时恢复：
-
-```text
-bca_creator_deepseek_api_key
-bca_creator_image_api_key
-bca_creator_tencent_secret_id
-bca_creator_tencent_secret_key
-bca_creator_meshy_api_key
-```
-
-及对应 Base URL、模型、质量、地区、Meshy 输入模式和公开地址字段。`GET /api/v1/creator/config` 会向 `SETTINGS_READ` 调用方返回明文值；`PUT` 需要 `SETTINGS_UPDATE` 并会重新创建 `AgentSettings`、Provider 和 LangGraph planner。配置响应总是：
-
-```text
-Cache-Control: private, no-store
-```
-
-Provider Base URL 仍需经过 LAN-service HTTP(S) URL 验证；不安全值返回 HTTP `422`。
-
-## 部署模型
-
-同一个 Bambuddy Dockerfile 构建 React 到 `/static` 并运行一个 FastAPI 进程。BCA 依赖在 `requirements.txt`；产物在：
-
-```text
-DATA_DIR/bca-agent/   会话、概念图、GLB、3MF
-DATA_DIR/bca-tasks/   等待切片的任务源文件
-```
-
-`BCA_PUBLIC_BASE_URL` 只在 `MESHY_MODEL_INPUT_MODE=public_url` 时需要，必须是 Meshy 可访问的 HTTPS 公开地址。
-
-当前锁和后台任务均为单进程内存模型。不要通过增加 Uvicorn workers 或 BCA 副本来伪装支持多进程。分布式锁、持久 Worker 恢复、对象存储、多用户所有权隔离、可验证 webhook 均是未来工作。
+当前实现仍为单进程。多 worker 调度、分布式锁、持久 worker 恢复、多用户所有权隔离、对象存储和可验证 Provider webhook 均不是当前行为。
 
 ## 相关文档
 
+- [English architecture](BCA_ARCHITECTURE.md)
+- [部署指南](DEPLOYMENT_BCA.zh-CN.md)
 - [中文 README](README.md)
-- [English README](README.en.md)
-- [中文部署指南](DEPLOYMENT_BCA.zh-CN.md)
-- [工程契约中文说明](AGENTS.zh-CN.md)
+- [文档审计](DOCUMENTATION_AUDIT.zh-CN.md)

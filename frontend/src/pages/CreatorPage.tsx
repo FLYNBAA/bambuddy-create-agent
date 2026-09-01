@@ -1,30 +1,40 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, Check, Download, Image as ImageIcon, Loader2, Plus, Send, Sparkles, Trash2, WandSparkles } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Check, Download, Expand, Image as ImageIcon, Loader2, Plus, Send,
+  Sparkles, Trash2, WandSparkles, X,
+} from 'lucide-react';
 import { getAuthToken } from '../api/client';
+import { ModelViewer } from '../components/ModelViewer';
 
+type Stage = { status: string; message?: string | null; error?: string | null };
+type PrintAnalysis = {
+  status: string;
+  report?: { status?: string; [key: string]: unknown } | null;
+  score?: number | null;
+  insights?: string[] | null;
+  error?: string | null;
+};
 type CreatorSession = {
   session_id: string;
   status: string;
   brief: { subject?: string; style?: string; product_type?: string; details?: string };
-  questions: Array<{ field: string; prompt: string; options: string[] }>;
   image_prompt: string | null;
   generated_images: string[];
   selected_image_index: number | null;
   model_download_url: string | null;
-  print_file_download_url: string | null;
   calibrated_print_file_download_url: string | null;
-  print_analysis: { status: string; report?: { status: string } | null };
-  model_repair: { status: string };
-  print_file: { status: string };
-  color_calibration: { status: string };
+  image_generation?: Stage;
+  model_generation?: Stage;
+  print_analysis: PrintAnalysis;
+  color_calibration: Stage;
   events: Array<{ stage: string; status: string; message: string }>;
   error: string | null;
-  geometry_print_file_download_url: string | null;
-  geometry_status: string;
-  conversation: Array<{ role: 'user' | 'assistant'; content: string }>;
 };
+type Preview = { url: string; fileType: 'glb' | '3mf'; title: string };
+type TaskDetails = { title: string; customer_name: string; phone: string; address: string; notes: string };
 
 const API = '/api/v1/creator';
+const emptyTaskDetails: TaskDetails = { title: '', customer_name: '', phone: '', address: '', notes: '' };
 
 async function creatorRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -44,10 +54,7 @@ async function downloadCreatorArtifact(path: string, filename: string) {
   const token = getAuthToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
   const response = await fetch(path, { headers });
-  if (!response.ok) {
-    const detail = await response.json().catch(() => ({}));
-    throw new Error(detail.detail || `Artifact download failed (${response.status})`);
-  }
+  if (!response.ok) throw new Error(`Artifact download failed (${response.status})`);
   const objectUrl = URL.createObjectURL(await response.blob());
   const link = document.createElement('a');
   link.href = objectUrl;
@@ -56,8 +63,59 @@ async function downloadCreatorArtifact(path: string, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
-function statusLabel(status: string) {
-  return status.replaceAll('_', ' ');
+function statusLabel(status?: string) {
+  return (status || 'not_started').replaceAll('_', ' ');
+}
+
+function stageTone(status?: string) {
+  if (status === 'failed' || status === 'error') return 'failed';
+  if (status === 'queued' || status === 'running' || status === 'generating') return 'running';
+  if (status === 'succeeded' || status === 'completed') return 'completed';
+  return 'pending';
+}
+
+function StageState({ status }: { status?: string }) {
+  const tone = stageTone(status);
+  return <span className={`creator-stage-state is-${tone}`}><span aria-hidden="true" />{statusLabel(status)}</span>;
+}
+
+function PreviewDialog({ preview, onClose }: { preview: Preview; onClose: () => void }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return;
+      const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+        .filter((element) => !element.hasAttribute('disabled'));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onClose]);
+
+  return <div className="creator-preview-backdrop" role="presentation" onMouseDown={onClose}>
+    <section ref={dialogRef} className="creator-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="creator-preview-title" onMouseDown={(event) => event.stopPropagation()}>
+      <header><h2 id="creator-preview-title">{preview.title}</h2><button className="icon-button" onClick={onClose} aria-label="关闭预览" autoFocus><X size={18} /></button></header>
+      <div className="creator-preview-large"><ModelViewer url={preview.url} fileType={preview.fileType} /></div>
+    </section>
+  </div>;
 }
 
 export function CreatorPage() {
@@ -66,55 +124,66 @@ export function CreatorPage() {
   const [message, setMessage] = useState('');
   const [reference, setReference] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
-  const [acknowledgeIssues, setAcknowledgeIssues] = useState(false);
-  const [imagePreviews, setImagePreviews] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [imagePreviews, setImagePreviews] = useState<Record<string, string>>({});
+  const [selectedCandidate, setSelectedCandidate] = useState<number | null>(null);
+  const [calibrationMode, setCalibrationMode] = useState<'white' | 'multicolor'>('white');
+  const [maxColors, setMaxColors] = useState(4);
+  const [taskDetails, setTaskDetails] = useState<TaskDetails>(emptyTaskDetails);
+  const [expandedPreview, setExpandedPreview] = useState<Preview | null>(null);
+  const [typedPrompt, setTypedPrompt] = useState('');
 
   const active = useMemo(() => sessions.find((item) => item.session_id === activeId) || null, [sessions, activeId]);
-  const requiresIssueAcknowledgment = Boolean(
-    active?.print_analysis.report && active.print_analysis.report.status !== 'healthy',
-  );
   const imageRoutesKey = active?.generated_images.join('\u0000') ?? '';
+  const hasCreativeResult = Boolean(active?.image_prompt || active?.brief.subject || active?.brief.details);
+  const hasImages = Boolean(active?.generated_images.length);
+  const hasModel = Boolean(active?.model_download_url);
+  const hasCalibration = Boolean(active?.calibrated_print_file_download_url);
+
+  const replaceSession = useCallback((updated: CreatorSession) => {
+    setSessions((current) => current.map((item) => item.session_id === updated.session_id ? updated : item));
+  }, []);
   const refresh = useCallback(async () => {
     try {
       const data = await creatorRequest<CreatorSession[]>('/sessions');
       setSessions(data);
-      if (!activeId && data[0]) setActiveId(data[0].session_id);
+      setActiveId((current) => current || data[0]?.session_id || null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load creator sessions');
     }
-  }, [activeId]);
+  }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
-    const hasActiveWorkflow = active && (
-      ['queued_image', 'generating_images', 'queued_3d', 'generating_3d'].includes(active.status)
-      || ['queued', 'running'].includes(active.print_analysis.status)
-      || ['queued', 'running'].includes(active.print_file.status)
-      || ['queued', 'running'].includes(active.color_calibration.status)
-      || active.geometry_status === 'running'
-    );
-    if (!hasActiveWorkflow) return;
+    if (!active) return;
+    const statuses = [active.image_generation?.status, active.model_generation?.status, active.color_calibration.status, active.print_analysis.status];
+    if (!statuses.some((status) => stageTone(status) === 'running')) return;
     const timer = window.setInterval(() => void refresh(), 2000);
     return () => window.clearInterval(timer);
   }, [active, refresh]);
   useEffect(() => {
-    const onCreatorUpdate = (event: Event) => {
-      const detail = (event as CustomEvent<{ session_id?: string }>).detail;
-      if (detail?.session_id && detail.session_id === activeId) void refresh();
-    };
-    window.addEventListener('bca:creator-session', onCreatorUpdate);
-    return () => window.removeEventListener('bca:creator-session', onCreatorUpdate);
-  }, [activeId, refresh]);
-
-  useEffect(() => { setAcknowledgeIssues(false); }, [activeId, active?.print_analysis.report?.status]);
-
+    setSelectedCandidate(active?.selected_image_index ?? null);
+  }, [active?.selected_image_index]);
+  useEffect(() => {
+    setTaskDetails(emptyTaskDetails);
+    setNotice(null);
+  }, [activeId]);
+  useEffect(() => {
+    const prompt = active?.image_prompt || '';
+    setTypedPrompt('');
+    if (!prompt) return;
+    let cursor = 0;
+    const timer = window.setInterval(() => {
+      cursor += Math.max(1, Math.ceil(prompt.length / 64));
+      setTypedPrompt(prompt.slice(0, cursor));
+      if (cursor >= prompt.length) window.clearInterval(timer);
+    }, 20);
+    return () => window.clearInterval(timer);
+  }, [active?.image_prompt]);
   useEffect(() => {
     const routes = imageRoutesKey ? imageRoutesKey.split('\u0000') : [];
-    if (!routes.length) {
-      setImagePreviews({});
-      return;
-    }
+    if (!routes.length) { setImagePreviews({}); return; }
     const headers = new Headers();
     const token = getAuthToken();
     if (token) headers.set('Authorization', `Bearer ${token}`);
@@ -123,37 +192,26 @@ export function CreatorPage() {
     let disposed = false;
     void Promise.allSettled(routes.map(async (route) => {
       const response = await fetch(route, { headers, signal: controller.signal });
-      if (!response.ok) throw new Error(`Candidate image preview failed (${response.status})`);
+      if (!response.ok) throw new Error(`Style image preview failed (${response.status})`);
       const objectUrl = URL.createObjectURL(await response.blob());
-      if (disposed) {
-        URL.revokeObjectURL(objectUrl);
-        return null;
-      }
+      if (disposed) { URL.revokeObjectURL(objectUrl); return null; }
       objectUrls.push(objectUrl);
       return [route, objectUrl] as const;
     })).then((results) => {
       if (disposed) return;
-      const entries = results.flatMap((result) => result.status === 'fulfilled' && result.value ? [result.value] : []);
-      if (entries.length) setImagePreviews(Object.fromEntries(entries));
-      const rejection = results.find((result) => result.status === 'rejected');
-      if (rejection && !controller.signal.aborted) {
-        setError(rejection.reason instanceof Error ? rejection.reason.message : 'Candidate image preview failed');
-      }
+      setImagePreviews(Object.fromEntries(results.flatMap((result) => result.status === 'fulfilled' && result.value ? [result.value] : [])));
     });
-    return () => {
-      disposed = true;
-      controller.abort();
-      objectUrls.forEach((objectUrl) => URL.revokeObjectURL(objectUrl));
-    };
+    return () => { disposed = true; controller.abort(); objectUrls.forEach(URL.revokeObjectURL); };
   }, [imageRoutesKey]);
 
   async function createSession() {
-    setError(null);
-    const created = await creatorRequest<CreatorSession>('/sessions', { method: 'POST' });
-    setSessions((current) => [created, ...current]);
-    setActiveId(created.session_id);
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      const created = await creatorRequest<CreatorSession>('/sessions', { method: 'POST' });
+      setSessions((current) => [created, ...current]); setActiveId(created.session_id);
+    } catch (err) { setError(err instanceof Error ? err.message : 'Unable to create creator session'); }
+    finally { setBusy(false); }
   }
-
   async function removeSession(sessionId: string) {
     if (!window.confirm('永久删除此创作会话及其所有产物？')) return;
     setBusy(true); setError(null);
@@ -167,25 +225,39 @@ export function CreatorPage() {
     } catch (err) { setError(err instanceof Error ? err.message : 'Unable to delete creator session'); }
     finally { setBusy(false); }
   }
-
   async function prepare() {
     if (!activeId || (!message.trim() && !reference)) return;
-    setBusy(true); setError(null);
+    setBusy(true); setError(null); setNotice(null);
     try {
-      if (reference) {
-        const form = new FormData();
-        form.append('message', message);
-        form.append('reference_image', reference);
-        const updated = await creatorRequest<CreatorSession>(`/sessions/${activeId}/prepare`, { method: 'POST', body: form });
-        setSessions((current) => current.map((item) => item.session_id === updated.session_id ? updated : item));
-      } else {
-        const chat = await creatorRequest<{ session: CreatorSession }>(`/sessions/${activeId}/chat`, { method: 'POST', body: JSON.stringify({ message }) });
-        setSessions((current) => current.map((item) => item.session_id === chat.session.session_id ? chat.session : item));
-      }
-    } catch (err) { setError(err instanceof Error ? err.message : 'Creator request failed'); }
+      const form = new FormData();
+      form.append('message', message.trim());
+      if (reference) form.append('reference_image', reference);
+      replaceSession(await creatorRequest<CreatorSession>(`/sessions/${activeId}/prepare`, { method: 'POST', body: form }));
+      setMessage(''); setReference(null);
+    } catch (err) { setError(err instanceof Error ? err.message : 'Unable to prepare creative direction'); }
     finally { setBusy(false); }
   }
-
+  async function action(path: string, body?: object) {
+    if (!activeId) return;
+    setBusy(true); setError(null); setNotice(null);
+    try { replaceSession(await creatorRequest<CreatorSession>(`/sessions/${activeId}${path}`, { method: 'POST', body: body ? JSON.stringify(body) : undefined })); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Creator action failed'); }
+    finally { setBusy(false); }
+  }
+  async function createTask() {
+    if (!activeId) return;
+    const customer_name = taskDetails.customer_name.trim();
+    const phone = taskDetails.phone.trim();
+    const address = taskDetails.address.trim();
+    if (!customer_name || !phone || !address) { setError('请填写客户姓名、联系电话和地址。'); return; }
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await creatorRequest(`/sessions/${activeId}/task`, { method: 'POST', body: JSON.stringify({ title: taskDetails.title.trim() || undefined, customer_name, phone, address, notes: taskDetails.notes.trim() || undefined }) });
+      setNotice('任务已创建，可在任务清单中继续处理。');
+      setTaskDetails(emptyTaskDetails);
+    } catch (err) { setError(err instanceof Error ? err.message : 'Unable to create task'); }
+    finally { setBusy(false); }
+  }
   async function download(path: string, filename: string) {
     setBusy(true); setError(null);
     try { await downloadCreatorArtifact(path, filename); }
@@ -193,90 +265,65 @@ export function CreatorPage() {
     finally { setBusy(false); }
   }
 
-  async function action(path: string, init?: RequestInit) {
-    if (!activeId) return;
-    setBusy(true); setError(null);
-    try {
-      const updated = await creatorRequest<CreatorSession>(`/sessions/${activeId}${path}`, { method: 'POST', ...init });
-      setSessions((current) => current.map((item) => item.session_id === updated.session_id ? updated : item));
-    } catch (err) { setError(err instanceof Error ? err.message : 'Creator action failed'); }
-    finally { setBusy(false); }
-  }
+  return <div className="creator-shell">
+    <aside className="creator-sessions panel">
+      <div className="creator-panel-heading"><div><h1>创作会话</h1><p>每个作品独立保存。</p></div><button className="icon-button" disabled={busy} onClick={() => void createSession()} aria-label="新建会话"><Plus size={18} /></button></div>
+      <div className="creator-session-list">
+        {sessions.map((session) => <div className={`creator-session-row ${session.session_id === activeId ? 'is-active' : ''}`} key={session.session_id}>
+          <button className="creator-session-select" onClick={() => setActiveId(session.session_id)}><span>{session.brief.subject || '未命名创作'}</span><small>{statusLabel(session.status)}</small></button>
+          <button className="creator-session-delete" disabled={busy} onClick={() => void removeSession(session.session_id)} aria-label={`删除创作会话 ${session.brief.subject || '未命名创作'}`}><Trash2 size={16} /></button>
+        </div>)}
+        {!sessions.length && <div className="creator-empty">新建一个会话，开始准备作品。</div>}
+      </div>
+    </aside>
 
-  async function generatePrintFile() {
-    if (requiresIssueAcknowledgment && !acknowledgeIssues) {
-      setError('请先确认已了解打印分析报告中的问题。');
-      return;
-    }
-    await action('/print/generate', {
-      method: 'POST',
-      body: JSON.stringify({ max_colors: 8, acknowledge_issues: requiresIssueAcknowledgment }),
-    });
-  }
+    <main className="creator-workflow panel">
+      <header className="creator-workflow-heading"><div><h2>3D 打印创作</h2><p>从灵感到已校准的打印文件。</p></div>{active && <StageState status={active.status} />}</header>
+      {!active ? <div className="creator-empty creator-start-empty"><WandSparkles size={24} /><p>选择或新建会话以开始创作。</p></div> : <div className="creator-canvas">
+        <article className="creator-card creator-card-start">
+          <div className="creator-card-header"><div><h3>创意呈现</h3><p>填写文字创意，可选一张参考图，由 DeepSeek 补全创作方向。</p></div><StageState status={hasCreativeResult ? 'completed' : 'not_started'} /></div>
+          <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：做一只适合桌面打印的英短猫 Q 版摆件" rows={4} aria-label="创意描述" />
+          <div className="creator-input-row"><label className="creator-upload"><ImageIcon size={17} /><span>{reference ? reference.name : '添加参考图'}</span><input type="file" accept="image/*" onChange={(event) => setReference(event.target.files?.[0] || null)} /></label><button className="primary-button" disabled={busy || (!message.trim() && !reference)} onClick={() => void prepare()}>{busy ? <Loader2 className="spin" size={16} /> : <Send size={16} />}准备创意</button></div>
+          {hasCreativeResult && <div className="creator-creative-result"><Sparkles size={17} /><div><strong>创意方向</strong><p>{typedPrompt || active.image_prompt || active.brief.subject}</p></div></div>}
+        </article>
 
-  async function pushTask(mode: 'multicolor' | 'geometry') {
-    if (!activeId) return;
-    setBusy(true); setError(null);
-    try {
-      await creatorRequest(`/sessions/${activeId}/task`, { method: 'POST', body: JSON.stringify({ mode }) });
-      setError('已加入任务清单；请在任务清单中上传切片后的 .gcode.3mf。');
-    } catch (err) { setError(err instanceof Error ? err.message : 'Unable to create task'); }
-    finally { setBusy(false); }
-  }
+        {hasCreativeResult && <><div className="creator-connector" /><article className="creator-card">
+          <div className="creator-card-header"><div><h3>风格图生成</h3><p>由 Image2 生成可用于建模的风格参考，并选择一个版本。</p></div><StageState status={active.image_generation?.status || (hasImages ? 'succeeded' : 'not_started')} /></div>
+          <div className="creator-card-actions"><button className="small-action" disabled={busy || stageTone(active.image_generation?.status) === 'running'} onClick={() => void action('/images/generate')}>{hasImages ? '重新生成风格图' : '生成风格图'}</button></div>
+          {hasImages && <div className="creator-image-grid" role="radiogroup" aria-label="选择用于建模的风格图">{active.generated_images.map((url, index) => <button className={`creator-image ${selectedCandidate === index ? 'is-selected' : ''}`} key={url} role="radio" aria-checked={selectedCandidate === index} onClick={() => setSelectedCandidate(index)}><img src={imagePreviews[url]} alt={`风格图 ${index + 1}`} />{selectedCandidate === index && <span><Check size={14} /></span>}</button>)}</div>}
+        </article></>}
 
-  return (
-    <div className="creator-shell">
-      <aside className="creator-sessions panel">
-        <div className="creator-panel-heading"><div><span className="eyebrow">BCA WORKSPACE</span><h1>创作会话</h1></div><button className="icon-button" onClick={() => void createSession()} aria-label="新建会话"><Plus size={18} /></button></div>
-        <div className="creator-session-list">
-          {sessions.map((session) => <div className={`creator-session-row ${session.session_id === activeId ? 'is-active' : ''}`} key={session.session_id}><button className="creator-session-select" onClick={() => setActiveId(session.session_id)}><span>{session.brief.subject || '未命名创作'}</span><small>{statusLabel(session.status)}</small></button><button className="creator-session-delete" disabled={busy} onClick={() => void removeSession(session.session_id)} aria-label={`删除创作会话 ${session.brief.subject || '未命名创作'}`}><Trash2 size={15} /></button></div>)}
-          {!sessions.length && <div className="creator-empty">还没有创作会话。新建一个开始。</div>}
-        </div>
-      </aside>
+        {hasImages && <><div className="creator-connector" /><article className="creator-card">
+          <div className="creator-card-header"><div><h3>3D 概念图生成</h3><p>根据所选风格图，由混元生成可预览的 GLB 概念模型。</p></div><StageState status={active.model_generation?.status || (hasModel ? 'succeeded' : 'not_started')} /></div>
+          <div className="creator-card-actions"><button className="small-action" disabled={busy || selectedCandidate == null || stageTone(active.model_generation?.status) === 'running'} onClick={() => void action('/model/generate', { image_index: selectedCandidate })}>{hasModel ? '重做 3D 概念图' : '生成 3D 概念图'}</button></div>
+          {hasModel && <div className="creator-artifact-preview"><div className="creator-preview-small"><ModelViewer url={active.model_download_url!} fileType="glb" /></div><div><strong>GLB 模型</strong><p>旋转查看模型，或打开大图预览。</p><button className="creator-download" onClick={() => void download(active.model_download_url!, 'model.glb')}><Download size={15} />下载 GLB</button><button className="creator-download" onClick={() => setExpandedPreview({ url: active.model_download_url!, fileType: 'glb', title: 'GLB 模型预览' })}><Expand size={15} />展开预览</button></div></div>}
+        </article></>}
 
-      <section className="creator-chat panel">
-        <div className="creator-panel-heading"><div><span className="eyebrow">AGENT CONTROL</span><h2>和 Agent 对话</h2></div><Bot size={22} /></div>
-        {active ? <>
-          <div className="creator-chat-intro"><Sparkles size={17} /><span>告诉我你想制作什么；参考图可选。</span></div>
-          {active.conversation.length > 0 && <div className="creator-transcript">{active.conversation.slice(-8).map((turn, index) => <p className={`creator-turn creator-turn-${turn.role}`} key={`${turn.role}-${index}`}><strong>{turn.role === 'user' ? '你' : 'Agent'}</strong>{turn.content}</p>)}</div>}
-          <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：做一只适合桌面打印的英短猫 Q 版摆件" rows={7} />
-          <label className="creator-upload"><ImageIcon size={17} />{reference ? reference.name : '附加参考图'}<input type="file" accept="image/*" onChange={(event) => setReference(event.target.files?.[0] || null)} /></label>
-          <button className="primary-button creator-send" disabled={busy || (!message.trim() && !reference)} onClick={() => void prepare()}>{busy ? <Loader2 className="spin" size={16} /> : <Send size={16} />}发送创意</button>
-          {active.questions.length > 0 && <div className="creator-questions"><strong>还需要确认</strong>{active.questions.map((question) => <div key={question.field}><p>{question.prompt}</p><div className="creator-options">{question.options.map((option) => <button key={option} onClick={() => setMessage((current) => `${current}${current ? '，' : ''}${option}`)}>{option}</button>)}</div></div>)}</div>}
-          {error && <div className="creator-error" role="alert">{error}</div>}
-        </> : <div className="creator-empty">选择或新建一个会话。</div>}
-      </section>
+        {hasModel && <><div className="creator-connector" /><article className="creator-card">
+          <div className="creator-card-header"><div><h3>打印校准</h3><p>Meshy 生成 3MF 后完成颜色匹配；白模最终统一替换为白色。</p></div><StageState status={active.color_calibration.status || (hasCalibration ? 'succeeded' : 'not_started')} /></div>
+          <div className="creator-mode-nav" role="group" aria-label="打印校准模式"><button className={calibrationMode === 'white' ? 'is-active' : ''} aria-pressed={calibrationMode === 'white'} onClick={() => setCalibrationMode('white')}>白模</button><button className={calibrationMode === 'multicolor' ? 'is-active' : ''} aria-pressed={calibrationMode === 'multicolor'} onClick={() => setCalibrationMode('multicolor')}>多色</button></div>
+          {calibrationMode === 'multicolor' && <label className="creator-color-range">最大颜色数 <output>{maxColors}</output><input type="range" min="1" max="8" value={maxColors} onChange={(event) => setMaxColors(Number(event.target.value))} aria-valuemin={1} aria-valuemax={8} aria-valuenow={maxColors} /></label>}
+          <div className="creator-card-actions"><button className="small-action" disabled={busy || stageTone(active.color_calibration.status) === 'running'} onClick={() => void action('/print/calibrate', { mode: calibrationMode, max_colors: calibrationMode === 'white' ? 1 : maxColors })}>{hasCalibration ? '重新校准' : '开始校准'}</button></div>
+          {active.color_calibration.error && <p className="creator-error" role="alert">{active.color_calibration.error}</p>}
+          {hasCalibration && <div className="creator-artifact-preview"><div className="creator-preview-small"><ModelViewer url={active.calibrated_print_file_download_url!} fileType="3mf" /></div><div><strong>最终 3MF</strong><p>此文件已完成最终校准，可用于创建任务。</p><button className="creator-download" onClick={() => void download(active.calibrated_print_file_download_url!, 'print-calibrated.3mf')}><Download size={15} />下载 3MF</button><button className="creator-download" onClick={() => setExpandedPreview({ url: active.calibrated_print_file_download_url!, fileType: '3mf', title: '最终 3MF 预览' })}><Expand size={15} />展开预览</button></div></div>}
+        </article></>}
 
-      <main className="creator-workflow panel">
-        <div className="creator-panel-heading"><div><span className="eyebrow">WORKFLOW CANVAS</span><h2>3D 打印创作流程</h2></div>{active && <span className="creator-status"><span className="status-dot" />{statusLabel(active.status)}</span>}</div>
-        {active && <div className="creator-restart-row"><span>不满意？</span>{(['brief', 'images', 'model', 'print'] as const).map((stage) => <button key={stage} className="small-action" onClick={() => void action('/restart', { method: 'POST', body: JSON.stringify({ stage }) })}>重做 {stage === 'brief' ? '创意' : stage === 'images' ? '效果图' : stage === 'model' ? '3D 模型' : '打印处理'}</button>)}</div>}
-        {active && <div className="creator-canvas">
-          <article className="creator-card creator-card-start"><div className="creator-card-icon"><WandSparkles size={20} /></div><div><span className="eyebrow">01 · BRIEF</span><h3>告诉我你的创意</h3><p>{active.brief.subject || active.brief.style || '等待输入主体、风格和作品类型'}</p></div></article>
-          <div className="creator-connector" />
-          <article className="creator-card"><div className="creator-card-header"><span className="eyebrow">02 · CONCEPTS</span>{active.status === 'awaiting_image_confirmation' && <button className="small-action" onClick={() => void action('/confirm-image')}>确认生成四张图</button>}</div><h3>打印友好的风格图</h3><p>{active.image_prompt || '补全创意后生成标准提示词'}</p>{active.generated_images.length > 0 && <><div className="creator-image-grid">{active.generated_images.map((url, index) => <button className={`creator-image ${active.selected_image_index === index ? 'is-selected' : ''}`} key={url} onClick={() => void action('/select-image', { method: 'POST', body: JSON.stringify({ image_index: index }) })}>{imagePreviews[url] ? <img src={imagePreviews[url]} alt={`候选效果图 ${index + 1}`} /> : <span className="creator-image-loading">加载预览中</span>}<span>{active.selected_image_index === index ? <Check size={16} /> : index + 1}</span></button>)}</div><div className="creator-image-downloads">{active.generated_images.map((url, index) => <button className="creator-download" key={url} onClick={() => void download(url, `candidate-${index + 1}.png`)}><Download size={15} />下载图 {index + 1}</button>)}</div></>}</article>
-          <div className="creator-connector" />
-          <article className="creator-card"><div className="creator-card-header"><span className="eyebrow">03 · MODEL</span>{active.status === 'awaiting_3d_confirmation' && <button className="small-action" onClick={() => void action('/confirm-3d')}>确认生成 GLB</button>}</div><h3>图生 3D 模型</h3><p>只使用选中的持久化效果图，完成后保存 GLB。</p>{active.model_download_url && <button className="creator-download" onClick={() => void download(active.model_download_url!, 'model.glb')}><Download size={15} />下载 GLB</button>}</article>
-          <div className="creator-connector" />
-          <article className="creator-card">
-            <div className="creator-card-header">
-              <span className="eyebrow">04 · COLOR</span>
-              {active.print_file.status === 'not_started' && active.status === 'completed' && active.print_analysis.status !== 'succeeded' && <button className="small-action" onClick={() => void action('/print/analyze')}>开始打印分析</button>}
-              {active.print_analysis.status === 'succeeded' && active.print_file.status === 'not_started' && <div className="creator-print-confirmation">
-                {requiresIssueAcknowledgment && <label className="creator-issue-acknowledgment"><input type="checkbox" checked={acknowledgeIssues} onChange={(event) => setAcknowledgeIssues(event.target.checked)} />我已了解打印分析报告中的问题，并确认继续生成多色 3MF。</label>}
-                <button className="small-action" disabled={busy || (requiresIssueAcknowledgment && !acknowledgeIssues)} onClick={() => void generatePrintFile()}>确认生成多色 3MF（最多 8 色）</button>
-              </div>}
-            </div>
-            <h3>多色 3MF 与校准</h3>
-            <p>Meshy 多色转换后，可选择几何模式白模，或使用耗材库进行多色校准。</p>
-            {active.print_file_download_url && <button className="creator-download" onClick={() => void download(active.print_file_download_url!, 'print.3mf')}><Download size={15} />下载原始 3MF</button>}
-            {active.print_file.status === 'succeeded' && !active.geometry_print_file_download_url && <button className="small-action" onClick={() => void action('/print/geometry')}>生成几何白模</button>}
-            {active.geometry_print_file_download_url && <><button className="creator-download" onClick={() => void download(active.geometry_print_file_download_url!, 'print-geometry.3mf')}><Download size={15} />下载几何白模 3MF</button><button className="small-action" onClick={() => void pushTask('geometry')}>加入任务清单</button></>}
-            {active.print_file.status === 'succeeded' && active.color_calibration.status === 'not_started' && <button className="small-action" onClick={() => void action('/print/calibrate')}>匹配耗材并校准</button>}
-            {active.calibrated_print_file_download_url && <><button className="creator-download creator-download-final" onClick={() => void download(active.calibrated_print_file_download_url!, 'print-calibrated.3mf')}><Download size={15} />下载多色校准 3MF</button><button className="small-action" onClick={() => void pushTask('multicolor')}>加入任务清单</button></>}
-          </article>
-          <div className="creator-events"><h3>运行事件</h3>{active.events.slice(-8).reverse().map((event, index) => <div className="creator-event" key={`${event.stage}-${index}`}><span>{event.stage}</span><p>{event.message}</p></div>)}</div>
-        </div>}
-      </main>
-    </div>
-  );
+        {hasCalibration && <><div className="creator-connector" /><article className="creator-card">
+          <div className="creator-card-header"><div><h3>打印分析</h3><p>Meshy 与 DeepSeek 在最终校准后给出评分和见解，不提供建议。</p></div><StageState status={active.print_analysis.status} /></div>
+          <div className="creator-card-actions"><button className="small-action" disabled={busy || stageTone(active.print_analysis.status) === 'running'} onClick={() => void action('/print/analyze')}>{active.print_analysis.status === 'succeeded' ? '重新分析' : '开始分析'}</button></div>
+          {active.print_analysis.error && <p className="creator-error" role="alert">{active.print_analysis.error}</p>}
+          {active.print_analysis.status === 'succeeded' && <div className="creator-analysis"><div><strong>评分</strong><output>{active.print_analysis.score ?? '—'}</output></div><div><strong>洞察</strong>{active.print_analysis.insights?.length ? <ul>{active.print_analysis.insights.map((insight) => <li key={insight}>{insight}</li>)}</ul> : <p>暂无额外洞察。</p>}</div></div>}
+        </article></>}
+
+        {active.print_analysis.status === 'succeeded' && <><div className="creator-connector" /><article className="creator-card">
+          <div className="creator-card-header"><div><h3>推送订单</h3><p>填写订单信息并将最终校准文件推送到 root 任务清单。</p></div><StageState status="ready" /></div>
+          <div className="creator-order-grid"><label>任务标题（可选）<input value={taskDetails.title} maxLength={120} onChange={(event) => setTaskDetails((current) => ({ ...current, title: event.target.value }))} placeholder="留空可自动生成" /></label><label>客户姓名<input required value={taskDetails.customer_name} maxLength={120} onChange={(event) => setTaskDetails((current) => ({ ...current, customer_name: event.target.value }))} /></label><label>联系电话<input required value={taskDetails.phone} maxLength={40} onChange={(event) => setTaskDetails((current) => ({ ...current, phone: event.target.value }))} /></label><label>地址<input required value={taskDetails.address} maxLength={500} onChange={(event) => setTaskDetails((current) => ({ ...current, address: event.target.value }))} /></label><label className="creator-order-notes">订单备注（可选）<textarea value={taskDetails.notes} maxLength={2000} onChange={(event) => setTaskDetails((current) => ({ ...current, notes: event.target.value }))} rows={3} /></label></div>
+          <div className="creator-card-actions"><button className="primary-button" disabled={busy} onClick={() => void createTask()}>{busy ? <Loader2 className="spin" size={16} /> : <Check size={16} />}推送订单</button></div>
+        </article></>}
+      </div>}
+      {error && <div className="creator-error" role="alert">{error}</div>}
+      {notice && <div className="creator-notice" role="status">{notice}</div>}
+    </main>
+    {expandedPreview && <PreviewDialog preview={expandedPreview} onClose={() => setExpandedPreview(null)} />}
+  </div>;
 }

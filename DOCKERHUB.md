@@ -9,7 +9,7 @@ BCA 是从当前 `bambuddy-create-agent` 工作树构建的 Bambuddy 二次开�
 Linux：
 
 ```bash
-docker compose up -d --build
+docker compose --env-file .env.bca up -d --build
 docker compose ps
 docker compose logs -f bambuddy
 ```
@@ -17,7 +17,7 @@ docker compose logs -f bambuddy
 Windows Docker Desktop：
 
 ```powershell
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
+docker compose --env-file .env.bca -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
 curl http://127.0.0.1:8012/health
 ```
 
@@ -40,6 +40,6 @@ docker compose down
 
 ## 网络
 
-Linux 默认 host networking。Windows Docker Desktop 使用 bridge override，必须手工使用 LAN IP 添加打印机，并为 Virtual Printer/被动 FTP 等能力按需要映射额外端口。
+Linux 默认 host networking 并保留 SSDP。Windows Docker Desktop 使用 bridge override；通过 `.env.bca` 中的 `BCA_DISCOVERY_SUBNETS` 对明确的私有/Tailscale 路由 CIDR 执行单播扫描，Virtual Printer/被动 FTP 仍按需映射额外端口。
 
 完整 BCA 部署、反向代理、明文配置、备份与 smoke 策略见 [中文部署指南](DEPLOYMENT_BCA.zh-CN.md)。

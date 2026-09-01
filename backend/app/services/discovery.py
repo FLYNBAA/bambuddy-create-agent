@@ -12,15 +12,96 @@ available as an alternative discovery method.
 import asyncio
 import ipaddress
 import logging
+import math
 import os
 import re
 import socket
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# A scan is an explicit operator action. Limit it to private address space that
+# can contain printers, including Tailscale's CGNAT range for routed networks.
+# The ceiling is deliberately much higher than the old /22 truncation while
+# still preventing one request from scheduling an unbounded Internet scan.
+_DISCOVERY_ADDRESS_RANGES = (
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("100.64.0.0/10"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+)
+MAX_SCAN_HOSTS = 65_534
+MAX_CONCURRENT_PROBES = 64
+MIN_SCAN_TIMEOUT = 0.1
+MAX_SCAN_TIMEOUT = 10.0
+MAX_CONFIGURED_DISCOVERY_SUBNETS = 16
+
+
+def _host_count(network: ipaddress.IPv4Network) -> int:
+    """Return the number of addresses yielded by ``IPv4Network.hosts``."""
+    if network.prefixlen >= 31:
+        return network.num_addresses
+    return network.num_addresses - 2
+
+
+def validate_scan_subnet(subnet: str) -> str:
+    """Normalize one safe, bounded IPv4 printer-discovery CIDR."""
+    try:
+        network = ipaddress.ip_network(subnet.strip(), strict=False)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("subnet must be an IPv4 CIDR") from exc
+
+    if not isinstance(network, ipaddress.IPv4Network):
+        raise ValueError("subnet must be an IPv4 CIDR")
+    if not any(network.subnet_of(allowed) for allowed in _DISCOVERY_ADDRESS_RANGES):
+        raise ValueError("subnet must be within a private or Tailscale CGNAT range")
+
+    host_count = _host_count(network)
+    if host_count > MAX_SCAN_HOSTS:
+        raise ValueError(f"subnet contains more than {MAX_SCAN_HOSTS} usable hosts")
+    return str(network)
+
+
+def validate_scan_timeout(timeout: float) -> float:
+    """Validate the per-host probe timeout before work is scheduled."""
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timeout must be a number") from exc
+    if not math.isfinite(value) or not MIN_SCAN_TIMEOUT <= value <= MAX_SCAN_TIMEOUT:
+        raise ValueError(f"timeout must be between {MIN_SCAN_TIMEOUT} and {MAX_SCAN_TIMEOUT} seconds")
+    return value
+
+
+def parse_configured_discovery_subnets(value: str | None = None) -> list[str]:
+    """Parse valid bridge-mode discovery candidates from ``BCA_DISCOVERY_SUBNETS``.
+
+    Invalid entries are ignored rather than making application startup depend on
+    a deployment typo. Request-provided CIDRs use ``validate_scan_subnet`` and
+    are rejected to the caller instead.
+    """
+    configured = os.environ.get("BCA_DISCOVERY_SUBNETS", "") if value is None else value
+    subnets: list[str] = []
+    for candidate in configured.split(","):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            subnet = validate_scan_subnet(candidate)
+        except ValueError as exc:
+            logger.warning("Ignoring unsafe BCA_DISCOVERY_SUBNETS entry %r: %s", candidate, exc)
+            continue
+        if subnet not in subnets:
+            subnets.append(subnet)
+        if len(subnets) >= MAX_CONFIGURED_DISCOVERY_SUBNETS:
+            logger.warning("Ignoring BCA_DISCOVERY_SUBNETS entries after the first %s", MAX_CONFIGURED_DISCOVERY_SUBNETS)
+            break
+    return subnets
 
 
 def is_running_in_docker() -> bool:
@@ -323,6 +404,9 @@ class SubnetScanner:
         self._running = False
         self._scanned = 0
         self._total = 0
+        self._scan_id = 0
+        self._active_scan_id: int | None = None
+        self._scan_task: asyncio.Task[object] | None = None
 
     @property
     def is_running(self) -> bool:
@@ -337,54 +421,98 @@ class SubnetScanner:
         """Return (scanned, total) counts."""
         return self._scanned, self._total
 
-    async def scan_subnet(self, subnet: str, timeout: float = 1.0) -> list[DiscoveredPrinter]:
-        """Scan a subnet for Bambu printers.
-
-        Args:
-            subnet: CIDR notation subnet (e.g., "192.168.1.0/24")
-            timeout: Connection timeout per host in seconds
-
-        Returns:
-            List of discovered printers
-        """
+    def start_scan(self, subnets: Sequence[str], timeout: float = 1.0) -> int | None:
+        """Reserve the single scanner and publish its progress before scheduling."""
+        networks = [ipaddress.IPv4Network(validate_scan_subnet(subnet)) for subnet in subnets]
+        if not networks:
+            raise ValueError("at least one subnet is required")
+        validate_scan_timeout(timeout)
         if self._running:
-            return []
+            return None
 
+        self._scan_id += 1
+        self._active_scan_id = self._scan_id
         self._running = True
         self._discovered.clear()
         self._scanned = 0
+        self._total = sum(_host_count(network) for network in networks)
+        self._scan_task = None
+        return self._scan_id
+
+    def attach_scan_task(self, scan_id: int, task: asyncio.Task[object]) -> None:
+        """Attach the background task so ``stop`` can cancel active probes."""
+        if self._active_scan_id == scan_id and self._running:
+            self._scan_task = task
+        else:
+            task.cancel()
+
+    async def scan_subnet(self, subnet: str, timeout: float = 1.0) -> list[DiscoveredPrinter]:
+        """Scan one private CIDR without allocating an address list."""
+        return await self.scan_subnets([subnet], timeout)
+
+    async def scan_subnets(
+        self,
+        subnets: Sequence[str],
+        timeout: float = 1.0,
+        *,
+        scan_id: int | None = None,
+    ) -> list[DiscoveredPrinter]:
+        """Scan configured CIDRs with bounded parallel probes and cancellation."""
+        normalized = [validate_scan_subnet(subnet) for subnet in subnets]
+        timeout = validate_scan_timeout(timeout)
+        if scan_id is None:
+            scan_id = self.start_scan(normalized, timeout)
+            if scan_id is None:
+                return []
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self.attach_scan_task(scan_id, current_task)
+        elif scan_id != self._active_scan_id or not self._running:
+            return []
+
+        networks = [ipaddress.IPv4Network(subnet) for subnet in normalized]
+        pending: set[asyncio.Task[None]] = set()
+        hosts = (host for network in networks for host in network.hosts())
 
         try:
-            network = ipaddress.ip_network(subnet, strict=False)
-            hosts = list(network.hosts())
-            self._total = len(hosts)
+            logger.info("Starting subnet scan of %s hosts across %s subnet(s)", self._total, len(networks))
+            while self._is_active(scan_id):
+                while len(pending) < MAX_CONCURRENT_PROBES and self._is_active(scan_id):
+                    try:
+                        host = next(hosts)
+                    except StopIteration:
+                        break
+                    pending.add(asyncio.create_task(self._probe_host(str(host), timeout)))
 
-            if self._total > 1024:
-                logger.warning("Subnet %s has %s hosts, limiting to /22 (1024 hosts)", subnet, self._total)
-                self._total = 1024
-                hosts = hosts[:1024]
-
-            logger.info("Starting subnet scan of %s (%s hosts)", subnet, self._total)
-
-            # Scan in batches to avoid overwhelming the network
-            batch_size = 50
-            for i in range(0, len(hosts), batch_size):
-                if not self._running:
+                if not pending:
                     break
 
-                batch = hosts[i : i + batch_size]
-                tasks = [self._probe_host(str(ip), timeout) for ip in batch]
-                await asyncio.gather(*tasks, return_exceptions=True)
-                self._scanned = min(i + batch_size, len(hosts))
+                completed, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in completed:
+                    try:
+                        task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.debug("Subnet probe failed", exc_info=True)
+                if self._is_active(scan_id):
+                    self._scanned += len(completed)
 
-            logger.info("Subnet scan complete. Found %s printers.", len(self._discovered))
+            if self._is_active(scan_id):
+                logger.info("Subnet scan complete. Found %s printers.", len(self._discovered))
             return self.discovered_printers
-
-        except ValueError as e:
-            logger.error("Invalid subnet format: %s", e)
-            return []
         finally:
-            self._running = False
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if self._active_scan_id == scan_id:
+                self._running = False
+                self._active_scan_id = None
+                self._scan_task = None
+
+    def _is_active(self, scan_id: int) -> bool:
+        return self._running and self._active_scan_id == scan_id
 
     async def _probe_host(self, ip: str, timeout: float):
         """Probe a single host for Bambu printer ports."""
@@ -488,9 +616,14 @@ class SubnetScanner:
                 logger.debug("OSError checking %s:%s: %s", ip, port, e)
             return False
 
-    def stop(self):
-        """Stop the current scan."""
+    def stop(self) -> None:
+        """Cancel the current scan and any in-flight bounded probe window."""
+        task = self._scan_task
         self._running = False
+        self._active_scan_id = None
+        self._scan_task = None
+        if task is not None and not task.done():
+            task.cancel()
 
 
 class TasmotaScanner:

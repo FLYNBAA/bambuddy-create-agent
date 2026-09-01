@@ -21,6 +21,20 @@ async def test_creator_config_rejects_unsafe_provider_url_with_client_error(asyn
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_creator_config_persists_safe_meshy_base_url(async_client, db_session) -> None:
+    response = await async_client.put(
+        "/api/v1/creator/config",
+        json={"meshy_base_url": "http://127.0.0.1:8787"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["meshy_base_url"] == "http://127.0.0.1:8787"
+    row = await db_session.scalar(select(Settings).where(Settings.key == "bca_creator_meshy_base_url"))
+    assert row is not None
+    assert row.value == "http://127.0.0.1:8787"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_creator_config_persists_plaintext_provider_credentials(async_client, db_session) -> None:
     credentials = {
         "deepseek_api_key": "test-deepseek-plain",

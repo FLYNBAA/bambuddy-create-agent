@@ -8,9 +8,9 @@ Microsoft Entra ID 属于 Bambuddy 原生认证层。BCA 不实现第二套 OIDC
 
 | BCA 接口 | Bambuddy 权限 |
 |---|---|
-| 读取 `/api/v1/creator/config` 明文配置 | `SETTINGS_READ` |
+| 读取 `/api/v1/creator/config` 明文配置 | `SETTINGS_UPDATE` |
 | 保存并热加载 Creator 配置 | `SETTINGS_UPDATE` |
-| 操作 creator 与付费确认 | `QUEUE_CREATE` |
+| 操作 creator 直接工作流与推送订单 | `QUEUE_CREATE` |
 | 下载 creator 产物 | `QUEUE_READ_ALL` |
 | 创建/附加 BCA task | `LIBRARY_UPLOAD` / `QUEUE_CREATE` |
 | 删除 BCA task | `QUEUE_DELETE_ALL` |

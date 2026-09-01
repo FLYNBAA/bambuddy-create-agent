@@ -1,5 +1,6 @@
-# Windows Docker Desktop test override. Use together with docker-compose.yml.
-# Linux production retains host networking from the base compose file.
+# Windows Docker Desktop bridge-mode override. Use together with docker-compose.yml.
+# Configure BCA_DISCOVERY_SUBNETS in .env.bca with the intended private printer
+# CIDRs; bridge networking cannot rely on SSDP multicast.
 services:
   bambuddy:
     # Compose reset removes Linux host networking and restores the default bridge network.
@@ -7,5 +8,5 @@ services:
     ports:
       - "${BCA_DOCKER_PORT:-8012}:8000"
     environment:
-      # Bridge networking cannot use SSDP reliably. Add printers by LAN IP.
+      # Required for virtual-printer FTP passive mode on Docker Desktop.
       - VIRTUAL_PRINTER_PASV_ADDRESS=host.docker.internal

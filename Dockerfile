@@ -32,10 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the Tailscale CLI only (no tailscaled — the daemon runs on the host).
-# Bambuddy calls `tailscale status` / `tailscale cert` via the host's socket,
-# which the user mounts in via docker-compose when they want to enable the
-# Tailscale integration for virtual printers. Without the socket mount, the
-# binary is harmless — the code logs a hint and falls back to self-signed.
+# Bambuddy uses the optional host socket only to report tailnet identity and
+# reachability. Enrollment, subnet routing, ACLs, and certificates stay under
+# host/operator control; Virtual Printers continue using Bambuddy's own CA.
 RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
         -o /usr/share/keyrings/tailscale-archive-keyring.gpg \
     && curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list \
@@ -60,14 +59,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Copy backend
 COPY backend/ ./backend/
 
-# Capture the current git branch at build time. `.git/HEAD` is the only
-# .git metadata the build context lets through (see .dockerignore); it
-# contains `ref: refs/heads/<branch>`, which the SpoolBuddy remote-update
-# flow reads at runtime via detect_current_branch() in spoolbuddy_ssh.py.
-# Without this, the production image has no git metadata at all and would
-# always pull `main` on the remote device regardless of which branch
-# Bambuddy itself was built from.
-COPY .git/HEAD ./.git/HEAD
+# Record a build branch without requiring `.git` in deployment archives.
+# CI or an operator may pass `--build-arg BUILD_BRANCH=<name>`; source bundles
+# default to `main`, which keeps SpoolBuddy's remote-update branch selection
+# deterministic while allowing clean, metadata-free production builds.
+ARG BUILD_BRANCH=main
+RUN mkdir -p .git && printf 'ref: refs/heads/%s\n' "$BUILD_BRANCH" > .git/HEAD
 
 # Copy built frontend from builder stage
 COPY --from=frontend-builder /app/static ./static

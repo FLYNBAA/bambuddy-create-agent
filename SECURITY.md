@@ -19,8 +19,8 @@
 ### 路由与权限
 
 - 认证与权限采用 Bambuddy 原生模型。
-- `/api/v1/creator/config`：GET 需要 `SETTINGS_READ`，PUT 需要 `SETTINGS_UPDATE`。
-- Creator 普通产物下载使用受控路由与权限；Meshy `public_url` GLB capability route 是例外，不返回普通会话快照。
+- `/api/v1/creator/config` 的明文 GET 与热加载 PUT 都需要 `SETTINGS_UPDATE`；只读状态/API Key 不得读取 Provider 密钥。
+- Creator 普通浏览器产物下载要求权限。Meshy `public_url` 使用独立不可猜测 Provider capability token；它不是 session ID，也不会出现在快照或 WebSocket 事件中。
 - 新路由必须有显式 auth dependency，或在公共路由 allowlist 中注明理由。
 
 ### 明文 Provider 配置

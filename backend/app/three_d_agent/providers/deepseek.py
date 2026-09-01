@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-import json
 import httpx
 
 from ..config import Settings
@@ -13,6 +13,9 @@ from ..contracts import (
     ColorMatchAssignment,
     ColorMatchResponse,
     CreativeBrief,
+    GeneratedTaskTitle,
+    PrintabilityReport,
+    PrintAssessment,
 )
 from ..network import httpx_route_kwargs, proxy_route_candidates
 from .exceptions import ProviderConfigurationError, ProviderError
@@ -154,6 +157,7 @@ Keep each value concise and omit commentary.""",
             if type(current).__name__ in transport_errors:
                 return True
             current = current.__cause__
+
     def _model(
         self,
         http_async_client: httpx.AsyncClient,
@@ -185,6 +189,37 @@ Keep each value concise and omit commentary.""",
         )
         return model.with_structured_output(schema, method="json_mode") if structured else model
 
+    async def _structured(self, schema, system: str, content: str):
+        """Invoke structured output with the same proxy/direct fallback as brief enrichment."""
+        try:
+            preferred = await self._select_trust_env()
+            routes = (preferred,) + tuple(
+                route
+                for route in proxy_route_candidates(self._settings.deepseek_proxy_mode)
+                if route != preferred
+            )
+            last_error: Exception | None = None
+            for index, trust_env in enumerate(routes):
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=self._settings.deepseek_timeout_seconds,
+                        **httpx_route_kwargs(trust_env),
+                    ) as client:
+                        result = await self._model(client, schema).ainvoke(
+                            [("system", system), ("human", content)]
+                        )
+                    self._trust_env = trust_env
+                    return result if isinstance(result, schema) else schema.model_validate(result)
+                except Exception as exc:
+                    last_error = exc
+                    if index + 1 >= len(routes) or not self._is_transport_error(exc):
+                        raise
+            raise ProviderError("DeepSeek route selection failed.") from last_error
+        except ProviderConfigurationError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"DeepSeek structured request failed ({type(exc).__name__}).") from exc
+
     @staticmethod
     def _valid_value(field: str, value: str | None) -> str | None:
         if not isinstance(value, str):
@@ -193,6 +228,33 @@ Keep each value concise and omit commentary.""",
         if not normalized:
             return None
         return normalized if len(normalized) <= _FIELD_LIMITS[field] else None
+
+
+class DeepSeekPrintAssessor(DeepSeekBriefEnricher):
+    """Produce an observational score and insights for the final Meshy report."""
+
+    async def assess_printability(self, report: PrintabilityReport) -> PrintAssessment:
+        return await self._structured(
+            PrintAssessment,
+            """Assess this Meshy printability report after the calibration stage. Return only JSON matching the schema.
+Give a 0-100 score and concise factual insights grounded only in the supplied report.
+Never recommend actions, propose changes, give instructions, or use imperative language.""",
+            report.model_dump_json(),
+        )
+
+
+
+class DeepSeekTaskTitleGenerator(DeepSeekBriefEnricher):
+    """Generate a compact task-list label for a completed creator order."""
+
+    async def generate_task_title(self, brief: CreativeBrief) -> GeneratedTaskTitle:
+        return await self._structured(
+            GeneratedTaskTitle,
+            """Create one concise task title for this 3D-print order. Return only JSON matching the schema.
+Use the stated subject and product type. Do not add commentary or recommendations.""",
+            brief.model_dump_json(),
+        )
+
 
 
 class DeepSeekColorMatcher(DeepSeekBriefEnricher):

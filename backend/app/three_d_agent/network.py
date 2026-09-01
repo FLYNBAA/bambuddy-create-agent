@@ -10,7 +10,6 @@ from typing import Literal
 from urllib.parse import urlsplit
 from urllib.request import getproxies
 
-
 _PROXY_ENVIRONMENT_VARIABLES = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -140,3 +139,30 @@ def assert_allowed_https_host(url: str, allowed_suffixes: tuple[str, ...]) -> No
     if not any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in allowed):
         raise UnsafeRemoteURL("Artifact URL host is not an approved provider domain")
     assert_public_http_url(url)
+
+
+def assert_allowed_provider_artifact_url(
+    url: str,
+    allowed_suffixes: tuple[str, ...],
+    allowed_origin: str | None = None,
+) -> None:
+    """Allow trusted provider HTTPS hosts or the exact configured relay origin."""
+    parsed = urlsplit(url)
+    if allowed_origin:
+        relay = urlsplit(allowed_origin.strip())
+        try:
+            parsed_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            relay_port = relay.port or (443 if relay.scheme == "https" else 80)
+        except ValueError as error:
+            raise UnsafeRemoteURL("Artifact URL contains an invalid port") from error
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.scheme == relay.scheme
+            and parsed.hostname.rstrip(".").lower() == (relay.hostname or "").rstrip(".").lower()
+            and parsed_port == relay_port
+        ):
+            return
+    assert_allowed_https_host(url, allowed_suffixes)

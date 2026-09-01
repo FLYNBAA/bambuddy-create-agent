@@ -161,7 +161,7 @@ class OpenAICompatibleImageGenerator:
         filename: str,
         content: bytes,
     ) -> Any:
-        """Request one reference-conditioned concept image from each paid call."""
+        """Request one reference-conditioned concept image per provider call."""
         try:
             response = await client.post(
                 f"{base_url}/images/edits",

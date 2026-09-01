@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import shutil
 import os
 import re
+import shutil
 import sqlite3
 import struct
 import tempfile
-import zipfile
 import warnings
+import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,7 +21,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import Settings
 from .contracts import SessionSnapshot, SessionStatus
-from .network import assert_allowed_https_host
+from .network import assert_allowed_provider_artifact_url
 
 try:
     from pillow_heif import register_heif_opener
@@ -35,7 +35,9 @@ _COPY_CHUNK_SIZE: Final[int] = 64 * 1024
 _TENCENT_MODEL_HOST_SUFFIXES: Final[tuple[str, ...]] = ("tencentcos.cn", "myqcloud.com")
 _MESHY_MODEL_HOST_SUFFIXES: Final[tuple[str, ...]] = ("meshy.ai",)
 _LEGACY_STATUSES: Final[dict[str, str]] = {
-    "awaiting_confirmation": SessionStatus.AWAITING_IMAGE_CONFIRMATION.value,
+    "awaiting_confirmation": SessionStatus.READY_FOR_IMAGES.value,
+    "awaiting_image_confirmation": SessionStatus.READY_FOR_IMAGES.value,
+    "awaiting_3d_confirmation": SessionStatus.AWAITING_IMAGE_SELECTION.value,
     "queued": SessionStatus.QUEUED_IMAGE.value,
     "generating_image": SessionStatus.GENERATING_IMAGES.value,
 }
@@ -44,12 +46,13 @@ _LEGACY_STATUSES: Final[dict[str, str]] = {
 class _PublicRedirectHandler(HTTPRedirectHandler):
     """Validate every redirect before urllib opens the next destination."""
 
-    def __init__(self, allowed_suffixes: tuple[str, ...]) -> None:
+    def __init__(self, allowed_suffixes: tuple[str, ...], allowed_origin: str | None = None) -> None:
         super().__init__()
         self._allowed_suffixes = allowed_suffixes
+        self._allowed_origin = allowed_origin
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        assert_allowed_https_host(newurl, self._allowed_suffixes)
+        assert_allowed_provider_artifact_url(newurl, self._allowed_suffixes, self._allowed_origin)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -220,6 +223,7 @@ class ArtifactStore:
         self._max_upload_pixels = settings.max_upload_pixels
         self._max_remote_download_bytes = settings.meshy_max_download_bytes
         self._max_uncompressed_3mf_bytes = settings.meshy_max_uncompressed_3mf_bytes
+        self._meshy_artifact_origin = settings.meshy_base_url.strip().rstrip("/")
         self._uploads_dir = self._data_dir / "uploads"
         self._images_dir = self._data_dir / "images"
         self._models_dir = self._data_dir / "models"
@@ -341,6 +345,7 @@ class ArtifactStore:
             "repaired-model.glb",
             _MESHY_MODEL_HOST_SUFFIXES,
             self._validate_glb,
+            self._meshy_artifact_origin,
         )
 
     async def download_print_file(self, session_id: str, file_url: str) -> Path:
@@ -352,6 +357,7 @@ class ArtifactStore:
             "print.3mf",
             _MESHY_MODEL_HOST_SUFFIXES,
             self._validate_3mf,
+            self._meshy_artifact_origin,
         )
 
     def calibrated_print_file_path(self, session_id: str) -> Path:
@@ -370,8 +376,9 @@ class ArtifactStore:
         filename: str,
         allowed_suffixes: tuple[str, ...],
         validator: Callable[[Path], None],
+        allowed_origin: str | None = None,
     ) -> Path:
-        assert_allowed_https_host(source_url, allowed_suffixes)
+        assert_allowed_provider_artifact_url(source_url, allowed_suffixes, allowed_origin)
         destination = self._session_directory(root, session_id) / filename
         temporary_path: Path | None = None
         try:
@@ -380,9 +387,9 @@ class ArtifactStore:
             ) as temporary_file:
                 temporary_path = Path(temporary_file.name)
                 request = Request(source_url, headers={"User-Agent": "3d-print-agent/1.0"})
-                opener = build_opener(_PublicRedirectHandler(allowed_suffixes))
+                opener = build_opener(_PublicRedirectHandler(allowed_suffixes, allowed_origin))
                 with opener.open(request, timeout=60.0) as response:
-                    assert_allowed_https_host(response.geturl(), allowed_suffixes)
+                    assert_allowed_provider_artifact_url(response.geturl(), allowed_suffixes, allowed_origin)
                     length = response.headers.get("Content-Length")
                     if length is not None and (not length.isdigit() or int(length) > self._max_remote_download_bytes):
                         raise ValueError("Downloaded artifact exceeds the allowed size")

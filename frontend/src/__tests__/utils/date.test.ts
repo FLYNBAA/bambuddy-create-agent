@@ -297,9 +297,12 @@ describe('formatTimeOnly', () => {
   it('formats time with 12h format', () => {
     const date = new Date(2025, 5, 15, 14, 30);
     const result = formatTimeOnly(date, '12h');
-    // Locale-agnostic: separator is "." in en_DK, " " (NBSP) in some, ":" elsewhere.
+    const dayPeriod = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: true })
+      .formatToParts(date)
+      .find((part) => part.type === 'dayPeriod')?.value;
     expect(result).toMatch(/\b0?2\D+30\b/);
-    expect(result.toUpperCase()).toContain('PM');
+    expect(dayPeriod).toBeTruthy();
+    expect(result).toContain(dayPeriod!);
   });
 
   it('formats time with 24h format', () => {

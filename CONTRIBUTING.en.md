@@ -7,7 +7,7 @@ This repository is the Bambuddy Create Agent (BCA) fork. Contributions target th
 ## Before you start
 
 1. Describe the scope through the current BCA fork's issue, discussion, or maintainer-designated channel.
-2. Determine whether it affects payment gates, state machine behavior, Providers, persistence, queue handoff, permissions, plaintext configuration, or deployment documentation.
+2. Determine whether it affects the direct-workflow state machine, billed-Provider call boundary, persistence, queue handoff, permissions, plaintext configuration, or deployment documentation; do not reintroduce product-UI paid confirmation gates.
 3. Record architecture choices in the issue/PR rather than creating a competing convention.
 4. Never commit real Provider credentials, production databases, artifact URLs, or printer access codes.
 

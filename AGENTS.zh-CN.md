@@ -9,16 +9,14 @@
 BCA 是以 Bambuddy 为中心的自托管 3D 创作和打印管理后端：
 
 ```text
-创意对话 / 可选参考图
-  → brief 补全与追问
-  → 明确确认图像生成
-  → 四张串行概念图
-  → 持久化选择
-  → 明确确认 3D
-  → 持久化 GLB
-  → Meshy 多色模型 3MF
-  → 几何白模 或 Bambuddy 耗材多色校准
-  → BCA task
+创意输入 / 可选参考图
+  → DeepSeek 创意补全
+  → Image2 串行风格图
+  → 选择并持久化风格图
+  → 混元 3D 概念 GLB
+  → Meshy 3MF + 白模或 1–8 色耗材匹配校准
+  → Meshy + DeepSeek 打印评分/洞察（不提供建议）
+  → 订单 task（标题、用户、姓名、手机号、地址、备注、暂空价格、预览）
   → root 上传 .gcode.3mf
   → Bambuddy LibraryFile / PrintQueueItem
   → FTPS + MQTT project_file
@@ -29,8 +27,8 @@ Bambuddy 是打印机发现、打印机状态和别名、AMS、队列匹配、Li
 ## 2. Provider 配置与付费调用
 
 - Provider 凭据可以按产品决定在 Agent Services 中以明文填写、读取、返回与热加载。
-- 明文值存为 Bambuddy settings 表中的 `bca_creator_*`；数据库读取者、数据库备份持有者及具备 `SETTINGS_READ` 的 API/网页调用者可以读取它们。
-- `/api/v1/creator/config` 保留 Bambuddy 权限：GET 需要 `SETTINGS_READ`，PUT 需要 `SETTINGS_UPDATE`；不得创建无认证凭据接口。
+- 明文值存为 Bambuddy settings 表中的 `bca_creator_*`；数据库读取者、数据库备份持有者及具备 `SETTINGS_UPDATE` 的管理员网页调用者可以读取它们。
+- `/api/v1/creator/config` 的明文 GET 与热加载 PUT 都需要 `SETTINGS_UPDATE`；只读状态/API Key 不得读取 Provider 密钥。
 - 配置响应必须使用：
 
 ```text
@@ -86,9 +84,8 @@ backend/app/
 ├─ models/bca_task.py              BCA task 表
 └─ three_d_agent/
    ├─ contracts.py                 公共模型、状态、Provider Protocol
-   ├─ service.py                   状态机、确认门、持久化语义
-   ├─ conversation.py              LangGraph 对话 planner
-   ├─ graph.py                     免费 brief 图
+   ├─ service.py                   直接工作流状态机与持久化语义
+   ├─ graph.py                     DeepSeek brief 补全图
    ├─ calibration.py               安全 3MF 转换
    ├─ storage.py                   session SQLite 与产物
    └─ providers/                   DeepSeek、Image、Hunyuan、Meshy
@@ -96,47 +93,46 @@ backend/app/
 
 ## 5. 创作状态机
 
-```text
-needs_input
-  → awaiting_image_confirmation
-  → queued_image → generating_images
-  → awaiting_image_selection
-  → awaiting_3d_confirmation
-  → queued_3d → generating_3d
-  → completed | failed
-```
-
-后置子流程：
+产品页面是直接工作流卡片序列：
 
 ```text
-print_analysis:    not_started → queued → running → succeeded | failed
-print_file:        not_started → queued → running → succeeded | failed
-color_calibration: not_started → queued → running → succeeded | failed
-geometry_status:   not_started → running → succeeded | failed
+创意输入 → 创意补全
+  → 风格图生成 → 选择风格图
+  → 3D 概念图生成
+  → 打印校准（白模 | 多色 1..8）
+  → 打印分析
+  → 推送订单任务
 ```
 
 必须保持：
 
-1. `prepare()` 免费，只负责 brief、追问和提示词。
-2. 图像阶段要求完整 brief、`image_prompt` 和 `awaiting_image_confirmation`。
-3. 图像严格四次串行 `n=1`；每张保存后立刻可见，必须四张后才能选择。
-4. 3D 阶段要求已持久化的选择图和 `awaiting_3d_confirmation`。
-5. BCA 不公开 Meshy repair。
-6. 多色限制为 1–8；分析非 `healthy` 时必须显式确认问题。
-7. 所有 Provider 结果在 API 暴露前必须下载、验证和持久化。
-8. 取消/失败要持久化正确主状态或子状态。
-9. 重做 `brief`、`images`、`model` 必须清除所有下游路径、状态、修复模型及跨模型待下载 Provider URL。
+1. `prepare()` 只负责补全 brief、追问缺项并生成 Image2 提示词。
+2. 风格图生成要求完整 brief 与提示词，严格执行四次串行 `n=1`；禁止自动重试计费 Provider POST。
+3. 每张风格图完成后立即持久化；生成 3D 概念图前必须选择一张已持久化风格图。
+4. 混元结果必须先下载、验证、持久化，再公开 GLB 预览路由。
+5. 打印校准在 GLB 完成后执行。白模使用一个逻辑色并将最终 3MF 统一为白色；多色接受 `1..8`，先由 Meshy 转换，再由 DeepSeek 匹配 Bambuddy 活动耗材。
+6. 打印分析只在最终校准后开放；Meshy 分析已持久化 GLB，DeepSeek 将指标转为评分与事实洞察；禁止输出建议。
+7. UI 和 API 没有付费确认门或问题确认门。计费 smoke 仍需在执行点取得运维方明确批准，且禁止自动重试。
+8. 任一重做必须清除该阶段及所有下游路径、状态、待下载 Provider URL 和任务资格；旧产物不得继续下载。
+9. 取消、失败和进程恢复必须持久化终止状态，不能留下永久 running 会话。
 
-## 6. 对话 planner
+## 6. 直接工作流 API
 
-`three_d_agent/conversation.py` 用 LangGraph `StateGraph` 选择单一安全动作：
+前端直接调用类型化 Creator 端点：
 
 ```text
-prepare | confirm_images | select_image | confirm_3d | analyze
-| generate_print_file | geometry | calibrate | restart_question
+POST /sessions/{id}/prepare
+POST /sessions/{id}/images/generate
+POST /sessions/{id}/model/generate
+POST /sessions/{id}/print/calibrate
+POST /sessions/{id}/print/analyze
+POST /sessions/{id}/task
 ```
 
-LangGraph 只规划动作；`creator.py` 负责实际 service 调用。不要把付费 Provider 调用移动到图节点中。付费动作仍需要明确确认，且非健康分析的多色动作需要问题确认文本。
+- Creator 页面不公开、也不依赖全局 Agent 对话。
+- 参考图通过 multipart `prepare` 上传，并随会话持久化。
+- Provider 调用必须留在 service 层，不能放进 LangGraph 节点；状态、持久化、取消、产物校验与禁止自动重试边界由 service 决定。
+- 后台阶段先持久化事件；WebSocket 只是提示，轮询仍是恢复路径。
 
 ## 7. 产物与 3MF
 
@@ -154,7 +150,7 @@ Metadata/plate_N.gcode
 Metadata/slice_info.config
 ```
 
-BCA 上传限制为 100 MB，并校验 ZIP 成员数量、成员大小、压缩比、解压总大小、重复成员和路径安全。几何和多色校准均是独立 3MF，不覆盖原始多色 3MF。
+BCA 上传限制为 100 MB，并校验 ZIP 成员数量、成员大小、压缩比、解压总大小、重复成员和路径安全。白模与多色流程都只把最终颜色校准 3MF 暴露给订单任务；Meshy 中间 3MF 不可直接进入任务清单。
 
 ## 8. BCA Task
 
@@ -182,7 +178,7 @@ DELETE /api/v1/bca-tasks/{id}
 Creator 配置路由：
 
 ```text
-GET /api/v1/creator/config     SETTINGS_READ
+GET /api/v1/creator/config     SETTINGS_UPDATE
 PUT /api/v1/creator/config     SETTINGS_UPDATE
 ```
 
@@ -196,7 +192,7 @@ bca_creator_tencent_secret_key
 bca_creator_meshy_api_key
 ```
 
-启动时从数据库恢复，然后构建 `AgentSettings`、Provider 与 planner。Provider Base URL 必须通过 LAN-service URL 验证；不安全值返回 422。
+启动时从数据库恢复，然后构建 `AgentSettings` 与 Provider。Provider Base URL 必须通过 LAN-service URL 验证；不安全值返回 422。
 
 ## 10. WebSocket
 
@@ -206,7 +202,7 @@ Creator 后台阶段发布：
 {
   "type": "bca_creator_session",
   "session_id": "...",
-  "stage": "images|model|analysis|print-file|geometry|calibration",
+  "stage": "images|model|analysis|calibration",
   "event": "running|updated|failed",
   "status": "..."
 }

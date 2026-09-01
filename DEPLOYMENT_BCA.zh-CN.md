@@ -2,238 +2,79 @@
 
 [English](DEPLOYMENT_BCA.md) | **中文**
 
-本文面向部署和运维开发者。BCA 是 Bambuddy 的内嵌模块，使用同一个 FastAPI 进程、数据库和静态前端，不要把它部署成第二个独立 create-agent 服务。
+BCA 作为 Bambuddy 的一部分部署：一个应用、一个前端 origin，并由 Bambuddy 继续负责身份、队列和打印机。不要将第二个 create-agent 服务、独立 Agent 对话 UI 或上游预构建镜像描述为当前 BCA 部署。
 
-## 1. 部署前条件
+## 1. 支持的 Compose 拓扑
 
-| 条件 | 说明 |
-|---|---|
-| Python | 本地开发使用 Python 3.11+ 与项目 `.venv`。 |
-| Node.js | 仅在本地构建前端时需要；Docker 多阶段构建会处理前端。 |
-| Docker | Linux 生产或 Windows Docker Desktop 使用 Docker Compose。 |
-| 网络 | Linux host networking 最适合发现、Virtual Printer、相机与打印机 LAN 协议。 |
-| 认证 | 暴露到公网或 Tailnet 时必须启用 Bambuddy 认证和 API Key 管理。 |
-| 数据库 | SQLite 支持单机；外部 PostgreSQL 支持必须纳入备份与恢复流程。 |
+### Linux 打印机 LAN 部署
 
-## 2. Windows 本地开发
-
-在仓库根目录执行：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
-npm --prefix .\frontend ci
-npm --prefix .\frontend run build
-$env:DATA_DIR = "$PWD\data"
-.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
-```
-
-打开：
-
-```text
-http://127.0.0.1:8000
-```
-
-首次运行使用 Setup 创建管理员或按你的策略启用认证。不要使用多 Uvicorn worker；BCA 会话锁和后台阶段当前是单进程模型。
-
-## 3. Linux Docker
-
-从仓库根目录执行：
+Linux Compose 从本地仓库源码构建 `bambuddy-bca:local`。使用显式 BCA 环境文件，而不是隐式项目 dotenv 发现：
 
 ```bash
-docker compose up -d --build
-docker compose ps
-docker compose logs -f bambuddy
+docker compose --env-file .env.bca up -d --build
 ```
 
-默认 Linux Compose 使用 host networking。它是打印机发现、SSDP、Virtual Printer、相机和 LAN FTP/MQTT 的推荐模型。
+Linux 拓扑使用 host networking，并保留用于打印机 LAN 发现的 SSDP。`.env.bca` 提供部署初始值；它不能替代安全凭据管理，也不得提交。
 
-部署环境至少应配置：
+### Windows Docker Desktop 或其他 bridge 部署
 
-```text
-DATA_DIR=/app/data
-LOG_DIR=/app/logs
-BCA_PUBLIC_BASE_URL=https://bca.example.invalid
-```
-
-Provider 凭据可以作为首次启动值通过环境变量注入，也可以在启动后由 Agent Services 页面填写并持久化：
-
-```text
-DEEPSEEK_API_KEY
-IMAGE_API_KEY
-TENCENT_SECRET_ID
-TENCENT_SECRET_KEY
-MESHY_API_KEY
-```
-
-BCA 不会读取 source-project `.env` 或 `.env.local`。`.env.bca.example` 是变量名和默认值参考，不要提交真实凭据。
-
-## 4. Windows Docker Desktop
-
-Docker Desktop 不支持生产 Compose 的 Linux `network_mode: host`。使用仓库的 bridge override：
+使用 bridge override 及声明的发现目标集：
 
 ```powershell
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml build
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d
-curl http://127.0.0.1:8012/health
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
+docker compose --env-file .env.bca -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
 ```
 
-普通停止使用 `down`。`down -v` 会删除命名数据卷，只能用于明确可丢弃的 smoke 测试栈。
+将 `BCA_DISCOVERY_SUBNETS` 设置为允许 BCA 扫描的 CIDR，例如相关私有 LAN，必要时还包括 Tailscale CGNAT 范围。bridge 部署使用单播扫描，不依赖 SSDP 广播发现。适用时可直接添加打印机 LAN IP。不得暗示 bridge 模式具有 host-network multicast 行为。
 
-该 override 使用：
+日常停机和移除使用普通 Compose 操作。需要保留部署数据时，不要删除数据卷。
 
-```yaml
-network_mode: !reset null
-ports:
-  - "${BCA_DOCKER_PORT:-8012}:8000"
-```
+## 2. Provider 配置
 
-不要用空字符串代替 `network_mode`；它会产生 Docker `none` 网络并阻止端口发布。
+`/creator/settings` 的 Creator 配置可编辑 DeepSeek、Image2、Hunyuan 和 Meshy 的凭据、模型及 Provider 请求端点/Base URL；Meshy Base URL 可配置。显式 `.env.bca` 提供部署初始值；BCA 不读取 source-project `.env` 或 `.env.local`。
 
-Bridge 模式限制：
+持久化 Creator 配置是敏感数据库状态。配置页、数据库、备份和 `.env.bca` 都必须在管理员控制下。不要把凭据放入任务记录、预览、源码或公开文档。
 
-- 使用打印机 LAN IP 手动添加打印机；不支持 SSDP 自动发现。
-- Virtual Printer 完整被动 FTP 范围和额外相机/代理能力需要额外端口映射。
-- 端口 `8012` 已占用时设置 `BCA_DOCKER_PORT`。
+## 3. 反向代理与公网 origin
 
-## 5. Agent Services 明文配置
+仓库中的生产 Nginx 模板为 [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf)。用它作为静态应用服务及 API/WebSocket 到 Bambuddy 代理的拓扑参考。它保留上游认证，并转发 WebSocket 与 forwarded-request 头。
 
-Agent Services (`/creator/settings`) 会读取、填写、持久化并热加载：
+使用 `MESHY_MODEL_INPUT_MODE=public_url` 时，将 `BCA_PUBLIC_BASE_URL` 设置为可从外部访问、且代理受控模型路由的 HTTPS origin。反向代理、DNS、证书签发和可信 forwarded-header 策略均由运维基础设施负责。不得声称 BCA 会提供证书或信任任意 forwarded headers。
 
-```text
-DeepSeek API Key / Base URL / Model
-Image API Key / Base URL / Model / Quality
-Tencent Secret ID / Secret Key / Region
-Meshy API Key / Input Mode
-BCA Public Base URL
-```
+## 4. Tailscale 与发现
 
-实现契约：
+Tailscale 提供网络可达性，不提供应用认证、TLS 证书或打印机 LAN 路由。仍应保留 Bambuddy 认证与 API Key 控制。要访问另一 LAN 后的打印机，应部署外部维护的 Tailscale 子网路由器，或让 BCA 运行在该打印机 LAN。BCA 不会自动注册为子网路由器，也不会自行通告路由。
 
-```text
-GET /api/v1/creator/config → SETTINGS_READ → 明文配置
-PUT /api/v1/creator/config → SETTINGS_UPDATE → 数据库保存 + Agent Provider 热重载
-Cache-Control: private, no-store
-```
+## 5. 工作流、任务与原生队列交接
 
-明文配置保存在 Bambuddy settings 表的 `bca_creator_*` 行。因此能够读取数据库、数据库备份或 Creator Config API 的主体都能读取凭据。仅在受控管理员浏览器、API 客户端、数据库与备份环境中使用此模式。
+直接工作流为：创意展示（DeepSeek）→ 风格图（Image2）→ 3D 概念图/模型（Hunyuan）→ 白色或 1–8 色校准（Meshy 加耗材颜色匹配）→ Meshy + DeepSeek 评分/洞察且不提供建议 → 订单任务提交。
 
-Base URL 仍被限制为安全的 LAN-service HTTP(S) 地址；不安全 URL 返回 HTTP `422`。
-
-## 6. Meshy public URL 模式
-
-默认推荐：
-
-```text
-MESHY_MODEL_INPUT_MODE=data_uri
-```
-
-如果使用：
-
-```text
-MESHY_MODEL_INPUT_MODE=public_url
-```
-
-则 `BCA_PUBLIC_BASE_URL` 必须是 Meshy 能从公网访问的 HTTPS 地址，并经反向代理公开：
-
-```text
-GET /api/v1/creator/sessions/{session_id}/model.glb
-```
-
-这是用于 Meshy 拉取 GLB 的高熵能力路由，不会出现在普通 creator 会话快照中。
-
-## 7. 反向代理与公网访问
-
-反向代理必须把同一 origin 的静态前端、`/api/v1` 和 WebSocket 正确转发至 Bambuddy。部署时：
-
-- 使用 HTTPS 终止；`BCA_PUBLIC_BASE_URL` 应是外部 HTTPS origin。
-- 只在代理地址可信时配置转发头信任。
-- 不要把 Provider 密钥、数据库或 `DATA_DIR` 直接映射到公网。
-- Tailscale 只提供网络连通性，不提供应用身份认证；仍应启用 Bambuddy 认证和 API Key 管理。
-
-## 8. 数据与备份
-
-必须把以下内容作为**同一恢复点**备份：
-
-```text
-DATA_DIR/bca-agent/  creator sessions and persisted artifacts
-DATA_DIR/bca-tasks/  task source files waiting for slicing
-DATA_DIR/archive/    archives and Library files
-```
-
-以及：
-
-1. Bambuddy 原生数据库：SQLite 数据库及一致的 WAL sidecar，或 `DATABASE_URL` 指向的 PostgreSQL 完整 dump。
-2. `bca_creator_*` 明文 Provider 设置：它们位于原生 Bambuddy 数据库中。
-3. 首次启动仍需要的部署环境与基础设施配置。
-
-仅恢复 `DATA_DIR` 会缺少 `bca_tasks`、Library/队列关系和 Provider 配置；仅恢复数据库会缺少 BCA 产物。必须恢复匹配的数据库与 `DATA_DIR` 快照。
-
-Provider 签名 URL 不是备份产物；BCA 只公开已经下载、验证和持久化的文件。
-
-## 9. 队列交接
-
-BCA 输出的是模型 3MF，不是可直接打印的 job。root 必须上传 slicer 生成的 `.gcode.3mf`，且包内必须有：
+任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、当前留空的可空价格，以及模型/风格预览。模型 3MF 不能直接打印。root 附加的 slicer 生成 `.gcode.3mf` 必须包含：
 
 ```text
 Metadata/plate_N.gcode
 Metadata/slice_info.config
 ```
 
-验证后 BCA 创建原生 `LibraryFile`，再通过 `add_to_queue()` 创建 `manual_start=True` 的原生 `PrintQueueItem`。开始、取消、AMS 映射、打印机状态与归档继续由 Bambuddy 负责。
+验证后交接给 Bambuddy 原生 Library/队列；打印机控制和队列生命周期继续由 Bambuddy 负责。
 
-## 10. 付费 Provider smoke
+## 6. 备份、恢复与回滚
 
-日常测试不得调用付费 Provider。非计费检查：
+创建一个同时包含下列内容的恢复点：
 
-```powershell
-.\.venv\Scripts\python.exe .\backend\tools\bca_provider_smoke.py --base-url http://127.0.0.1:8000
-```
+1. `DATA_DIR`，包括 Creator 产物和任务源文件。
+2. 匹配的 Bambuddy 数据库，包括持久化 Provider 配置和 Library/队列关系。
 
-经过人工批准的完整链路：
+必须一起恢复。只恢复数据文件或只恢复数据库都可能让任务和产物脱离原生 Library/队列记录。源码回滚必须使用已知兼容的本地源码修订；数据兼容性不明确时，恢复匹配恢复点，而不要将旧源码与较新数据混用。
 
-```powershell
-.\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
-  --base-url http://127.0.0.1:8000 `
-  --confirm-paid `
-  --seed-calibration-spool
-```
+## 7. 验证指导
 
-如果 Meshy 分析不是 `healthy`，该命令会在提交 Meshy 多色付费请求前停止。审阅同一 session 的报告后，恢复而不是重跑 GPT Image 或 Hunyuan：
+应通过实际拓扑验证部署行为：应用健康端点、经配置代理的认证应用访问、预期发现方式（Linux host networking 的 SSDP 或 bridge 的声明子网单播）及 root 切片到原生队列的交接。这些检查不需要计费 Provider。
 
-```powershell
-.\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
-  --base-url http://127.0.0.1:8000 `
-  --session-id <existing-session-id> `
-  --confirm-paid `
-  --acknowledge-print-issues `
-  --seed-calibration-spool
-```
+日常验证不得调用计费 Provider。计费 Provider smoke 运行必须在该次调用及其费用被授权时取得明确人工批准。这是该运行的运维批准，不是产品 UI 付费确认门；UI 也没有问题确认门。打印分析只返回评分和洞察，不提供建议。
 
-## 11. 健康检查与排障
+## 相关文档
 
-```text
-GET /health                      进程存活
-GET /api/v1/creator/config       Creator 配置；返回明文，响应 no-store
-```
-
-常用命令：
-
-```powershell
-$env:PYTHONPATH = "."
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\ruff.exe check backend\app backend\tests
-npm --prefix .\frontend run lint
-npm --prefix .\frontend run test:run
-npm --prefix .\frontend run build
-```
-
-## 12. 相关文档
-
+- [English deployment guide](DEPLOYMENT_BCA.md)
+- [架构说明](BCA_ARCHITECTURE.zh-CN.md)
 - [中文 README](README.md)
-- [English README](README.en.md)
-- [中文架构说明](BCA_ARCHITECTURE.zh-CN.md)
-- [English architecture](BCA_ARCHITECTURE.md)
-- [中文 Agent 开发契约](AGENTS.zh-CN.md)
-- [文档审计](DOCUMENTATION_AUDIT.md)
+- [文档审计](DOCUMENTATION_AUDIT.zh-CN.md)

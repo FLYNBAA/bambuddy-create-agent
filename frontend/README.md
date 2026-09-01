@@ -1,57 +1,30 @@
 # Bambuddy Frontend
 
-
 [中文](README.zh-CN.md) | **English**
-The Bambuddy frontend is a React + TypeScript + Vite single-page administration UI. It is built into the repository-level `static/` directory and served by the FastAPI application; it is not deployed as an independent frontend service.
 
-## Development
-
-From the repository root:
-
-```powershell
-npm --prefix .\frontend ci
-npm --prefix .\frontend run lint
-npm --prefix .\frontend run test:run
-npm --prefix .\frontend run build
-```
-
-For local API-backed development, start the backend from the repository root:
-
-```powershell
-$env:DATA_DIR = "$PWD\data"
-.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
-npm --prefix .\frontend run dev
-```
-
-### Linux Docker Compose development
-
-From the repository root, use the development Compose stack instead of starting the frontend and backend commands separately:
-
-```bash
-docker compose -f docker-compose.dev.yml up --build
-```
-
-This is the development-only two-service exception: `frontend` runs Vite with HMR at `http://127.0.0.1:5173`, while `backend` runs Uvicorn with reload at `http://127.0.0.1:8000`. Compose sets `BACKEND_HOST=backend` and `BACKEND_PORT=8000`, so both `/api` and `/api/v1/ws` proxy through Docker service DNS. Native development leaves both variables unset and continues to proxy to `localhost:8000`. The frontend service is not an independently deployable production application.
-
-Use `docker compose -f docker-compose.dev.yml down` to stop the stack. See the repository README for optional Provider environment injection and volume-reset guidance.
+The React + TypeScript + Vite frontend is built into repository-level `static/` and served by the Bambuddy application. BCA remains embedded in that application; do not create a second application shell, independent production frontend, or standalone agent-chat surface.
 
 ## BCA surfaces
 
-The embedded Bambuddy Create Agent UI lives in these pages:
-
-| Route | Component | Purpose |
+| Route | Component | Current responsibility |
 |---|---|---|
-| `/creator` | `pages/CreatorPage.tsx` | Agent conversation, concept-image selection, workflow canvas, artifact download, calibration, and task handoff. |
-| `/tasks` | `pages/TaskListPage.tsx` | BCA model tasks, sliced-file attachment, printer selection, and native queue handoff. |
-| `/creator/settings` | `pages/CreatorSettingsPage.tsx` | Plaintext Provider credentials, runtime configuration, and hot reload. |
+| `/creator` | `pages/CreatorPage.tsx` | Direct Creator cards for DeepSeek creative presentation, Image2 style images, Hunyuan 3D concept image/model generation, calibration, analysis, and order-task submission. |
+| `/tasks` | `pages/TaskListPage.tsx` | Preserve title/user/customer/phone/address/notes, a currently blank price, and model/style previews; accept root slicing, select a printer, and submit to Bambuddy’s native queue. |
+| `/creator/settings` | `pages/CreatorSettingsPage.tsx` | Update provider credentials, models, and request endpoint/Base URLs, including the Meshy base URL. |
 
-Creator image previews use an authenticated Blob fetch rather than a raw `<img>` source, so they work when Bambuddy authentication is enabled. Do not replace them with unauthenticated provider or artifact URLs.
+The direct order is Creative presentation → style image → 3D concept image/model → white or 1–8-color calibration using Meshy and material color matching → final color-calibrated 3MF → Meshy + DeepSeek score/insights without advice → order task submission.
 
-## Design and contracts
+## UI contracts
 
-- Keep BCA navigation integrated in `components/Layout.tsx`; do not create a second shell.
-- Keep artifact downloads behind controlled BCA routes.
-- BCA task files remain model 3MFs until root uploads a validated sliced `.gcode.3mf`.
-- Keep API types and frontend state in sync with `backend/app/services/creator_integration.py` and the `creator.py` / `bca_tasks.py` routes.
+- The product UI has no paid confirmation or issue-acknowledgement gates. A billed-provider smoke run is an operational invocation requiring explicit human approval at execution time, not a UI gate.
+- Keep style/model previews available in task state until root slicing and native queueing. A model 3MF is never a direct printer job; root attaches a validated `.gcode.3mf` before native handoff.
+- Authenticated previews use a controlled Bearer-authenticated Blob fetch. Do not expose provider temporary URLs or assign protected artifact routes directly to `<img src>`.
+- Keep BCA routes inside `components/Layout.tsx` and use Bambuddy’s authorization model and API contracts.
+- Keep Creator configuration sensitive: provider endpoints and credentials must not leak into task records, client logs, or previews.
 
-See the bilingual developer [README](../README.md) / [English README](../README.en.md), [architecture](../BCA_ARCHITECTURE.md), and [engineering guide](../AGENTS.md) for the workflow and non-negotiable gates.
+## References
+
+- [中文前端说明](README.zh-CN.md)
+- [English README](../README.en.md)
+- [Architecture](../BCA_ARCHITECTURE.md)
+- [Deployment](../DEPLOYMENT_BCA.md)

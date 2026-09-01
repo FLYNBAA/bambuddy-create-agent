@@ -19,8 +19,8 @@ Include:
 ### Routes and permissions
 
 - Authentication and authorization use Bambuddy's native model.
-- `GET /api/v1/creator/config` requires `SETTINGS_READ`; `PUT` requires `SETTINGS_UPDATE`.
-- Ordinary creator artifact downloads use controlled routes and permissions. Meshy's `public_url` GLB capability route is an exception and is not returned in normal session snapshots.
+- Plaintext `GET /api/v1/creator/config` and hot-reloading `PUT` both require `SETTINGS_UPDATE`; read-only status/API-key scopes cannot retrieve Provider secrets.
+- Ordinary browser artifact downloads require permissions. Meshy `public_url` uses a separate unguessable Provider capability token which is neither the session ID nor returned in snapshots/WebSocket events.
 - New routes require an explicit auth dependency or a documented reason in the public-route allowlist.
 
 ### Plaintext Provider configuration

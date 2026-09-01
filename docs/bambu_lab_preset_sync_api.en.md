@@ -6,7 +6,7 @@ Bambu preset sync is a native Bambuddy slicer/inventory capability. BCA does not
 
 ## BCA integration principles
 
-- Creator generates only model 3MF, geometry-white, or calibrated multi-color 3MF.
+- Creator exposes only the final white or 1–8-color calibrated 3MF to order tasks; the intermediate Meshy model never enters the queue directly.
 - Root uses Bambuddy slicer, Slicer-API sidecar, or desktop slicer to select printer/process/filament presets.
 - The final `.gcode.3mf` returns through `/tasks`; BCA validates structure then hands off to native queue.
 - BCA multi-color calibration candidates come from active Bambuddy manual spools, not directly from Bambu Cloud presets.

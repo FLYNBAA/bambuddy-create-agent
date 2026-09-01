@@ -15,6 +15,15 @@ class BCATask(Base):
     session_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     source_path: Mapped[str] = mapped_column(Text, nullable=False)
+    style_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_preview_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    username: Mapped[str] = mapped_column(String(100), nullable=False, default="root")
+    title: Mapped[str] = mapped_column(String(120), nullable=False, default="Untitled task")
+    customer_name: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    phone: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    address: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sliced_library_file_id: Mapped[int | None] = mapped_column(
         ForeignKey("library_files.id", ondelete="SET NULL"), nullable=True, index=True
     )

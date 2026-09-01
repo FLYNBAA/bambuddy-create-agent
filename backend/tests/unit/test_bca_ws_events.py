@@ -33,7 +33,6 @@ async def test_creator_stage_event_is_scoped_by_session_id(monkeypatch):
                 "event": "running",
                 "status": "needs_input",
                 "image_count": 0,
-                "geometry_status": "not_started",
                 "print_file_status": "not_started",
                 "color_calibration_status": "not_started",
             },

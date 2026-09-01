@@ -24,7 +24,6 @@ from backend.app.core.websocket import ws_manager
 from backend.app.models.settings import Settings as StoredSetting
 from backend.app.services.creator_inventory import active_creator_inventory_colors
 from backend.app.three_d_agent.config import Settings as AgentSettings
-from backend.app.three_d_agent.conversation import CreatorConversationPlanner
 from backend.app.three_d_agent.factory import create_agent
 from backend.app.three_d_agent.service import ThreeDPrintAgent
 
@@ -41,6 +40,7 @@ _CONFIG_KEYS = frozenset(
         "tencent_secret_key",
         "tencent_region",
         "meshy_api_key",
+        "meshy_base_url",
         "meshy_model_input_mode",
         "app_public_base_url",
     }
@@ -77,23 +77,17 @@ class CreatorSessionResponse(BaseModel):
     questions: list[dict[str, Any]]
     image_prompt: str | None
     generated_images: list[str]
+    image_generation: dict[str, Any]
+    model_generation: dict[str, Any]
     selected_image_index: int | None
     model_download_url: str | None
-    print_file_download_url: str | None
     calibrated_print_file_download_url: str | None
-    geometry_print_file_download_url: str | None
     print_analysis: dict[str, Any]
-    model_repair: dict[str, Any]
-    print_file: dict[str, Any]
-    conversation: list[dict[str, Any]]
-    geometry_status: str
     color_calibration: dict[str, Any]
     events: list[dict[str, Any]]
     error: str | None
 
 
-class ImageSelectionRequest(BaseModel):
-    image_index: int
 
 
 class CreatorController:
@@ -107,12 +101,25 @@ class CreatorController:
         )
         self.settings.ensure_directories()
         self.agent: ThreeDPrintAgent = create_agent(self.settings, inventory_colors=active_creator_inventory_colors)
-        self.planner = CreatorConversationPlanner(self.settings)
         self.tasks: dict[tuple[str, str], asyncio.Task[object]] = {}
 
     def snapshot(self, session_id: str) -> CreatorSessionResponse:
         snapshot = self.agent.get_session(session_id)
         base = f"/api/v1/creator/sessions/{session_id}"
+        image_status = (
+            "running" if snapshot.status.value == "generating_images" else
+            "queued" if snapshot.status.value == "queued_image" else
+            "succeeded" if snapshot.generated_image_paths else
+            "failed" if snapshot.status.value == "failed" and not snapshot.generated_image_paths else
+            "not_started"
+        )
+        model_status = (
+            "running" if snapshot.status.value == "generating_3d" else
+            "queued" if snapshot.status.value == "queued_3d" else
+            "succeeded" if snapshot.model_path else
+            "failed" if snapshot.status.value == "failed" and snapshot.generated_image_paths else
+            "not_started"
+        )
         return CreatorSessionResponse(
             session_id=snapshot.session_id,
             status=snapshot.status.value,
@@ -120,16 +127,12 @@ class CreatorController:
             questions=[item.model_dump(mode="json") for item in snapshot.questions],
             image_prompt=snapshot.image_prompt,
             generated_images=[f"{base}/images/{index}" for index in range(len(snapshot.generated_image_paths))],
+            image_generation={"status": image_status},
+            model_generation={"status": model_status},
             selected_image_index=snapshot.selected_image_index,
             model_download_url=f"{base}/model" if snapshot.model_path else None,
-            print_file_download_url=f"{base}/print-file" if snapshot.print_file_path else None,
             calibrated_print_file_download_url=f"{base}/calibrated-print-file" if snapshot.calibrated_print_file_path else None,
-            geometry_print_file_download_url=f"{base}/geometry-print-file" if snapshot.geometry_print_file_path else None,
             print_analysis=snapshot.print_analysis.model_dump(mode="json"),
-            model_repair=snapshot.model_repair.model_dump(mode="json"),
-            print_file=snapshot.print_file.model_dump(mode="json"),
-            conversation=[item.model_dump(mode="json") for item in snapshot.conversation],
-            geometry_status=snapshot.geometry_status.value,
             color_calibration=snapshot.color_calibration.model_dump(mode="json"),
             events=[item.model_dump(mode="json") for item in snapshot.events],
             error=snapshot.error,
@@ -168,7 +171,6 @@ class CreatorController:
                     "event": event,
                     "status": snapshot.status.value,
                     "image_count": len(snapshot.generated_image_paths),
-                    "geometry_status": snapshot.geometry_status.value,
                     "print_file_status": snapshot.print_file.status.value,
                     "color_calibration_status": snapshot.color_calibration.status.value,
                 },
@@ -184,7 +186,6 @@ class CreatorController:
         self.settings = AgentSettings(data_dir=self.settings.data_dir, **overrides)
         self.settings.ensure_directories()
         self.agent = create_agent(self.settings, inventory_colors=active_creator_inventory_colors)
-        self.planner = CreatorConversationPlanner(self.settings)
 
     async def shutdown(self) -> None:
         tasks = [task for task in self.tasks.values() if not task.done()]
@@ -212,9 +213,7 @@ def controller_for(request: Request) -> CreatorController:
 
 def confined_artifact(snapshot, kind: str) -> Path:
     paths = {
-        "geometry-print-file": snapshot.geometry_print_file_path,
         "model": snapshot.model_path,
-        "print-file": snapshot.print_file_path,
         "calibrated-print-file": snapshot.calibrated_print_file_path,
     }
     stored = paths.get(kind)

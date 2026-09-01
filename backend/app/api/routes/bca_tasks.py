@@ -38,7 +38,17 @@ class BCATaskResponse(BaseModel):
     status: str
     sliced_library_file_id: int | None
     print_queue_item_id: int | None
+    username: str
     created_by: str
+    title: str
+    customer_name: str
+    phone: str
+    address: str
+    notes: str | None
+    price: str | None
+    style_image_preview_url: str | None
+    model_preview_url: str | None
+    source_3mf_url: str
     created_at: str
     updated_at: str
 
@@ -48,7 +58,8 @@ class BCATaskQueueRequest(BaseModel):
     plate_id: int | None = Field(default=None, ge=1)
 
 
-def _response(task: BCATask, user_name: str = "root") -> BCATaskResponse:
+def _response(task: BCATask, user_name: str | None = None) -> BCATaskResponse:
+    username = user_name or task.username
     return BCATaskResponse(
         id=task.id,
         session_id=task.session_id,
@@ -56,7 +67,17 @@ def _response(task: BCATask, user_name: str = "root") -> BCATaskResponse:
         status=task.status,
         sliced_library_file_id=task.sliced_library_file_id,
         print_queue_item_id=task.print_queue_item_id,
-        created_by=user_name,
+        username=username,
+        created_by=username,
+        title=task.title,
+        customer_name=task.customer_name,
+        phone=task.phone,
+        address=task.address,
+        notes=task.notes,
+        price=task.price,
+        style_image_preview_url=f"/api/v1/bca-tasks/{task.id}/style-image" if task.style_image_path else None,
+        model_preview_url=f"/api/v1/bca-tasks/{task.id}/model-preview" if task.model_preview_path else None,
+        source_3mf_url=f"/api/v1/bca-tasks/{task.id}/source",
         created_at=task.created_at.isoformat(),
         updated_at=task.updated_at.isoformat(),
     )
@@ -120,6 +141,8 @@ async def upload_bca_task(
     task = BCATask(
         filename=filename,
         source_path=str(source),
+        username=current_user.username if current_user else "root",
+        title=Path(filename).stem,
         status="awaiting_slice",
         created_by_id=current_user.id if current_user else None,
     )
@@ -146,6 +169,35 @@ async def download_bca_task_source(
     if not source.is_file():
         raise HTTPException(status_code=404, detail="BCA task file not found")
     return FileResponse(source, media_type="model/3mf", filename=task.filename)
+
+
+def _task_artifact(task: BCATask, value: str | None) -> Path:
+    if not value:
+        raise HTTPException(status_code=404, detail="BCA task preview not found")
+    path = Path(value).resolve()
+    try:
+        path.relative_to(_task_root().resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="BCA task preview not found") from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="BCA task preview not found")
+    return path
+
+
+@router.get("/{task_id}/style-image")
+async def download_bca_task_style_image(task_id: int, db: AsyncSession = Depends(get_db), _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_READ_ALL)) -> FileResponse:
+    task = await db.get(BCATask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="BCA task not found")
+    return FileResponse(_task_artifact(task, task.style_image_path), media_type="image/png", filename=f"task-{task_id}-style.png")
+
+
+@router.get("/{task_id}/model-preview")
+async def download_bca_task_model_preview(task_id: int, db: AsyncSession = Depends(get_db), _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_READ_ALL)) -> FileResponse:
+    task = await db.get(BCATask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="BCA task not found")
+    return FileResponse(_task_artifact(task, task.model_preview_path), media_type="model/gltf-binary", filename=f"task-{task_id}.glb")
 
 
 @router.post("/{task_id}/sliced", response_model=BCATaskResponse)
@@ -217,7 +269,8 @@ async def delete_bca_task(
     task = await db.get(BCATask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="BCA task not found")
-    source = Path(task.source_path)
+    paths = [Path(value) for value in (task.source_path, task.style_image_path, task.model_preview_path) if value]
     await db.delete(task)
     await db.commit()
-    await asyncio.to_thread(source.unlink, missing_ok=True)
+    for path in paths:
+        await asyncio.to_thread(path.unlink, missing_ok=True)

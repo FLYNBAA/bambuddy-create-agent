@@ -251,13 +251,13 @@ async def init_db():
     # Import models to register them with SQLAlchemy
     from backend.app.models import (  # noqa: F401
         active_print_session,
-        bca_task,
         active_print_spoolman,
         ams_history,
         ams_label,
         api_key,
         archive,
         auth_ephemeral,
+        bca_task,
         bug_report,
         color_catalog,
         external_link,
@@ -1266,6 +1266,19 @@ async def run_migrations(conn):
         "ALTER TABLE bca_tasks ADD COLUMN print_queue_item_id INTEGER REFERENCES print_queue(id) ON DELETE SET NULL",
     )
     await _safe_execute(conn, "CREATE INDEX IF NOT EXISTS ix_bca_tasks_print_queue_item_id ON bca_tasks (print_queue_item_id)")
+    # Direct creator tasks persist immutable order metadata and preview artifacts.
+    for statement in (
+        "ALTER TABLE bca_tasks ADD COLUMN style_image_path TEXT",
+        "ALTER TABLE bca_tasks ADD COLUMN model_preview_path TEXT",
+        "ALTER TABLE bca_tasks ADD COLUMN username VARCHAR(100) NOT NULL DEFAULT 'root'",
+        "ALTER TABLE bca_tasks ADD COLUMN title VARCHAR(120) NOT NULL DEFAULT 'Untitled task'",
+        "ALTER TABLE bca_tasks ADD COLUMN customer_name VARCHAR(120) NOT NULL DEFAULT ''",
+        "ALTER TABLE bca_tasks ADD COLUMN phone VARCHAR(40) NOT NULL DEFAULT ''",
+        "ALTER TABLE bca_tasks ADD COLUMN address VARCHAR(500) NOT NULL DEFAULT ''",
+        "ALTER TABLE bca_tasks ADD COLUMN notes TEXT",
+        "ALTER TABLE bca_tasks ADD COLUMN price VARCHAR(64)",
+    ):
+        await _safe_execute(conn, statement)
 
     # Migration: Add parent_run_id column to pipeline_runs (#1425 PR C).
     # Links a retry-failed run back to its parent so the dashboard can show

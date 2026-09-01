@@ -7,8 +7,8 @@ Supports both SSDP discovery (for native installs) and subnet scanning (for Dock
 
 import logging
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
 
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.permissions import Permission
@@ -17,7 +17,10 @@ from backend.app.models.user import User
 from backend.app.services.discovery import (
     discovery_service,
     is_running_in_docker,
+    parse_configured_discovery_subnets,
     subnet_scanner,
+    validate_scan_subnet,
+    validate_scan_timeout,
 )
 from backend.app.services.network_utils import get_network_interfaces
 
@@ -41,10 +44,20 @@ class DiscoveryInfo(BaseModel):
 
 
 class SubnetScanRequest(BaseModel):
-    """Request to scan a subnet."""
+    """Request a bounded unicast scan of an operator-approved subnet."""
 
-    subnet: str  # CIDR notation, e.g., "192.168.1.0/24"
-    timeout: float = 1.0  # Connection timeout per host
+    subnet: str | None = Field(default=None, max_length=64, description="IPv4 CIDR to scan")
+    timeout: float = Field(default=1.0, ge=0.1, le=10.0, description="Per-host timeout in seconds")
+
+    @field_validator("subnet")
+    @classmethod
+    def validate_subnet(cls, subnet: str | None) -> str | None:
+        if subnet is None:
+            return None
+        try:
+            return validate_scan_subnet(subnet)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class SubnetScanStatus(BaseModel):
@@ -69,8 +82,9 @@ class DiscoveredPrinterResponse(BaseModel):
 async def get_discovery_info(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.DISCOVERY_SCAN),
 ):
-    """Get discovery environment info (Docker detection, etc.)."""
-    subnets = [iface["subnet"] for iface in get_network_interfaces()]
+    """Get discovery environment info and configured scan candidates."""
+    configured_subnets = parse_configured_discovery_subnets()
+    subnets = configured_subnets or [iface["subnet"] for iface in get_network_interfaces()]
     return DiscoveryInfo(
         is_docker=is_running_in_docker(),
         ssdp_running=discovery_service.is_running,
@@ -89,7 +103,7 @@ async def get_discovery_status(
 
 @router.post("/start", response_model=DiscoveryStatus)
 async def start_discovery(
-    duration: float = 10.0,
+    duration: float = Query(default=10.0, ge=0.1, le=60.0),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.DISCOVERY_SCAN),
 ):
     """Start SSDP printer discovery.
@@ -147,26 +161,34 @@ async def start_subnet_scan(
     request: SubnetScanRequest,
     _: User | None = RequirePermissionIfAuthEnabled(Permission.DISCOVERY_SCAN),
 ):
-    """Start a subnet scan for Bambu printers.
+    """Start a bounded unicast scan for Bambu printers.
 
-    Use this when running in Docker where SSDP multicast doesn't work.
-
-    Args:
-        request: Subnet to scan in CIDR notation (e.g., "192.168.1.0/24")
+    A supplied CIDR is validated before a task is scheduled. Omitting it scans
+    the private routed-LAN candidates configured in ``BCA_DISCOVERY_SUBNETS``.
     """
-    # Start scan in background
-    spawn_background_task(
-        subnet_scanner.scan_subnet(request.subnet, request.timeout),
-        name=f"subnet-scan-{request.subnet}",
-    )
+    subnets = [request.subnet] if request.subnet else parse_configured_discovery_subnets()
+    if not subnets:
+        raise HTTPException(
+            status_code=422,
+            detail="subnet is required unless BCA_DISCOVERY_SUBNETS contains a valid private CIDR",
+        )
 
-    # Return immediate status
-    scanned, total = subnet_scanner.progress
-    return SubnetScanStatus(
-        running=subnet_scanner.is_running,
-        scanned=scanned,
-        total=total,
+    try:
+        timeout = validate_scan_timeout(request.timeout)
+        scan_id = subnet_scanner.start_scan(subnets, timeout)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if scan_id is None:
+        raise HTTPException(status_code=409, detail="a subnet scan is already running")
+
+    task = spawn_background_task(
+        subnet_scanner.scan_subnets(subnets, timeout, scan_id=scan_id),
+        name=f"subnet-scan-{','.join(subnets)}",
     )
+    subnet_scanner.attach_scan_task(scan_id, task)
+
+    scanned, total = subnet_scanner.progress
+    return SubnetScanStatus(running=subnet_scanner.is_running, scanned=scanned, total=total)
 
 
 @router.get("/scan/status", response_model=SubnetScanStatus)

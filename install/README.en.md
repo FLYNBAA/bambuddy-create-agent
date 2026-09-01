@@ -11,7 +11,7 @@ This directory contains inherited Bambuddy installation foundations. BCA deploym
 From the BCA fork working tree:
 
 ```bash
-docker compose up -d --build
+docker compose --env-file .env.bca up -d --build
 ```
 
 Linux production defaults to host networking for discovery, Virtual Printer, cameras, and LAN protocols.
@@ -19,11 +19,11 @@ Linux production defaults to host networking for discovery, Virtual Printer, cam
 ### Windows Docker Desktop
 
 ```powershell
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
+docker compose --env-file .env.bca -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
 curl http://127.0.0.1:8012/health
 ```
 
-Windows bridge mode requires printer LAN IP setup. For an ordinary stop:
+Windows bridge mode unicast-scans explicit printer-LAN CIDRs from `BCA_DISCOVERY_SUBNETS` in `.env.bca`; adding by LAN IP remains available. For an ordinary stop:
 
 ```powershell
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
@@ -58,7 +58,7 @@ $env:DATA_DIR = "$PWD\data"
 2. Use `/creator/settings` to enter or confirm Provider parameters and plaintext credentials.
 3. Record that these values persist as `bca_creator_*` Bambuddy database rows.
 4. Add printers and filament inventory.
-5. Create sessions at `/creator` and retain every payment confirmation gate.
+5. At `/creator`, complete the direct cards for creative direction, style image, 3D concept, print calibration, print analysis, and order submission; the product UI has no paid confirmation gate.
 6. At `/tasks`, attach root-sliced `.gcode.3mf` before native queue handoff.
 
 See the full [English deployment guide](../DEPLOYMENT_BCA.md) for network, reverse-proxy, backup, PostgreSQL, and billed smoke requirements.

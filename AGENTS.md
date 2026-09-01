@@ -9,16 +9,14 @@ This file is the required entry point for all coding work in `bambuddy-create-ag
 BCA is a Bambuddy-centered, self-hosted 3D-creation and printing-management backend.
 
 ```text
-Creative conversation / optional reference image
-  → brief extraction and clarification
-  → explicit image payment confirmation
-  → four serial concept-image requests
-  → persisted image selection
-  → explicit 3D payment confirmation
-  → persisted GLB
-  → Meshy multi-color model 3MF
-  → geometry-white OR Bambuddy-inventory color calibration
-  → BCA task list
+Creative input / optional reference image
+  → DeepSeek creative completion
+  → four serial Image2 style images
+  → persisted style-image selection
+  → Hunyuan 3D concept GLB
+  → Meshy 3MF + white or 1–8-color inventory calibration
+  → Meshy + DeepSeek print score/insights (no advice)
+  → order task (title, user, customer, phone, address, notes, blank price, previews)
   → root supplies sliced .gcode.3mf
   → Bambuddy LibraryFile
   → Bambuddy PrintQueueItem
@@ -72,7 +70,6 @@ Windows Docker Desktop smoke uses the bridge override, not Linux host networking
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml build
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d
 curl http://127.0.0.1:8012/health
-curl http://127.0.0.1:8012/api/v1/creator/config
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
 ```
 
@@ -112,9 +109,8 @@ backend/app/
 │  └─ bambu_mqtt.py                     native MQTT project_file authority
 └─ three_d_agent/
    ├─ contracts.py                      creator models, states and protocols
-   ├─ service.py                        creator orchestration and paid gates
-   ├─ conversation.py                   LangGraph creator command planner
-   ├─ graph.py                          free brief preparation graph
+   ├─ service.py                        direct creator workflow orchestration
+   ├─ graph.py                          DeepSeek brief preparation graph
    ├─ prompts.py                        print-aware prompt builder
    ├─ calibration.py                    safe 3MF color/geometry transforms
    ├─ storage.py                        SQLite sessions and validated artifacts
@@ -122,58 +118,48 @@ backend/app/
    └─ providers/                        DeepSeek, image, Hunyuan and Meshy adapters
 ```
 
-## 5. Creator State Machine and Gates
+## 5. Creator State Machine
 
-Main session state:
-
-```text
-needs_input
-  → awaiting_image_confirmation
-  → queued_image
-  → generating_images
-  → awaiting_image_selection
-  → awaiting_3d_confirmation
-  → queued_3d
-  → generating_3d
-  → completed | failed
-```
-
-Post-model subworkflows:
+The product surface is a direct sequence of workflow cards:
 
 ```text
-print_analysis:    not_started → queued → running → succeeded | failed
-print_file:        not_started → queued → running → succeeded | failed
-color_calibration: not_started → queued → running → succeeded | failed
-geometry_status:   not_started → running → succeeded | failed
+creative input → prepared brief
+  → image generation → image selection
+  → 3D concept generation
+  → print calibration (white | multicolor 1..8)
+  → print analysis
+  → order task submission
 ```
 
 Rules:
 
-1. `prepare()` is free and may only enrich the brief, ask questions and build a prompt.
-2. Image generation requires `awaiting_image_confirmation`, a complete brief and `image_prompt`.
-3. Image calls remain four serial `n=1` paid requests. Each successful image is saved and surfaced immediately. Selection remains blocked until all four persisted paths exist.
-4. 3D generation requires a selected persisted image and `awaiting_3d_confirmation`.
-5. The BCA UI and API do not expose Meshy topology repair. Do not re-add it without a product decision and an explicit paid confirmation design.
-6. Multi-color 3MF is limited to `1..8` colors in BCA.
-7. Every provider result must be downloaded, validated and stored before the public API exposes it.
-8. Main generation cancellation/failure produces main `failed`; post-model workflow failure must not discard a completed GLB.
-9. A restart never bypasses a paid confirmation. Restarting `brief`, `images`, or `model` must clear every downstream GLB/print/calibration/geometry path and nested status before the new boundary is exposed; stale artifacts must never remain downloadable or task-eligible.
-10. If print analysis is not `healthy`, multi-color generation additionally requires an explicit issue acknowledgment. The UI checkbox and chat wording must state that the reported issues are understood; never silently set `acknowledge_issues=True`.
+1. `prepare()` enriches the brief, asks for missing information, and builds the Image2 prompt.
+2. Image generation requires a complete brief and prompt. It runs exactly four serial `n=1` calls; no paid Provider POST is retried automatically.
+3. Each completed image is persisted and exposed immediately. A persisted image selection is required for 3D concept generation.
+4. Hunyuan output is downloaded, validated, and persisted before the GLB preview route is exposed.
+5. Print calibration runs after GLB completion. White mode requests one logical color and normalizes the final 3MF to white. Multicolor accepts `1..8`, runs Meshy conversion, then DeepSeek matching against active Bambuddy inventory.
+6. Print analysis is exposed only after final calibration; Meshy analyzes the persisted GLB and DeepSeek turns those metrics into a score and factual insights. It must not emit recommendations.
+7. The UI and API contain no paid-confirmation or issue-acknowledgement gates. Billed smoke runs still require explicit operator approval at the point of execution; automatic retries remain prohibited.
+8. Every redo clears the selected stage and all downstream paths, states, pending Provider URLs, and task eligibility. Stale artifacts must never remain downloadable.
+9. Main and subworkflow cancellation/failure persists a terminal failed state; no session may remain running after process recovery.
 
-## 6. Global Agent Conversation
+## 6. Direct Workflow API
 
-`three_d_agent/conversation.py` compiles a LangGraph `StateGraph` that asks DeepSeek structured output to choose one constrained action:
+The frontend uses the typed Creator endpoints directly:
 
 ```text
-prepare | confirm_images | select_image | confirm_3d | analyze
-| generate_print_file | geometry | calibrate | restart_question
+POST /sessions/{id}/prepare
+POST /sessions/{id}/images/generate
+POST /sessions/{id}/model/generate
+POST /sessions/{id}/print/calibrate
+POST /sessions/{id}/print/analyze
+POST /sessions/{id}/task
 ```
 
-- Conversation turns persist in `SessionSnapshot.conversation`; retain only the latest bounded history.
-- The graph chooses a tool action; `creator.py` performs the actual service call.
-- Paid actions still require an explicit user message containing Chinese `确认` and a structured `explicit_confirmation=true` result. Service gate checks remain authoritative.
-- The reference-image flow uses the regular preparation endpoint because it requires multipart upload; do not silently discard a reference image to route it through chat.
-- Do not move paid provider calls into LangGraph nodes. Service state, confirmation gates, idempotency and cancellation are outside the planning graph.
+- The Creator page does not expose or depend on a global Agent conversation.
+- Reference images use the multipart preparation endpoint and are retained with the session.
+- Provider calls remain in the service layer, outside LangGraph nodes. Service state, persistence, cancellation, artifact validation, and the no-retry boundary remain authoritative.
+- Background stage events are persisted first; WebSocket delivery is advisory and polling remains the recovery path.
 
 ## 7. Artifact and 3MF Contract
 
@@ -197,13 +183,10 @@ Metadata/slice_info.config
 
 ### Calibration modes
 
-- **Geometry mode**: `geometry_only_3mf()` normalizes supported color metadata to white while retaining valid geometry/property references. It is for a single white-material workflow, not a destructive geometry conversion.
-- **Multi-color mode**: source colors are mapped by DeepSeek to actual Bambuddy active manual Spools. `creator_inventory.py` reads unarchived `Spool` rows with valid RGBA, material, brand and color name. Missing/invalid color data is excluded; no fallback color is invented.
+- **White mode**: Meshy generates a one-color model 3MF and `geometry_only_3mf()` normalizes every supported palette entry to opaque white while preserving valid geometry/property references.
+- **Multicolor mode**: Meshy generates a `1..8`-color model 3MF, then DeepSeek maps every source color to an active Bambuddy manual spool. `creator_inventory.py` excludes archived spools and rows without valid RGBA/material data; no fallback color is invented.
 
-The original model 3MF is never overwritten. Geometry and calibrated copies are separate artifacts.
-
-For Meshy `public_url` model input, the provider receives only the controlled capability route `/api/v1/creator/sessions/{session_id}/model.glb`. It is not returned in public snapshots; it exists solely so Meshy can fetch the GLB without a browser credential.
-
+The final calibrated 3MF is a separate persisted artifact and the only creator output eligible for order submission. The intermediate Meshy 3MF is never task-eligible.
 ## 8. BCA Task Contract
 
 `BCATask` state:
@@ -256,7 +239,7 @@ bca_creator_meshy_model_input_mode
 bca_creator_app_public_base_url
 ```
 
-They are restored during FastAPI lifespan startup. `GET /api/v1/creator/config` returns the stored plaintext credentials to callers with Bambuddy `SETTINGS_READ`; `PUT` persists and hot-reloads them for callers with `SETTINGS_UPDATE`. Database backups therefore contain these values.
+They are restored during FastAPI lifespan startup. Both plaintext `GET /api/v1/creator/config` and hot-reloading `PUT` require Bambuddy `SETTINGS_UPDATE`; read-only status/API-key scopes cannot retrieve Provider secrets. Database backups therefore contain these values.
 
 Native Bambuddy API keys, webhook routes, camera routes and printer-control routes remain the external integration mechanism. Add BCA-specific external routes under `/api/v1/creator` or `/api/v1/bca-tasks`, then apply existing Bambuddy permission dependencies. Do not create an unauthenticated BCA API surface.
 
@@ -268,11 +251,10 @@ Creator background stages publish this native WebSocket event:
 {
   "type": "bca_creator_session",
   "session_id": "...",
-  "stage": "images|model|analysis|print-file|geometry|calibration",
+  "stage": "images|model|analysis|calibration",
   "event": "running|updated|failed",
   "status": "...",
   "image_count": 0,
-  "geometry_status": "...",
   "print_file_status": "...",
   "color_calibration_status": "..."
 }
@@ -291,7 +273,7 @@ The React `useWebSocket` hook dispatches `bca:creator-session`; `CreatorPage` re
 
 ```text
 frontend/src/
-├─ pages/CreatorPage.tsx             creator session/chat/canvas
+├─ pages/CreatorPage.tsx             progressive Creator workflow cards
 ├─ pages/TaskListPage.tsx            task intake, slice upload, printer picker
 ├─ pages/CreatorSettingsPage.tsx     plaintext Provider configuration and hot reload
 ├─ hooks/useWebSocket.ts             BCA event dispatch integration
@@ -355,7 +337,7 @@ Paid image smoke, only after explicit operator approval and configured Provider 
 The runner stops after the four-image request is accepted. It does not submit Hunyuan or Meshy work.
 
 
-Full paid-chain smoke, only after explicit approval of image, Hunyuan, Meshy multi-color and DeepSeek calibration charges:
+Full paid-chain smoke, only after explicit approval of Image2, Hunyuan, Meshy calibration, DeepSeek analysis/title, and their applicable charges:
 
 ```powershell
 .\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
@@ -364,16 +346,15 @@ Full paid-chain smoke, only after explicit approval of image, Hunyuan, Meshy mul
   --seed-calibration-spool
 ```
 
-The initial full-chain command intentionally stops before Meshy multi-color generation when analysis is not `healthy`; it cannot pre-approve unseen defects. `--seed-calibration-spool` creates then removes a local active PLA test spool so calibration has an inventory candidate after a healthy analysis. The runner also creates a task from the calibrated 3MF; the resulting task remains intentionally unsliced and cannot be queued until a slicer produces a validated `.gcode.3mf`.
+The runner follows the direct card contract: prepare, four style images, selected-image 3D concept, white or multicolor calibration, Meshy + DeepSeek analysis, and order submission. `--seed-calibration-spool` selects the multicolor path and creates then removes one local PLA test spool. Without it, the runner uses white mode. The created task remains intentionally unsliced and cannot enter the native queue until root supplies a validated `.gcode.3mf`.
 
-If a full run stops after non-healthy analysis, do **not** repeat the paid image or 3D stages. Review the existing session's report, then resume only Meshy print generation:
+If a run stops after the GLB is persisted, do **not** repeat Image2 or Hunyuan. Resume calibration, analysis, and order submission for that same session:
 
 ```powershell
 .\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
   --base-url http://127.0.0.1:8000 `
   --session-id <existing-session-id> `
   --confirm-paid `
-  --acknowledge-print-issues `
   --seed-calibration-spool
 ```
 

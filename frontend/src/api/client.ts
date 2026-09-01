@@ -1554,6 +1554,21 @@ export interface ColorCatalogEntry {
   effect_type?: string | null;
 }
 
+
+export interface BambuddyColorCatalogEntry {
+  selection_key: string;
+  manufacturer: string;
+  color_name: string;
+  hex_color: string;
+  material: string;
+  exists: boolean;
+}
+
+export interface BambuddyColorImportResult {
+  imported: number;
+  skipped: number;
+}
+
 export interface ColorLookupResult {
   found: boolean;
   hex_color: string | null;
@@ -6194,6 +6209,13 @@ export const api = {
     request<{ status: string }>(`/inventory/locations/${id}`, { method: 'DELETE' }),
   getColorCatalog: () =>
     request<ColorCatalogEntry[]>('/inventory/colors'),
+  getBambuddyColorCatalog: () =>
+    request<BambuddyColorCatalogEntry[]>('/inventory/colors/bambuddy'),
+  importBambuddyColorCatalog: (selectionKeys: string[]) =>
+    request<BambuddyColorImportResult>('/inventory/colors/bambuddy/import', {
+      method: 'POST',
+      body: JSON.stringify({ selection_keys: selectionKeys }),
+    }),
   getColorNameMap: () =>
     request<{ colors: Record<string, string> }>('/inventory/colors/map'),
   addColorEntry: (data: {

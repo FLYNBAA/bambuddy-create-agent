@@ -2,63 +2,29 @@
 
 [English](README.md) | **中文**
 
-Bambuddy 前端是 React + TypeScript + Vite 单页管理界面。构建产物进入仓库根目录 `static/`，由同一 FastAPI 应用提供；它不是独立部署的前端服务。
-
-## 开发
-
-在仓库根目录执行：
-
-```powershell
-npm --prefix .\frontend ci
-npm --prefix .\frontend run lint
-npm --prefix .\frontend run test:run
-npm --prefix .\frontend run build
-```
-
-需要本地 API 时：
-
-```powershell
-$env:DATA_DIR = "$PWD\data"
-.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
-npm --prefix .\frontend run dev
-```
-
-### Linux Docker Compose 开发
-
-在仓库根目录使用开发 Compose 栈，不要再分别启动前端和后端命令：
-
-```bash
-docker compose -f docker-compose.dev.yml up --build
-```
-
-这是仅用于开发的双服务例外：`frontend` 以 Vite HMR 运行在 `http://127.0.0.1:5173`，`backend` 以 Uvicorn reload 运行在 `http://127.0.0.1:8000`。Compose 设置 `BACKEND_HOST=backend` 和 `BACKEND_PORT=8000`，使 `/api` 与 `/api/v1/ws` 均通过 Docker 服务 DNS 代理；原生开发不设置这两个变量，仍代理到 `localhost:8000`。前端服务不是可独立部署的生产应用。
-
-使用 `docker compose -f docker-compose.dev.yml down` 停止开发栈。Provider 环境注入和开发卷重置说明见仓库根 README。
+React + TypeScript + Vite 前端构建到仓库根目录 `static/`，由 Bambuddy 应用提供服务。BCA 始终内嵌在该应用中；不要创建第二个应用外壳、独立生产前端或独立 Agent 对话页面。
 
 ## BCA 页面
 
-| 路由 | 组件 | 用途 |
+| 路由 | 组件 | 当前职责 |
 |---|---|---|
-| `/creator` | `pages/CreatorPage.tsx` | Agent 对话、候选效果图、工作流画布、产物下载、校准与任务交接。 |
-| `/tasks` | `pages/TaskListPage.tsx` | BCA 模型任务、切片文件附加、打印机选择与原生队列交接。 |
-| `/creator/settings` | `pages/CreatorSettingsPage.tsx` | 明文 Provider 凭据、运行参数与热加载。 |
+| `/creator` | `pages/CreatorPage.tsx` | 用于 DeepSeek 创意展示、Image2 风格图、Hunyuan 3D 概念图/模型生成、校准、分析和订单任务提交的直接 Creator 卡片。 |
+| `/tasks` | `pages/TaskListPage.tsx` | 保留标题、用户、姓名、手机号、地址、备注、当前留空价格及模型/风格预览，接收 root 切片、选择打印机并提交到 Bambuddy 原生队列。 |
+| `/creator/settings` | `pages/CreatorSettingsPage.tsx` | 更新 Provider 凭据、模型和请求端点/Base URL，包括 Meshy Base URL。 |
 
-认证启用时，Creator 效果图必须通过带 Bearer token 的 Blob fetch 预览，不能把受控图片路由直接赋给 `<img src>`。effect 清理必须 abort 未完成请求并 revoke 已创建 Blob URL。
+直接顺序为：创意展示 → 风格图 → 3D 概念图/模型 → 通过 Meshy 和耗材颜色匹配进行白色或 1–8 色校准 → 最终颜色校准 3MF → Meshy + DeepSeek 评分/洞察且不提供建议 → 订单任务提交。
 
-## 前后端契约
+## UI 契约
 
-- BCA 导航必须保持在 `components/Layout.tsx` 的既有 Bambuddy Shell 中，不创建第二套应用外壳。
-- 普通产物下载保持受控 BCA route；不要向前端暴露 Provider 临时 URL。
-- BCA task 在 root 上传并验证 `.gcode.3mf` 前仍只是模型 3MF。
-- `CreatorSettingsPage` 使用 `/api/v1/creator/config`：GET 需要 `SETTINGS_READ`，PUT 需要 `SETTINGS_UPDATE`，返回与保存的明文凭据响应必须为 `Cache-Control: private, no-store`。
-- `CreatorPage` 卡片动作默认使用 POST；不要让确认、分析或生成动作退化成 GET/405。
-- 修改 creator response 或 task response 时同步更新 `backend/app/services/creator_integration.py`、`creator.py`、`bca_tasks.py` 与前端 type/state。
+- 产品 UI 没有付费确认门或问题确认门。计费 Provider smoke 运行是需要在执行时明确人工批准的运维调用，而不是 UI 门。
+- 在 root 切片和原生排队前，任务状态必须保留风格/模型预览。模型 3MF 绝不是直接打印任务；root 附加通过验证的 `.gcode.3mf` 后才能原生交接。
+- 认证预览使用受控的 Bearer Blob fetch。不要暴露 Provider 临时 URL，也不要把受保护产物路由直接赋给 `<img src>`。
+- BCA 路由必须保持在 `components/Layout.tsx` 和 Bambuddy 授权/API 契约内。
+- Creator 配置属于敏感数据：Provider 端点和凭据不得泄漏到任务记录、客户端日志或预览。
 
 ## 相关文档
 
-- [中文开发 README](../README.md)
-- [English developer README](../README.en.md)
-- [中文部署指南](../DEPLOYMENT_BCA.zh-CN.md)
-- [English deployment guide](../DEPLOYMENT_BCA.md)
-- [中文工程契约](../AGENTS.zh-CN.md)
-- [English engineering contract](../AGENTS.md)
+- [English frontend guide](README.md)
+- [中文 README](../README.md)
+- [架构说明](../BCA_ARCHITECTURE.zh-CN.md)
+- [部署指南](../DEPLOYMENT_BCA.zh-CN.md)

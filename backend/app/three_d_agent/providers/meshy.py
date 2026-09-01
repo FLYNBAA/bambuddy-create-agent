@@ -9,14 +9,20 @@ import struct
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from ..config import Settings
 from ..contracts import PrintabilityMetrics, PrintabilityReport
-from ..network import UnsafeRemoteURL, assert_public_http_url, httpx_route_kwargs, proxy_route_candidates
+from ..network import (
+    UnsafeRemoteURL,
+    assert_allowed_provider_artifact_url,
+    assert_public_http_url,
+    httpx_route_kwargs,
+    proxy_route_candidates,
+)
 from .exceptions import ProviderConfigurationError, ProviderError
 
 _MAX_GLB_INPUT_BYTES = 100 * 1024 * 1024
@@ -35,9 +41,10 @@ class MeshyPrintProvider:
         self,
         session_id: str,
         model_path: Path,
-        public_route: Literal["model", "repaired-model"] = "model",
+        public_route: str = "model",
+        capability_token: str | None = None,
     ) -> PrintabilityReport:
-        source = await self._model_source(session_id, model_path, public_route)
+        source = await self._artifact_source(session_id, model_path, public_route, capability_token)
         task = await self._submit("analyze", {"model_url": source})
         completed = await self._poll("analyze", task)
         return self._printability(completed)
@@ -53,10 +60,11 @@ class MeshyPrintProvider:
         session_id: str,
         model_path: Path,
         max_colors: int,
+        capability_token: str | None = None,
     ) -> str:
-        if not 1 <= max_colors <= 16:
-            raise ProviderError("Meshy color count must be between 1 and 16.")
-        source = await self._model_source(session_id, model_path)
+        if not 1 <= max_colors <= 8:
+            raise ProviderError("Meshy color count must be between 1 and 8.")
+        source = await self._model_source(session_id, model_path, capability_token=capability_token)
         task = await self._submit(
             "multi-color",
             {"model_url": source, "max_colors": max_colors},
@@ -64,16 +72,30 @@ class MeshyPrintProvider:
         completed = await self._poll("multi-color", task)
         return self._model_url(completed, "3mf")
 
+    async def _artifact_source(
+        self,
+        session_id: str,
+        path: Path,
+        public_route: str,
+        capability_token: str | None = None,
+    ) -> str:
+        self._validate_configuration()
+        if self._settings.meshy_model_input_mode == "data_uri":
+            if path.suffix.lower() == ".3mf":
+                return await asyncio.to_thread(self._three_mf_data_uri, path)
+            return await asyncio.to_thread(self._data_uri, path)
+        if not capability_token:
+            raise ProviderConfigurationError("A Provider capability token is required for Meshy public_url mode.")
+        return self._public_model_url(session_id, public_route, capability_token)
+
     async def _model_source(
         self,
         session_id: str,
         model_path: Path,
-        public_route: Literal["model", "repaired-model"] = "model",
+        public_route: str = "model",
+        capability_token: str | None = None,
     ) -> str:
-        self._validate_configuration()
-        if self._settings.meshy_model_input_mode == "data_uri":
-            return await asyncio.to_thread(self._data_uri, model_path)
-        return self._public_model_url(session_id, public_route)
+        return await self._artifact_source(session_id, model_path, public_route, capability_token)
 
     def _data_uri(self, model_path: Path) -> str:
         try:
@@ -94,14 +116,24 @@ class MeshyPrintProvider:
             raise ProviderError("The original GLB has an invalid header.")
         return "data:model/gltf-binary;base64," + base64.b64encode(content).decode("ascii")
 
+    def _three_mf_data_uri(self, path: Path) -> str:
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise ProviderError("The calibrated 3MF could not be read for Meshy.") from exc
+        if not content or len(content) > self._settings.meshy_max_download_bytes:
+            raise ProviderError("The calibrated 3MF is empty or exceeds the Meshy input limit.")
+        return "data:model/3mf;base64," + base64.b64encode(content).decode("ascii")
+
     def _public_model_url(
         self,
         session_id: str,
-        public_route: Literal["model", "repaired-model"],
+        public_route: str,
+        capability_token: str,
     ) -> str:
         parsed = urlsplit(self._settings.app_public_base_url)
         if (
-            parsed.scheme not in {"http", "https"}
+            parsed.scheme != "https"
             or not parsed.netloc
             or parsed.username is not None
             or parsed.password is not None
@@ -109,9 +141,12 @@ class MeshyPrintProvider:
             or parsed.fragment
         ):
             raise ProviderConfigurationError(
-                "APP_PUBLIC_BASE_URL must be an absolute HTTP(S) URL for Meshy public_url mode."
+                "APP_PUBLIC_BASE_URL must be an absolute HTTPS URL for Meshy public_url mode."
             )
-        path = parsed.path.rstrip("/") + f"/api/v1/creator/sessions/{session_id}/{public_route}.glb"
+        filename = "model.glb" if public_route == "model" else "calibrated.3mf" if public_route == "provider-calibrated" else ""
+        if not filename:
+            raise ProviderConfigurationError("Unsupported Meshy public artifact route.")
+        path = parsed.path.rstrip("/") + f"/api/v1/creator/sessions/{session_id}/provider/{capability_token}/{filename}"
         public_url = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
         try:
             assert_public_http_url(public_url)
@@ -125,7 +160,7 @@ class MeshyPrintProvider:
         response = await self._request(
             "POST",
             f"/openapi/v1/print/{operation}",
-            safe_to_retry=operation == "analyze",
+            safe_to_retry=False,
             json=payload,
         )
         result = response.get("result")
@@ -241,24 +276,21 @@ class MeshyPrintProvider:
 
     def _api_base_url(self) -> str:
         try:
-            parsed = urlsplit(self._settings.meshy_base_url)
+            parsed = urlsplit(self._settings.meshy_base_url.strip())
             port = parsed.port
         except ValueError as exc:
             raise ProviderConfigurationError("MESHY_BASE_URL is invalid.") from exc
         if (
-            parsed.scheme != "https"
-            or parsed.hostname != "api.meshy.ai"
-            or port not in {None, 443}
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or port is not None and not 1 <= port <= 65535
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment
         ):
-            raise ProviderConfigurationError(
-                "MESHY_BASE_URL must be exactly https://api.meshy.ai."
-            )
-        return "https://api.meshy.ai"
+            raise ProviderConfigurationError("MESHY_BASE_URL must be an absolute HTTP(S) service URL.")
+        return self._settings.meshy_base_url.strip().rstrip("/")
 
     @staticmethod
     def _task_error(task: Mapping[str, Any]) -> str:
@@ -308,15 +340,19 @@ class MeshyPrintProvider:
             ),
         )
 
-    @staticmethod
-    def _model_url(task: Mapping[str, Any], extension: str) -> str:
+    def _model_url(self, task: Mapping[str, Any], extension: str) -> str:
         model_urls = task.get("model_urls")
         if not isinstance(model_urls, Mapping):
             raise ProviderError("Meshy task completed without a model URL.")
         url = model_urls.get(extension)
         if not isinstance(url, str) or not url:
             raise ProviderError("Meshy task completed without the requested model URL.")
-        parsed = urlsplit(url)
-        if parsed.scheme != "https" or not parsed.netloc:
-            raise ProviderError("Meshy task returned an invalid model URL.")
+        try:
+            assert_allowed_provider_artifact_url(
+                url,
+                ("meshy.ai",),
+                self._settings.meshy_base_url,
+            )
+        except UnsafeRemoteURL as exc:
+            raise ProviderError("Meshy task returned an invalid model URL.") from exc
         return url

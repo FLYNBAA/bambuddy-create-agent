@@ -5,10 +5,11 @@ imported lazily so row models and tests remain usable without a live database.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 
 class InventoryConfigurationError(RuntimeError):

@@ -11,7 +11,7 @@
 在 BCA fork 工作树中：
 
 ```bash
-docker compose up -d --build
+docker compose --env-file .env.bca up -d --build
 ```
 
 生产 Linux 默认 host networking，支持发现、Virtual Printer、相机和 LAN 协议。
@@ -19,11 +19,11 @@ docker compose up -d --build
 ### Windows Docker Desktop
 
 ```powershell
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
+docker compose --env-file .env.bca -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
 curl http://127.0.0.1:8012/health
 ```
 
-Windows bridge 模式需要通过 LAN IP 添加打印机。正常停止：
+Windows bridge 模式通过 `.env.bca` 的 `BCA_DISCOVERY_SUBNETS` 单播扫描明确的打印机 LAN CIDR，也可按 LAN IP 添加。正常停止：
 
 ```powershell
 docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
@@ -58,7 +58,7 @@ $env:DATA_DIR = "$PWD\data"
 2. 在 `/creator/settings` 填入或确认 Provider 参数和明文凭据。
 3. 记录这些配置会写入 Bambuddy 数据库的 `bca_creator_*`。
 4. 添加打印机与耗材。
-5. 在 `/creator` 建立会话并遵守付费确认门。
+5. 在 `/creator` 按直接工作流卡片完成创意、风格图、3D 概念图、打印校准、打印分析与订单推送；产品 UI 没有付费确认门。
 6. 在 `/tasks` 上传 root 切片后的 `.gcode.3mf`，再交给原生队列。
 
 BCA 安装、网络、反向代理、备份、PostgreSQL 和付费 smoke 的完整说明见 [中文部署指南](../DEPLOYMENT_BCA.zh-CN.md)。

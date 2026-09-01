@@ -60,7 +60,7 @@ GET /health
 GET /api/v1/creator/config
 ```
 
-`/api/v1/creator/config` 返回明文 Provider 值；只在受控管理员浏览器或 API 客户端访问，响应为 `private, no-store`。
+`/api/v1/creator/config` 返回明文 Provider 值，只允许具备 `SETTINGS_UPDATE` 的受控管理员浏览器访问；只读状态/API Key 不得读取，响应为 `private, no-store`。
 
 ## Docker 更新
 
@@ -69,8 +69,8 @@ GET /api/v1/creator/config
 ```bash
 # 先备份数据和数据库
 # 然后使用当前 BCA checkout 构建，而不是拉 upstream 镜像。
-docker compose build
-docker compose up -d
+docker compose --env-file .env.bca build
+docker compose --env-file .env.bca up -d
 docker compose ps
 docker compose logs -f bambuddy
 ```

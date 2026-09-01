@@ -210,7 +210,7 @@ function App() {
                   <Route path="archives" element={<ArchivesPage />} />
                   <Route path="creator" element={<CreatorPage />} />
                   <Route path="tasks" element={<TaskListPage />} />
-                  <Route path="creator/settings" element={<CreatorSettingsPage />} />
+                  <Route path="creator/settings" element={<PermissionRoute permission="settings:update"><CreatorSettingsPage /></PermissionRoute>} />
                   <Route path="queue" element={<QueuePage />} />
                   {/* Slicer Pipelines (#1425) — Pipelines tab lives on the
                       Print Queue page (Queue + History + Timeline +

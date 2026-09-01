@@ -6,7 +6,7 @@ Bambu 预设同步是 Bambuddy 原生 slicer/耗材能力。BCA 不复制预设�
 
 ## BCA 集成原则
 
-- Creator 只生成模型 3MF、几何白模或校准多色 3MF。
+- Creator 只向订单任务公开最终白色或 1–8 色校准 3MF；Meshy 中间模型不可直接进入队列。
 - root 使用 Bambuddy slicer、Slicer-API sidecar 或桌面 slicer 选择 printer/process/filament preset。
 - 最终 `.gcode.3mf` 回传 `/tasks`，BCA 只验证结构并交给原生队列。
 - BCA 多色校准耗材候选来自 Bambuddy 活动手动 spool；不由 Bambu Cloud preset 直接决定。

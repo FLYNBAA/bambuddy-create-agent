@@ -2,195 +2,72 @@
 
 [English](README.en.md) | **中文**
 
-BCA 是基于 Bambuddy 的二次开发：它将 AI 3D 创作、模型校准、任务交接嵌入 Bambuddy 的打印机、耗材、队列、权限和部署体系。它不是独立 create-agent 服务。
+BCA 是嵌入 Bambuddy 的 3D 创作工作流。用户、打印机、耗材、Library 文件、队列、认证与部署均以 Bambuddy 为准；BCA 不是第二个 create-agent 服务，也不是独立的 Agent 对话 UI。
 
-## 适用场景
-
-- 在本地 Windows、局域网 Linux 或公网 Linux 服务器上运行自托管创作与打印后台。
-- 通过对话或工作流卡片生成适合 3D 打印的模型。
-- 使用 Bambuddy 原生打印机管理、打印队列、耗材库、API Key、Webhook、相机和权限。
-- 让 root 在模型完成后上传切片结果，再安全派发到指定打印机。
-
-## 工作流
+## 直接工作流
 
 ```text
-创意文字 / 可选参考图
-  → DeepSeek 补全主体、风格、作品类型并追问缺项
-  → 明确确认生成四张效果图
-  → GPT Image 串行生成并逐张持久化候选图
-  → 选择候选图并明确确认 3D
-  → 腾讯混元生成并持久化 GLB
-  → Meshy 免费打印分析
-  → 明确确认多色模型 3MF（1–8 色槽）
-  → 几何白模 或 Bambuddy 耗材库多色校准
-  → BCA 任务清单
-  → root 上传切片后的 .gcode.3mf
-  → Bambuddy LibraryFile / PrintQueueItem
-  → 原生 FTPS + MQTT 派发
+创意展示（DeepSeek）
+  → 风格图生成（Image2）
+  → 3D 概念图/模型生成（Hunyuan）
+  → 打印校准
+      白色，或使用 Meshy 与耗材颜色匹配的 1–8 色多色校准
+      → 最终颜色校准 3MF
+  → 打印分析（Meshy + DeepSeek 评分与洞察；不提供建议）
+  → 订单任务提交
+  → root 切片并交接原生队列
 ```
 
-## 重要约束
+创作由 Creator 卡片直接驱动，而非独立 Agent 聊天产品。任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、暂空价格，以及模型和风格预览。模型 3MF 不是打印任务：root 附加 slicer 生成的 `.gcode.3mf`，BCA 验证后由 Bambuddy 执行原生队列交接。
 
-1. 图像、3D 和 Meshy 多色请求都有独立确认门；付费 POST 不会自动重试。
-2. 效果图严格使用四次串行 `n=1` 请求；每张持久化后立即可见。
-3. Meshy 拓扑修复没有暴露在 BCA UI 或 API 中。
-4. 若分析状态不是 `healthy`，继续多色生成前必须单独确认已了解问题。
-5. 重新开始创意、效果图或 3D 阶段时，旧模型的下游产物和挂起供应商 URL 会全部失效，不能再下载或交接。
-6. 几何白模和多色校准 3MF 是独立产物；原始多色 3MF 保留。
-7. BCA 模型 3MF 不能直接推送打印机。只有 root 上传并通过验证的切片 `.gcode.3mf` 才可进入原生队列。
-
-有效切片包必须包含：
+有效切片包必须同时包含：
 
 ```text
 Metadata/plate_N.gcode
 Metadata/slice_info.config
 ```
 
-## 后台页面
+## BCA 页面
 
-| 页面 | 路由 | 用途 |
+| 页面 | 路由 | 当前职责 |
 |---|---|---|
-| 3D Creator | `/creator` | 会话列表、Agent 对话、四阶段画布、候选选择、产物下载、校准和任务交接。 |
-| BCA Tasks | `/tasks` | 下载模型、上传切片文件、选择 `命名（型号）` 打印机、提交原生队列、永久删除。 |
-| Agent Services | `/creator/settings` | 填写、读取、持久化并热加载所有 Provider 参数和明文密钥。 |
-| 原生 Bambuddy 页面 | 打印机、耗材、队列等 | 保持 Bambuddy 原生行为和权限模型。 |
+| Creator | `/creator` | 直接工作流卡片、风格/模型预览、校准、分析和任务提交。 |
+| BCA Tasks | `/tasks` | 任务标题/用户/订单上下文、预览、root 切片附件、打印机选择和原生队列提交。 |
+| Creator 配置 | `/creator/settings` | Provider 凭据、模型、请求端点和运行参数。 |
+| Bambuddy 原生页面 | 打印机、耗材、Library、队列 | 唯一权威的打印机、耗材、Library 与队列行为。 |
 
-认证开启时，效果图预览通过带 Bearer token 的 Blob 请求加载；不要将受控效果图路由直接放到 `<img src>`。
+认证开启时，预览使用受控的 Bearer Blob fetch；不要暴露 Provider 临时 URL，也不要把受保护的产物路由直接作为 `<img src>`。
 
-## 本地开发（Windows）
+## Provider 配置
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
-npm --prefix .\frontend ci
-npm --prefix .\frontend run build
-$env:DATA_DIR = "$PWD\data"
-.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
-```
+Creator 配置可编辑 DeepSeek、Image2、Hunyuan 与 Meshy 的请求端点/Base URL、凭据和模型参数，其中包括 Meshy Base URL。部署初始值来自显式 `.env.bca`；BCA 不读取 source-project `.env` 或 `.env.local`。持久化的 Creator 配置属于敏感数据库数据，必须按凭据处理。
 
-浏览器访问 `http://127.0.0.1:8000`。首次使用请按你的安全策略创建本地管理员并配置认证。
+## 部署与发现
 
-## 配置与明文密钥
+- Linux Compose 从本地 BCA 源码构建本地 `bambuddy-bca:local` 镜像，并使用显式 `.env.bca` 文件。
+- Linux host-network 部署保留打印机局域网的 SSDP 发现。
+- Windows Docker Desktop 和其他 bridge 部署使用声明的 `BCA_DISCOVERY_SUBNETS` CIDR 与单播扫描，不依赖广播发现。
+- Tailscale 只提供连通性。通过外部维护的子网路由器访问打印机 LAN，或将 BCA 与打印机部署在同一 LAN。BCA 不会自行注册为子网路由器，也不提供证书。
+- 生产反向代理模板是 [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf)，它保留上游认证并转发 WebSocket 和 forwarded-request 头。
 
-- Agent Services 可直接填写、读取、持久化并热加载 DeepSeek、图像 Provider、腾讯混元和 Meshy 的全部 Provider 密钥。
-- `GET /api/v1/creator/config` 会向拥有 `SETTINGS_READ` 的调用方返回明文密钥；`PUT` 要求 `SETTINGS_UPDATE` 并立即重建 Agent Provider。
-- 明文值保存为 Bambuddy 数据库中的 `bca_creator_*` settings 行，因此数据库读取者和数据库备份持有者可读取它们。
-- BCA 不会读取 source-project 的 `.env` 或 `.env.local`。环境变量仅提供首次启动值，之后可由网页配置覆盖。
-- 不要将密钥写入普通 creator 会话、任务记录、源代码、公开文档或非受控客户端。
+支持的生产拓扑、恢复、回滚和验证步骤见[部署指南](DEPLOYMENT_BCA.zh-CN.md)。
 
-可在 Agent Services 网页填写的 Provider 密钥：
+## 备份与回滚
 
-```text
-DEEPSEEK_API_KEY
-IMAGE_API_KEY
-TENCENT_SECRET_ID
-TENCENT_SECRET_KEY
-MESHY_API_KEY
-```
+将 `DATA_DIR` 与 Bambuddy 数据库作为同一个匹配恢复点备份。其中包含 Creator 产物、任务源文件、Library/队列关系和持久化 Provider 配置。回滚时使用已知兼容的本地源码修订；若数据兼容性不明确，必须同时恢复匹配的数据库与 `DATA_DIR` 恢复点，不得单独恢复其中之一。
 
-当 `MESHY_MODEL_INPUT_MODE=public_url` 时，`BCA_PUBLIC_BASE_URL` 必须是可从公网访问的 HTTPS 地址。Meshy 只会得到受控的 GLB 能力路由：
+## 计费 Provider smoke 策略
 
-```text
-/api/v1/creator/sessions/{session_id}/model.glb
-```
-
-## Linux Docker Compose 开发
-
-`docker-compose.dev.yml` 将后端和 Vite 前端拆为两个热重载服务；源代码通过 bind mount 提供。它不使用 host networking，也不暴露虚拟打印机端口，因此不要将它用于打印机 LAN 集成或生产部署。
-
-可选地在首次启动前创建仅供开发后端使用的 Provider 环境文件：
-
-```bash
-cp .env.bca.example .env.bca
-chmod 600 .env.bca
-# 编辑 .env.bca：删除未使用的 <inject-secret> 占位符，并填写实际值
-```
-
-Compose 只将 `.env.bca` 注入 `backend` 服务，前端容器不会获得 Provider 凭据；该文件同时被 Git 和 Docker build context 忽略。仅在 `MESHY_MODEL_INPUT_MODE=public_url` 时设置可公网访问的 HTTPS `BCA_PUBLIC_BASE_URL`，本地开发应保留 `data_uri` 或删除该变量。
-
-```bash
-docker compose -f docker-compose.dev.yml up --build
-```
-
-访问 `http://127.0.0.1:5173` 开发前端；Vite 通过 `BACKEND_HOST=backend` 和 `BACKEND_PORT=8000` 将 API 和 WebSocket 请求代理到后端，未设置时原生开发仍使用 `localhost:8000`。后端健康检查为 `http://127.0.0.1:8000/health`。默认端口仅绑定 loopback；需要从 LAN 访问时，在启动前显式设置 `BCA_FRONTEND_BIND=0.0.0.0` 和/或 `BCA_BACKEND_BIND=0.0.0.0`。
-
-```bash
-docker compose -f docker-compose.dev.yml down
-```
-
-`down -v` 会删除该开发栈的 SQLite、日志和前端依赖卷；仅在确实要重置开发数据时使用。
-
-
-## Docker 与网络
-
-Linux 推荐：
-
-```bash
-docker compose up -d --build
-```
-
-Windows Docker Desktop：
-
-```powershell
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
-curl http://127.0.0.1:8012/health
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml down
-```
-
-普通停止使用 `down`；不要在已有数据的部署中使用 `down -v`，它会删除命名数据卷。Linux 默认使用 host networking，以支持发现、Virtual Printer、相机与打印机 LAN 协议。Windows bridge override 使用 `network_mode: !reset null`，请使用打印机 LAN IP，并为 SSDP 或完整被动 FTP 范围额外映射端口。
-
-## 备份与恢复
-
-必须将下列内容作为**同一恢复点**备份和恢复：
-
-1. `DATA_DIR`：包含 `bca-agent` 会话和产物、`bca-tasks` 源文件、归档和 Library 数据。
-2. Bambuddy 原生数据库：SQLite 数据文件及一致的 WAL sidecar，或外部 PostgreSQL 的完整 dump。
-3. 明文 Provider 配置：Bambuddy 数据库中的 `bca_creator_*` settings 行，以及首次启动时需要的部署环境声明。
-
-如果 `DATABASE_URL` 指向 PostgreSQL，仅备份 `DATA_DIR` 不足以恢复 BCA：`bca_tasks` 和持久化的 `bca_creator_*` 服务配置位于 Bambuddy 原生数据库。恢复时必须同时恢复数据库与对应 `DATA_DIR` 快照，避免任务行、LibraryFile、队列行与 BCA 产物脱节。
-
-## 付费 smoke 策略
-
-常规测试不得调用付费 Provider。仅在明确批准具体费用后使用：
-
-```powershell
-.\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
-  --base-url http://127.0.0.1:8000 `
-  --confirm-paid `
-  --seed-calibration-spool
-```
-
-如果分析不是 `healthy`，初次链路会在 Meshy 前停止。审阅报告后，必须恢复同一会话，不能重新生成图像或 3D：
-
-```powershell
-.\.venv\Scripts\python.exe .\backend\tools\bca_full_paid_smoke.py `
-  --base-url http://127.0.0.1:8000 `
-  --session-id <existing-session-id> `
-  --confirm-paid `
-  --acknowledge-print-issues `
-  --seed-calibration-spool
-```
-
-## 开发验证
-
-```powershell
-$env:PYTHONPATH = "."
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\ruff.exe check backend\app backend\tests
-npm --prefix .\frontend run lint
-npm --prefix .\frontend run test:run
-npm --prefix .\frontend run build
-```
+产品 UI 没有付费确认门或问题确认门。日常检查不得调用计费 Provider。只有人在调用时对该次运行及相关费用作出明确批准，才可调用计费 Provider；不得将先前的 UI 操作或可复用标志视为产品确认。打印分析只报告评分和洞察，不提供建议。
 
 ## 当前边界
 
-当前 BCA 是单进程模型。会话锁、后台任务和任务调度不能通过增加 Uvicorn worker 扩展为多进程。多用户所有权隔离、分布式锁、持久队列恢复、对象存储和可验证 Provider webhook 是后续明确实现的能力，而非当前承诺。
+BCA 当前为单进程。不得声称支持多 worker、分布式队列恢复、多用户所有权隔离、自动 Tailscale 子网路由或自动 TLS/证书配置。
 
 ## 相关文档
 
 - [English README](README.en.md)
-- [架构说明](BCA_ARCHITECTURE.md)
-- [部署说明](DEPLOYMENT_BCA.md)
-- [工程契约](AGENTS.md)
-- [文档审计](DOCUMENTATION_AUDIT.md)
-- [前端说明](frontend/README.md)
+- [架构说明](BCA_ARCHITECTURE.zh-CN.md)
+- [部署指南](DEPLOYMENT_BCA.zh-CN.md)
+- [文档审计](DOCUMENTATION_AUDIT.zh-CN.md)
+- [前端说明](frontend/README.zh-CN.md)

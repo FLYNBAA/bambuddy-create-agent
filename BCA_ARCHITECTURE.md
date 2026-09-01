@@ -1,82 +1,62 @@
 # BCA Architecture
 
-
 [中文](BCA_ARCHITECTURE.zh-CN.md) | **English**
+
 ## Scope
 
-BCA is a Bambuddy-centered, single-process backend and administration surface. Bambuddy remains the authority for printers, native queue dispatch, library files, API keys, authentication, WebSocket connections, and deployment. The embedded creator owns only creative sessions and model artifacts.
+BCA is the embedded, single-process creator workflow within Bambuddy. Bambuddy remains authoritative for identities, printers, materials, Library files, native queue dispatch, authentication, WebSocket transport, and deployment. BCA owns creator state, generated artifacts, calibration, analysis, and order-task handoff; it is neither a separate service nor a standalone agent-chat UI.
 
-## Boundaries
+## Workflow and handoff
 
 ```text
-Creator session
-  → persisted GLB
-  → Meshy model 3MF
-  → geometry-white OR inventory-calibrated 3MF
-  → BCA task list
-  → root supplies sliced .gcode.3mf
-  → Bambuddy LibraryFile
-  → Bambuddy PrintQueueItem
-  → FTPS + MQTT project_file
+Creative presentation (DeepSeek)
+  → style image (Image2)
+  → 3D concept image/model (Hunyuan)
+  → calibration: white or multicolor 1–8
+      Meshy + Bambuddy material color matching → color-calibrated 3MF
+  → analysis: Meshy + DeepSeek score and insights, without advice
+  → order task submission
+  → root attaches validated sliced .gcode.3mf
+  → Bambuddy LibraryFile and native PrintQueueItem
 ```
 
-The creator output is never queued directly. A printable file must contain both `Metadata/plate_N.gcode` and `Metadata/slice_info.config`; BCA validates these before accepting the root-supplied sliced file.
+A task preserves title, user, customer name, phone, address, notes, a nullable price (currently blank), and model/style previews while pending root slicing and queueing. Creator model 3MF files never reach a printer directly. The root-supplied sliced package must contain `Metadata/plate_N.gcode` and `Metadata/slice_info.config` before BCA can hand it to the native queue.
 
-## Backend modules
+## Creator and task responsibilities
 
-| Module | Responsibility |
+| Area | Responsibility |
 |---|---|
-| `backend/app/three_d_agent/` | Isolated creative state machine, provider protocols, artifact validation, color/geometry conversion. |
-| `backend/app/services/creator_integration.py` | Bambuddy composition boundary, task lifecycle and safe public snapshot projection. |
-| `backend/app/api/routes/creator.py` | Authenticated `/api/v1/creator` control surface. |
-| `backend/app/models/bca_task.py` | Persistent root task entries. |
-| `backend/app/api/routes/bca_tasks.py` | Task upload, sliced-file validation, and explicit queue submission. |
-| Bambuddy `library.py`, `print_queue.py`, `print_scheduler.py` | Existing authoritative slicing, queue, printer mapping and transport workflow. |
+| Creator cards | Run the direct staged workflow; show style and model previews; create calibrated artifacts, analysis, and order tasks. |
+| Calibration | Produce either a white 3MF or a 1–8-color 3MF using Meshy and Bambuddy material-color matching. The final multicolor output is the color-calibrated 3MF. |
+| Analysis | Obtain Meshy data and DeepSeek scoring/insights. It does not produce user-facing advice. |
+| BCA task | Retain title, user, order, and previews until root adds the validated slice and selects a printer. |
+| Bambuddy | Own Library files, printer selection, queue lifecycle, dispatch, cancellation, and printer state. |
 
-## Creator invariants
+## API and configuration boundary
 
-1. Only explicit image and 3D confirmation gates can invoke paid providers.
-2. Four concept images are requested serially as one paid `n=1` operation each; no paid retry is introduced.
-3. Each image is persisted and visible immediately after its own response. Authenticated browsers retrieve previews through a Bearer-authenticated Blob URL; raw image routes are not assigned directly to `<img>`.
-4. Meshy repair is intentionally not exposed by BCA.
-5. Multi-color conversion accepts `1..8` slots only. A non-`healthy` analysis requires a separate explicit issue acknowledgement before its paid request.
-6. Geometry mode normalizes all supported 3MF color metadata to white while preserving face/property references and geometry. Cancellation and process-restart recovery leave it in `failed`, never `running`.
-7. Multi-color calibration reads Bambuddy's active, non-archived manual spool inventory (`Spool.rgba`) through an async adapter. Spools without valid RGB are excluded; empty eligible inventory fails calibration without a fallback.
-8. Only a completed geometry or multi-color calibration artifact may enter `BCATask`.
-9. Restarting `brief`, `images`, or `model` clears every downstream path, state, repaired model, and pending Meshy repair/print URL. A same-model `print` restart preserves its pending download URL.
-10. Deleting a creator session removes only creator-owned local artifacts. Deleting a task never deletes a LibraryFile or an already-created Bambuddy queue item.
+Creator and task routes remain within the Bambuddy application and its authorization model. Normal artifact downloads are controlled; provider temporary URLs and server filesystem paths are not frontend contracts.
 
-## Task state machine
+The Creator configuration page (`/creator/settings`) can update provider credentials, models, and request endpoints/Base URLs for DeepSeek, Image2, Hunyuan, and Meshy, including the Meshy base URL. Deployment values seed configuration through explicit `.env.bca`; BCA does not discover source-project `.env` or `.env.local` files. Persisted provider settings are sensitive Bambuddy database data.
 
-```text
-awaiting_slice
-  → root uploads a validated sliced .gcode.3mf → ready_for_queue
-  → root chooses printer_id → queued
-```
+## Approval and safety boundary
 
-The queue handoff creates an ordinary Bambuddy `PrintQueueItem` with `manual_start=True`. Printer control, cancellation, and final lifecycle remain in Bambuddy's native Queue page.
+The product UI contains no paid confirmation or issue-acknowledgement gates. Routine verification does not invoke billed providers. Any billed-provider run requires explicit human approval for that invocation and its charges at the point of execution. This operational approval is not a workflow-card gate. Print analysis supplies score and insights without advice.
 
-## HTTP surface
+## Deployment boundary
 
-- `/api/v1/creator/*`: authenticated creator sessions, artifact download, calibration artifact-to-task handoff.
-- `/api/v1/bca-tasks/*`: root task list, sliced file attachment, fixed-printer queue submission, permanent task removal.
+Linux Compose builds the local source into `bambuddy-bca:local` and uses explicit `.env.bca`. Linux host networking retains SSDP discovery. Windows Docker Desktop and other bridge networks use declared `BCA_DISCOVERY_SUBNETS` CIDRs and unicast scans.
 
-For Meshy `public_url` input only, `/api/v1/creator/sessions/{session_id}/model.glb` is a high-entropy provider capability route. It is not included in creator snapshots; normal artifact downloads remain permission-gated.
+For a public origin or Meshy public-URL input, use the production reverse-proxy template at `deploy/nginx/bca.conf`. It preserves upstream authentication and forwards WebSocket and forwarded-request headers. Tailscale supplies network reachability only: printer-LAN access requires an external subnet router or BCA colocated on that LAN. BCA does not auto-enroll as a subnet router and does not provide certificates.
 
-These routes use Bambuddy permission dependencies; no create-agent standalone app, unscoped route, direct SQLite mutation, filesystem-path response, or provider URL is exposed.
+## Persistence, recovery, and limits
 
-## Deployment
+Back up and restore the matching `DATA_DIR` and Bambuddy database together: creator artifacts, task sources, persisted configuration, and Library/queue relationships must not diverge. Roll back only to a known-compatible local-source revision; when compatibility is uncertain, restore the matching recovery point.
 
-The existing Bambuddy Dockerfile builds React into `/static` and runs one FastAPI process. BCA adds LangChain/LangGraph/provider dependencies to `requirements.txt`; BCA artifacts are stored under `DATA_DIR/bca-agent`, and BCA task source files under `DATA_DIR/bca-tasks`.
+The current implementation remains single-process. Multi-worker scheduling, distributed locks, durable worker recovery, multi-user ownership isolation, object storage, and verified provider webhooks are not current behavior.
 
-`BCA_PUBLIC_BASE_URL` is the namespaced public origin used only when Meshy public-URL input mode needs a reachable callback path. Environment variables provide initial Provider values, but Agent Services can replace them at runtime. BCA settings do not load source-project `.env` files.
+## References
 
-### Configuration persistence
-
-All Creator Service values, including plaintext Provider credentials, are stored under `bca_creator_*` entries in Bambuddy's existing settings table and restored during FastAPI lifespan startup. `GET /api/v1/creator/config` returns plaintext values to `SETTINGS_READ` callers; `PUT` persists and hot-reloads values for `SETTINGS_UPDATE` callers. Provider base URLs remain LAN-service URL validated; malformed or unsafe values return HTTP `422`. Database backups contain persisted credentials.
-
-## Next integration layers
-
-- Add a durable LangGraph checkpoint implementation if the single-process session store is replaced with distributed workers.
-- BCA creator stage events are published as `bca_creator_session` WebSocket messages carrying the session ID. The local-root deployment broadcasts to its sole active user; multi-user filtering remains part of the future ownership migration.
-- Add migration coverage for existing SQLite/PostgreSQL databases and task ownership/user filtering before multi-user rollout.
+- [中文架构说明](BCA_ARCHITECTURE.zh-CN.md)
+- [Deployment](DEPLOYMENT_BCA.md)
+- [English README](README.en.md)
+- [Documentation audit](DOCUMENTATION_AUDIT.md)

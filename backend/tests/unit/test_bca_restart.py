@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
-import backend.app.three_d_agent.service as service_module
 from backend.app.services.creator_integration import confined_artifact
 from backend.app.three_d_agent.contracts import (
     ColorCalibrationState,
@@ -77,7 +74,7 @@ def completed_snapshot() -> SessionSnapshot:
         selected_image_index=0,
         model_path="/models/model.glb",
         print_analysis=PrintAnalysisState(status=SubworkflowStatus.SUCCEEDED, report=report),
-        print_file=PrintFileState(status=SubworkflowStatus.SUCCEEDED, max_colors=4, issues_acknowledged=True),
+        print_file=PrintFileState(status=SubworkflowStatus.SUCCEEDED, max_colors=4),
         color_calibration=ColorCalibrationState(status=SubworkflowStatus.SUCCEEDED),
         print_file_path="/print/print.3mf",
         calibrated_print_file_path="/print/calibrated.3mf",
@@ -139,6 +136,28 @@ async def test_print_restart_preserves_same_model_pending_artifacts() -> None:
     assert repository.get_pending_artifact_url("session", "print_file") == "https://meshy.ai/same-model.3mf"
 
 
+@pytest.mark.asyncio
+async def test_explicit_recalibration_discards_cached_meshy_result() -> None:
+    repository = MemoryRepository(completed_snapshot())
+    repository.save_pending_artifact_url("session", "print_file", "https://meshy.ai/old-colors.3mf")
+    agent = ThreeDPrintAgent(repository, Store(), object(), object(), object())
+
+    await agent.queue_color_calibration("session", mode="multicolor", max_colors=6)
+
+    assert repository.get_pending_artifact_url("session", "print_file") is None
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_already_queued_generation() -> None:
+    snapshot = completed_snapshot()
+    snapshot.status = SessionStatus.QUEUED_IMAGE
+    repository = MemoryRepository(snapshot)
+    agent = ThreeDPrintAgent(repository, Store(), object(), object(), object())
+
+    with pytest.raises(ValueError, match="active workflow stage"):
+        await agent.restart_from_stage("session", "brief")
+
+
 def test_recovery_marks_interrupted_main_generation_failed() -> None:
     snapshot = completed_snapshot()
     snapshot.status = SessionStatus.GENERATING_3D
@@ -151,22 +170,6 @@ def test_recovery_marks_interrupted_main_generation_failed() -> None:
 
 
 
-@pytest.mark.asyncio
-async def test_geometry_cancellation_persists_failed_status(monkeypatch) -> None:
-    repository = MemoryRepository(completed_snapshot())
-    agent = ThreeDPrintAgent(repository, Store(), object(), object(), object())
-
-    async def cancelled_to_thread(*_args, **_kwargs):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(service_module.asyncio, "to_thread", cancelled_to_thread)
-
-    with pytest.raises(asyncio.CancelledError):
-        await agent.generate_geometry_print_file("session")
-
-    assert repository.snapshot.geometry_status is SubworkflowStatus.FAILED
-    assert repository.snapshot.events[-1].stage == "geometry"
-    assert repository.snapshot.events[-1].status == "failed"
 
 
 def test_recovery_marks_interrupted_geometry_failed() -> None:

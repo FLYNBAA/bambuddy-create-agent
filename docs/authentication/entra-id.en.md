@@ -8,9 +8,9 @@ Microsoft Entra ID is a native Bambuddy authentication layer. BCA does not imple
 
 | BCA interface | Bambuddy permission |
 |---|---|
-| Read plaintext `/api/v1/creator/config` | `SETTINGS_READ` |
+| Read plaintext `/api/v1/creator/config` | `SETTINGS_UPDATE` |
 | Save and hot-reload Creator configuration | `SETTINGS_UPDATE` |
-| Operate creator and payment gates | `QUEUE_CREATE` |
+| Operate the direct creator workflow and submit orders | `QUEUE_CREATE` |
 | Download creator artifacts | `QUEUE_READ_ALL` |
 | Create/attach BCA tasks | `LIBRARY_UPLOAD` / `QUEUE_CREATE` |
 | Delete BCA tasks | `QUEUE_DELETE_ALL` |

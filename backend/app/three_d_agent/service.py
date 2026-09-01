@@ -14,7 +14,9 @@ from .contracts import (
     BriefEnricher,
     ColorMatchAssignment,
     FilamentColorMatcher,
+    GeneratedTaskTitle,
     ImageGenerator,
+    PrintAssessment,
     PrintProvider,
     SessionSnapshot,
     SessionStatus,
@@ -53,8 +55,17 @@ class _ArtifactStore(Protocol):
     def calibrated_print_file_path(self, session_id: str) -> Path: ...
 
 
+
+class PrintAssessmentProvider(Protocol):
+    async def assess_printability(self, report) -> PrintAssessment: ...
+
+
+class TaskTitleProvider(Protocol):
+    async def generate_task_title(self, brief) -> GeneratedTaskTitle: ...
+
+
 class ThreeDPrintAgent:
-    """Coordinates preparation, four-image approval, and selected-image 3D work."""
+    """Coordinates the direct card-based 3D creation workflow."""
 
     def __init__(
         self,
@@ -65,6 +76,8 @@ class ThreeDPrintAgent:
         three_d_generator: ThreeDGenerator,
         print_provider: PrintProvider | None = None,
         color_matcher: FilamentColorMatcher | None = None,
+        print_assessor: PrintAssessmentProvider | None = None,
+        task_title_provider: TaskTitleProvider | None = None,
         filament_inventory: FilamentInventoryRepository | None = None,
         inventory_colors: Callable[[], Awaitable[list[object]]] | None = None,
     ) -> None:
@@ -76,6 +89,8 @@ class ThreeDPrintAgent:
         self._print_provider = print_provider
         self._color_matcher = color_matcher
         self._filament_inventory = filament_inventory
+        self._print_assessor = print_assessor
+        self._task_title_provider = task_title_provider
         self._inventory_colors = inventory_colors
         self._session_locks: dict[str, asyncio.Lock] = {}
 
@@ -132,13 +147,6 @@ class ThreeDPrintAgent:
         self._artifact_store.delete_session(session_id)
         self._session_locks.pop(session_id, None)
 
-    def record_conversation_message(self, session_id: str, role: str, content: str) -> SessionSnapshot:
-        """Persist bounded global chat history alongside the workflow snapshot."""
-        from .conversation import append_message
-
-        snapshot = self._repository.get(session_id)
-        append_message(snapshot, role, content)
-        return self._detach(self._repository.save(snapshot))
 
     @staticmethod
     def _reset_print_subworkflow(snapshot: SessionSnapshot) -> None:
@@ -158,14 +166,22 @@ class ThreeDPrintAgent:
         self._repository.clear_pending_artifact_url(session_id, "print_file")
 
     async def restart_from_stage(self, session_id: str, stage: str) -> SessionSnapshot:
-        """Reset a safe workflow boundary without bypassing a paid confirmation."""
+        """Reset a workflow boundary and coherently discard downstream artifacts."""
         if stage not in {"brief", "images", "model", "print"}:
             raise ValueError("Restart stage must be brief, images, model, or print.")
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             snapshot = self._repository.get(session_id)
-            if snapshot.status in {SessionStatus.GENERATING_IMAGES, SessionStatus.GENERATING_3D}:
-                raise ValueError("Wait for the active generation to finish or fail before restarting.")
+            if snapshot.status in {
+                SessionStatus.QUEUED_IMAGE,
+                SessionStatus.GENERATING_IMAGES,
+                SessionStatus.QUEUED_3D,
+                SessionStatus.GENERATING_3D,
+            } or any(
+                state.status in {SubworkflowStatus.QUEUED, SubworkflowStatus.RUNNING}
+                for state in (snapshot.print_analysis, snapshot.print_file, snapshot.color_calibration)
+            ):
+                raise ValueError("Wait for the active workflow stage to finish or fail before restarting.")
             if stage == "brief":
                 snapshot.brief = type(snapshot.brief)()
                 snapshot.questions = []
@@ -180,21 +196,19 @@ class ThreeDPrintAgent:
                 snapshot.selected_image_index = None
                 snapshot.model_path = None
                 self._reset_after_model_change(session_id, snapshot)
-                snapshot.status = (
-                    SessionStatus.AWAITING_IMAGE_CONFIRMATION if snapshot.brief.is_complete else SessionStatus.NEEDS_INPUT
-                )
+                snapshot.status = SessionStatus.READY_FOR_IMAGES if snapshot.brief.is_complete else SessionStatus.NEEDS_INPUT
             elif stage == "model":
                 if len(snapshot.generated_image_paths) != 4:
                     raise ValueError("Four images are required before restarting the 3D model stage.")
                 snapshot.model_path = None
                 self._reset_after_model_change(session_id, snapshot)
-                snapshot.status = SessionStatus.AWAITING_3D_CONFIRMATION
+                snapshot.status = SessionStatus.AWAITING_IMAGE_SELECTION
             else:
                 if snapshot.status is not SessionStatus.COMPLETED:
                     raise ValueError("A completed model is required before restarting print processing.")
                 self._reset_print_subworkflow(snapshot)
             snapshot.error = None
-            self._record(snapshot, "restart", f"已从 {stage} 阶段重新开始；后续付费阶段仍需要明确确认。")
+            self._record(snapshot, "restart", f"已从 {stage} 阶段重新开始。")
             return self._detach(self._repository.save(snapshot))
     async def prepare(
         self,
@@ -204,7 +218,7 @@ class ThreeDPrintAgent:
         reference_image_content: bytes | None = None,
         reference_image_media_type: str | None = None,
     ) -> SessionSnapshot:
-        """Enrich a brief and wait for the first explicit paid-generation gate."""
+        """Enrich a brief for direct stage generation."""
         if not message.strip() and reference_image_content is None:
             raise ValueError("A preparation message or reference image is required.")
         if reference_image_name and reference_image_content is None:
@@ -212,11 +226,27 @@ class ThreeDPrintAgent:
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             snapshot = self._repository.get(session_id)
-            if snapshot.status not in {
-                SessionStatus.NEEDS_INPUT,
-                SessionStatus.AWAITING_IMAGE_CONFIRMATION,
-            }:
-                raise ValueError(f"Cannot prepare a session in status '{snapshot.status}'.")
+            active_subworkflow = any(
+                state.status in {SubworkflowStatus.QUEUED, SubworkflowStatus.RUNNING}
+                for state in (snapshot.print_analysis, snapshot.print_file, snapshot.color_calibration)
+            )
+            if snapshot.status in {
+                SessionStatus.QUEUED_IMAGE,
+                SessionStatus.GENERATING_IMAGES,
+                SessionStatus.QUEUED_3D,
+                SessionStatus.GENERATING_3D,
+            } or active_subworkflow:
+                raise ValueError("Wait for the active workflow stage to finish before redoing the creative brief.")
+            if snapshot.status not in {SessionStatus.NEEDS_INPUT, SessionStatus.READY_FOR_IMAGES}:
+                snapshot.brief = type(snapshot.brief)()
+                snapshot.questions = []
+                snapshot.image_prompt = None
+                snapshot.reference_image_path = None
+                snapshot.generated_image_paths = []
+                snapshot.selected_image_index = None
+                snapshot.model_path = None
+                self._reset_after_model_change(session_id, snapshot)
+                snapshot.status = SessionStatus.NEEDS_INPUT
 
             if reference_image_content is not None:
                 reference_path = self._artifact_store.save_reference(
@@ -252,27 +282,38 @@ class ThreeDPrintAgent:
             snapshot.image_prompt = result["image_prompt"]
             snapshot.error = None
             if snapshot.brief.is_complete:
-                snapshot.status = SessionStatus.AWAITING_IMAGE_CONFIRMATION
-                self._record(snapshot, "preparation", "创作信息已完整，等待确认四张效果图生成。")
+                snapshot.status = SessionStatus.READY_FOR_IMAGES
+                self._record(snapshot, "preparation", "创作信息已完整，可以生成四张效果图。")
             else:
                 snapshot.status = SessionStatus.NEEDS_INPUT
                 self._record(snapshot, "preparation", "仍需补充创作信息。")
             return self._detach(self._repository.save(snapshot))
 
     async def queue_image_generation(self, session_id: str) -> SessionSnapshot:
-        """Open the first paid gate; only this method permits image provider work."""
+        """Queue image generation, resetting every downstream stage on redo."""
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             snapshot = self._repository.get(session_id)
-            if (
-                snapshot.status is not SessionStatus.AWAITING_IMAGE_CONFIRMATION
-                or not snapshot.brief.is_complete
-                or not snapshot.image_prompt
+            if snapshot.status in {
+                SessionStatus.QUEUED_IMAGE,
+                SessionStatus.GENERATING_IMAGES,
+                SessionStatus.QUEUED_3D,
+                SessionStatus.GENERATING_3D,
+            } or any(
+                state.status in {SubworkflowStatus.QUEUED, SubworkflowStatus.RUNNING}
+                for state in (snapshot.print_analysis, snapshot.print_file, snapshot.color_calibration)
             ):
-                raise ValueError("A complete prepared brief must be explicitly confirmed first.")
+                raise ValueError("Wait for the active workflow stage to finish before regenerating style images.")
+            if not snapshot.brief.is_complete or not snapshot.image_prompt:
+                raise ValueError("A complete prepared brief is required before image generation.")
+            if snapshot.status is not SessionStatus.READY_FOR_IMAGES:
+                snapshot.generated_image_paths = []
+                snapshot.selected_image_index = None
+                snapshot.model_path = None
+                self._reset_after_model_change(session_id, snapshot)
             snapshot.status = SessionStatus.QUEUED_IMAGE
             snapshot.error = None
-            self._record(snapshot, "image_confirmation", "已确认付费生成四张效果图，任务进入队列。")
+            self._record(snapshot, "images", "效果图生成任务已进入队列。")
             return self._detach(self._repository.save(snapshot))
 
     async def run_image_generation(self, session_id: str) -> SessionSnapshot:
@@ -285,7 +326,6 @@ class ThreeDPrintAgent:
                 and snapshot.status
                 in {
                     SessionStatus.AWAITING_IMAGE_SELECTION,
-                    SessionStatus.AWAITING_3D_CONFIRMATION,
                     SessionStatus.QUEUED_3D,
                     SessionStatus.GENERATING_3D,
                     SessionStatus.COMPLETED,
@@ -293,7 +333,7 @@ class ThreeDPrintAgent:
             ):
                 return self._detach(snapshot)
             if snapshot.status is not SessionStatus.QUEUED_IMAGE:
-                raise ValueError("Image generation can only run after explicit image confirmation.")
+                raise ValueError("Image generation can only run after it is queued.")
             try:
                 snapshot.status = SessionStatus.GENERATING_IMAGES
                 self._record(snapshot, "image", "正在生成四张适配彩色 3D 打印的效果图。")
@@ -341,39 +381,32 @@ class ThreeDPrintAgent:
                 self._fail(snapshot, "image", exc)
             return self._detach(self._repository.save(snapshot))
 
-    async def select_image(self, session_id: str, image_index: int) -> SessionSnapshot:
-        """Choose or re-choose a persisted candidate before the second gate queues."""
+    async def queue_3d_generation(self, session_id: str, image_index: int) -> SessionSnapshot:
+        """Select one persisted style image and queue 3D generation or redo."""
         if image_index not in range(4):
             raise ValueError("Image index must be between 0 and 3.")
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             snapshot = self._repository.get(session_id)
-            if snapshot.status not in {
-                SessionStatus.AWAITING_IMAGE_SELECTION,
-                SessionStatus.AWAITING_3D_CONFIRMATION,
-            }:
-                raise ValueError("An image can only be selected before 3D generation is queued.")
-            if len(snapshot.generated_image_paths) != 4:
-                raise ValueError("Exactly four persisted images are required before selection.")
-            snapshot.selected_image_index = image_index
-            snapshot.status = SessionStatus.AWAITING_3D_CONFIRMATION
-            self._record(snapshot, "image_selection", f"已选择第 {image_index + 1} 张效果图，等待确认 3D 生成。")
-            return self._detach(self._repository.save(snapshot))
-
-    async def queue_3d_generation(self, session_id: str) -> SessionSnapshot:
-        """Open the second paid gate for the selected and persisted image only."""
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            snapshot = self._repository.get(session_id)
-            if (
-                snapshot.status is not SessionStatus.AWAITING_3D_CONFIRMATION
-                or snapshot.selected_image_index is None
-                or len(snapshot.generated_image_paths) != 4
+            if snapshot.status in {
+                SessionStatus.QUEUED_IMAGE,
+                SessionStatus.GENERATING_IMAGES,
+                SessionStatus.QUEUED_3D,
+                SessionStatus.GENERATING_3D,
+            } or any(
+                state.status in {SubworkflowStatus.QUEUED, SubworkflowStatus.RUNNING}
+                for state in (snapshot.print_analysis, snapshot.print_file, snapshot.color_calibration)
             ):
-                raise ValueError("A selected image must be explicitly confirmed before 3D generation.")
+                raise ValueError("Wait for the active workflow stage to finish before regenerating the 3D concept.")
+            if len(snapshot.generated_image_paths) != 4:
+                raise ValueError("Exactly four generated images are required before 3D generation.")
+            if snapshot.model_path or snapshot.status is not SessionStatus.AWAITING_IMAGE_SELECTION:
+                snapshot.model_path = None
+                self._reset_after_model_change(session_id, snapshot)
+            snapshot.selected_image_index = image_index
             snapshot.status = SessionStatus.QUEUED_3D
             snapshot.error = None
-            self._record(snapshot, "model_confirmation", "已确认付费 3D 生成，任务进入队列。")
+            self._record(snapshot, "model", f"第 {image_index + 1} 张效果图的 3D 生成任务已进入队列。")
             return self._detach(self._repository.save(snapshot))
 
     async def run_3d_generation(self, session_id: str) -> SessionSnapshot:
@@ -384,7 +417,7 @@ class ThreeDPrintAgent:
             if snapshot.status is SessionStatus.COMPLETED:
                 return self._detach(snapshot)
             if snapshot.status is not SessionStatus.QUEUED_3D:
-                raise ValueError("3D generation can only run after explicit 3D confirmation.")
+                raise ValueError("3D generation can only run after it is queued.")
             if snapshot.selected_image_index is None or len(snapshot.generated_image_paths) != 4:
                 raise ValueError("The selected image is unavailable.")
             image_path = Path(snapshot.generated_image_paths[snapshot.selected_image_index])
@@ -416,19 +449,17 @@ class ThreeDPrintAgent:
             return self._detach(self._repository.save(snapshot))
 
     async def queue_print_analysis(self, session_id: str) -> SessionSnapshot:
+        """Queue or redo Meshy GLB analysis after final calibration."""
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             snapshot = self._repository.get(session_id)
-            if snapshot.status is not SessionStatus.COMPLETED or not snapshot.model_path:
-                raise ValueError("A completed GLB model is required before print analysis.")
-            if snapshot.print_analysis.status not in {
-                SubworkflowStatus.NOT_STARTED,
-                SubworkflowStatus.FAILED,
-            }:
-                raise ValueError("Print analysis is already queued or complete.")
+            if snapshot.color_calibration.status is not SubworkflowStatus.SUCCEEDED or not snapshot.calibrated_print_file_path:
+                raise ValueError("Final calibration must complete before print analysis.")
+            if snapshot.print_analysis.status in {SubworkflowStatus.QUEUED, SubworkflowStatus.RUNNING}:
+                raise ValueError("Print analysis is already queued or running.")
+            snapshot.print_analysis = type(snapshot.print_analysis)()
             snapshot.print_analysis.status = SubworkflowStatus.QUEUED
-            snapshot.print_analysis.error = None
-            self._record_sub(snapshot, "print_analysis", "queued", "已提交免费可打印性分析。")
+            self._record_sub(snapshot, "print_analysis", "queued", "已提交校准后打印分析。")
             return self._detach(self._repository.save(snapshot))
 
     async def run_print_analysis(self, session_id: str) -> SessionSnapshot:
@@ -437,21 +468,33 @@ class ThreeDPrintAgent:
             snapshot = self._repository.get(session_id)
             if snapshot.print_analysis.status is SubworkflowStatus.SUCCEEDED:
                 return self._detach(snapshot)
-            if snapshot.print_analysis.status is not SubworkflowStatus.QUEUED or not snapshot.model_path:
-                raise ValueError("Print analysis can only run after it is queued.")
+            if (
+                snapshot.print_analysis.status is not SubworkflowStatus.QUEUED
+                or not snapshot.calibrated_print_file_path
+                or not snapshot.model_path
+            ):
+                raise ValueError("Print analysis can only run after final calibration is queued.")
             snapshot.print_analysis.status = SubworkflowStatus.RUNNING
-            self._record_sub(snapshot, "print_analysis", "running", "正在分析 GLB 的可打印性。")
+            self._record_sub(snapshot, "print_analysis", "running", "正在执行 Meshy 模型分析和 DeepSeek 评估。")
             self._repository.save(snapshot)
             try:
-                report = await self._print_provider_for_use().analyze(session_id, Path(snapshot.model_path))
+                report = await self._print_provider_for_use().analyze(
+                    session_id,
+                    Path(snapshot.model_path),
+                    public_route="model",
+                    capability_token=snapshot.provider_capability_token,
+                )
+                assessment = await self._print_assessor_for_use().assess_printability(report)
                 snapshot = self._repository.get(session_id)
                 snapshot.print_analysis.status = SubworkflowStatus.SUCCEEDED
                 snapshot.print_analysis.report = report
+                snapshot.print_analysis.score = assessment.score
+                snapshot.print_analysis.insights = assessment.insights
                 snapshot.print_analysis.error = None
-                self._record_sub(snapshot, "print_analysis", "succeeded", "可打印性分析已完成。")
+                self._record_sub(snapshot, "print_analysis", "succeeded", "校准后打印分析和质量评估已完成。")
             except asyncio.CancelledError:
                 snapshot = self._repository.get(session_id)
-                self._fail_sub(snapshot, "print_analysis", "服务停止，可打印性分析已中断。")
+                self._fail_sub(snapshot, "print_analysis", "服务停止，打印分析已中断。")
                 self._repository.save(snapshot)
                 raise
             except Exception as exc:
@@ -459,282 +502,116 @@ class ThreeDPrintAgent:
                 self._fail_sub(snapshot, "print_analysis", f"{type(exc).__name__}: {exc}")
             return self._detach(self._repository.save(snapshot))
 
-    async def queue_model_repair(self, session_id: str) -> SessionSnapshot:
+    async def queue_color_calibration(self, session_id: str, *, mode: str, max_colors: int) -> SessionSnapshot:
+        """Queue conversion and final calibration, resetting prior downstream results on redo."""
+        if mode not in {"white", "multicolor"} or not 1 <= max_colors <= 8:
+            raise ValueError("Calibration requires white or multicolor mode and 1–8 colors.")
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             snapshot = self._repository.get(session_id)
-            report = snapshot.print_analysis.report
-            if (
-                snapshot.status is not SessionStatus.COMPLETED
-                or not snapshot.model_path
-                or snapshot.print_analysis.status is not SubworkflowStatus.SUCCEEDED
-                or report is None
-                or report.status == "healthy"
+            if snapshot.status is not SessionStatus.COMPLETED or not snapshot.model_path:
+                raise ValueError("A completed GLB model is required before calibration.")
+            if any(
+                state.status in {SubworkflowStatus.QUEUED, SubworkflowStatus.RUNNING}
+                for state in (snapshot.print_analysis, snapshot.print_file, snapshot.color_calibration)
             ):
-                raise ValueError("Repair requires a completed analysis that found printability issues.")
-            if snapshot.model_repair.status not in {
-                SubworkflowStatus.NOT_STARTED,
-                SubworkflowStatus.FAILED,
-            }:
-                raise ValueError("Model repair is already queued or complete.")
-            snapshot.model_repair.status = SubworkflowStatus.QUEUED
-            snapshot.model_repair.error = None
-            self._record_sub(snapshot, "model_repair", "queued", "已确认付费拓扑修复任务。")
-            return self._detach(self._repository.save(snapshot))
-
-    async def run_model_repair(self, session_id: str) -> SessionSnapshot:
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            snapshot = self._repository.get(session_id)
-            if snapshot.model_repair.status is SubworkflowStatus.SUCCEEDED:
-                return self._detach(snapshot)
-            if snapshot.model_repair.status is not SubworkflowStatus.QUEUED or not snapshot.model_path:
-                raise ValueError("Model repair can only run after it is queued.")
-            snapshot.model_repair.status = SubworkflowStatus.RUNNING
-            self._record_sub(snapshot, "model_repair", "running", "正在修复 GLB 拓扑；修复件不保留纹理。")
-            self._repository.save(snapshot)
-            try:
-                provider = self._print_provider_for_use()
-                original_model = Path(snapshot.model_path)
-                repaired_path = (
-                    Path(snapshot.repaired_model_path)
-                    if snapshot.repaired_model_path
-                    else None
-                )
-                if repaired_path is None or not repaired_path.is_file():
-                    repaired_url = self._repository.get_pending_artifact_url(session_id, "repair")
-                    if repaired_url is None:
-                        repaired_url = await provider.repair(session_id, original_model)
-                        self._repository.save_pending_artifact_url(
-                            session_id, "repair", repaired_url
-                        )
-                    repaired_path = await self._artifact_store.download_repaired_model(
-                        session_id, repaired_url
-                    )
-                    snapshot = self._repository.get(session_id)
-                    snapshot.repaired_model_path = str(repaired_path)
-                    self._repository.clear_pending_artifact_url(session_id, "repair")
-                    self._record_sub(
-                        snapshot,
-                        "model_repair",
-                        "running",
-                        "修复 GLB 已保存，正在执行免费复检。",
-                    )
-                    self._repository.save(snapshot)
-                repaired_report = await provider.analyze(
-                    session_id, repaired_path, public_route="repaired-model"
-                )
-                snapshot = self._repository.get(session_id)
-                snapshot.model_repair.status = SubworkflowStatus.SUCCEEDED
-                snapshot.model_repair.report = repaired_report
-                snapshot.model_repair.textures_preserved = False
-                snapshot.model_repair.error = None
-                self._record_sub(snapshot, "model_repair", "succeeded", "拓扑修复和复检已完成；修复件不保留纹理。")
-            except asyncio.CancelledError:
-                snapshot = self._repository.get(session_id)
-                self._fail_sub(snapshot, "model_repair", "服务停止，拓扑修复任务已中断。")
-                self._repository.save(snapshot)
-                raise
-            except Exception as exc:
-                snapshot = self._repository.get(session_id)
-                self._fail_sub(snapshot, "model_repair", f"{type(exc).__name__}: {exc}")
-            return self._detach(self._repository.save(snapshot))
-
-    async def queue_print_file(
-        self,
-        session_id: str,
-        max_colors: int = 4,
-        acknowledge_issues: bool = False,
-    ) -> SessionSnapshot:
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            snapshot = self._repository.get(session_id)
-            report = snapshot.print_analysis.report
-            if (
-                snapshot.status is not SessionStatus.COMPLETED
-                or not snapshot.model_path
-                or snapshot.print_analysis.status is not SubworkflowStatus.SUCCEEDED
-                or report is None
-            ):
-                raise ValueError("A completed printability analysis is required before 3MF generation.")
-            if not 1 <= max_colors <= 16:
-                raise ValueError("Invalid multi-color print settings.")
-            if report.status != "healthy" and not acknowledge_issues:
-                raise ValueError("Printability issues must be explicitly acknowledged before 3MF generation.")
-            if snapshot.print_file.status not in {
-                SubworkflowStatus.NOT_STARTED,
-                SubworkflowStatus.FAILED,
-            }:
-                raise ValueError("3MF generation is already queued or complete.")
+                raise ValueError("Wait for the active print stage to finish before recalibrating.")
+            # Recalibration is an explicit user redo with potentially different
+            # mode/color inputs; never reuse a prior Meshy result URL.
+            self._repository.clear_pending_artifact_url(session_id, "print_file")
+            snapshot.print_analysis = type(snapshot.print_analysis)()
+            snapshot.print_file = type(snapshot.print_file)()
+            snapshot.color_calibration = type(snapshot.color_calibration)()
+            snapshot.print_file_path = None
+            snapshot.calibrated_print_file_path = None
             snapshot.print_file.status = SubworkflowStatus.QUEUED
-            snapshot.print_file.max_colors = max_colors
-            snapshot.print_file.issues_acknowledged = acknowledge_issues
-            snapshot.print_file.error = None
-            self._record_sub(snapshot, "print_file", "queued", "已确认付费多色 3MF 生成任务。")
-            return self._detach(self._repository.save(snapshot))
-
-    async def run_print_file(self, session_id: str) -> SessionSnapshot:
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            snapshot = self._repository.get(session_id)
-            if snapshot.print_file.status is SubworkflowStatus.SUCCEEDED:
-                return self._detach(snapshot)
-            if (
-                snapshot.print_file.status is not SubworkflowStatus.QUEUED
-                or not snapshot.model_path
-                or snapshot.print_file.max_colors is None
-            ):
-                raise ValueError("3MF generation can only run after it is queued.")
-            snapshot.print_file.status = SubworkflowStatus.RUNNING
-            self._record_sub(snapshot, "print_file", "running", "正在以原始含纹理 GLB 生成多色 3MF。")
-            self._repository.save(snapshot)
-            try:
-                file_url = self._repository.get_pending_artifact_url(session_id, "print_file")
-                if file_url is None:
-                    file_url = await self._print_provider_for_use().multi_color(
-                        session_id, Path(snapshot.model_path), snapshot.print_file.max_colors
-                    )
-                    self._repository.save_pending_artifact_url(session_id, "print_file", file_url)
-                file_path = await self._artifact_store.download_print_file(session_id, file_url)
-                snapshot = self._repository.get(session_id)
-                snapshot.print_file.status = SubworkflowStatus.SUCCEEDED
-                snapshot.print_file_path = str(file_path)
-                snapshot.print_file.error = None
-                self._repository.clear_pending_artifact_url(session_id, "print_file")
-                self._record_sub(snapshot, "print_file", "succeeded", "多色 3MF 已保存；始终使用原始含纹理 GLB。")
-            except asyncio.CancelledError:
-                snapshot = self._repository.get(session_id)
-                self._fail_sub(snapshot, "print_file", "服务停止，多色 3MF 生成已中断。")
-                self._repository.save(snapshot)
-                raise
-            except Exception as exc:
-                snapshot = self._repository.get(session_id)
-                self._fail_sub(snapshot, "print_file", f"{type(exc).__name__}: {exc}")
-            return self._detach(self._repository.save(snapshot))
-
-    async def generate_geometry_print_file(self, session_id: str) -> SessionSnapshot:
-        """Create a safe single-white-material copy of the persisted model 3MF."""
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            snapshot = self._repository.get(session_id)
-            if snapshot.status is not SessionStatus.COMPLETED or not snapshot.print_file_path:
-                raise ValueError("A completed persisted 3MF is required before geometry conversion.")
-            if snapshot.geometry_status is SubworkflowStatus.RUNNING:
-                raise ValueError("Geometry conversion is already running.")
-            source_path = Path(snapshot.print_file_path)
-            configured_path = getattr(self._artifact_store, "geometry_print_file_path", None)
-            output_path = configured_path(session_id) if configured_path is not None else source_path.with_name("print-geometry.3mf")
-            snapshot.geometry_status = SubworkflowStatus.RUNNING
-            self._record_sub(snapshot, "geometry", "running", "正在生成仅保留几何信息的白色 3MF。")
-            self._repository.save(snapshot)
-            try:
-                await asyncio.to_thread(geometry_only_3mf, source_path, output_path=output_path)
-                snapshot = self._repository.get(session_id)
-                snapshot.geometry_print_file_path = str(output_path)
-                snapshot.geometry_status = SubworkflowStatus.SUCCEEDED
-                self._record_sub(snapshot, "geometry", "succeeded", "几何模式 3MF 已保存。")
-            except asyncio.CancelledError:
-                snapshot = self._repository.get(session_id)
-                snapshot.geometry_status = SubworkflowStatus.FAILED
-                self._record_sub(snapshot, "geometry", "failed", "服务停止，几何模式转换已中断。")
-                self._repository.save(snapshot)
-                raise
-            except Exception as exc:
-                snapshot = self._repository.get(session_id)
-                snapshot.geometry_status = SubworkflowStatus.FAILED
-                self._record_sub(snapshot, "geometry", "failed", f"{type(exc).__name__}: {exc}")
-            return self._detach(self._repository.save(snapshot))
-
-    async def queue_color_calibration(self, session_id: str) -> SessionSnapshot:
-        """Queue local/AI calibration after the original 3MF has been persisted."""
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            snapshot = self._repository.get(session_id)
-            if (
-                snapshot.status is not SessionStatus.COMPLETED
-                or snapshot.print_file.status is not SubworkflowStatus.SUCCEEDED
-                or not snapshot.print_file_path
-            ):
-                raise ValueError("A completed persisted 3MF is required before color calibration.")
-            if snapshot.color_calibration.status not in {
-                SubworkflowStatus.NOT_STARTED,
-                SubworkflowStatus.FAILED,
-            }:
-                raise ValueError("Color calibration is already queued or complete.")
+            snapshot.print_file.max_colors = 1 if mode == "white" else max_colors
             snapshot.color_calibration.status = SubworkflowStatus.QUEUED
-            snapshot.color_calibration.error = None
-            self._record_sub(snapshot, "color_calibration", "queued", "已提交本地色彩校准任务。")
+            snapshot.color_calibration.mode = mode
+            snapshot.error = None
+            self._record_sub(snapshot, "color_calibration", "queued", "已提交最终 3MF 校准任务。")
             return self._detach(self._repository.save(snapshot))
 
     async def run_color_calibration(self, session_id: str) -> SessionSnapshot:
-        """Map every source 3MF color to active inventory and atomically write a copy."""
+        """Create Meshy's 3MF then write only its final calibrated local derivative."""
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             snapshot = self._repository.get(session_id)
             if snapshot.color_calibration.status is SubworkflowStatus.SUCCEEDED:
                 return self._detach(snapshot)
-            if (
-                snapshot.color_calibration.status is not SubworkflowStatus.QUEUED
-                or not snapshot.print_file_path
-            ):
+            if snapshot.color_calibration.status is not SubworkflowStatus.QUEUED or not snapshot.model_path or snapshot.print_file.max_colors is None:
                 raise ValueError("Color calibration can only run after it is queued.")
+            mode = snapshot.color_calibration.mode
+            if mode is None:
+                raise ValueError("Calibration mode is unavailable.")
             snapshot.color_calibration.status = SubworkflowStatus.RUNNING
-            self._record_sub(snapshot, "color_calibration", "running", "正在检查 3MF 颜色并匹配可用耗材。")
+            snapshot.print_file.status = SubworkflowStatus.RUNNING
+            self._record_sub(snapshot, "color_calibration", "running", "正在生成并校准最终 3MF。")
             self._repository.save(snapshot)
+            temporary_path: Path | None = None
             try:
-                source_path = Path(snapshot.print_file_path)
-                inspection = await asyncio.to_thread(inspect_3mf, source_path)
-                snapshot = self._repository.get(session_id)
-                snapshot.color_calibration.source_colors = [item.source_color for item in inspection.colors]
-                self._repository.save(snapshot)
-                records = await self._inventory_records_for_use()
-                colors = [
-                    InventoryColor(
-                        id=str(record.id),
-                        name=record.name,
-                        material=record.material,
-                        brand=record.brand,
-                        hex_srgb=record.hex_srgb or "",
+                file_url = self._repository.get_pending_artifact_url(session_id, "print_file")
+                if file_url is None:
+                    file_url = await self._print_provider_for_use().multi_color(
+                        session_id,
+                        Path(snapshot.model_path),
+                        snapshot.print_file.max_colors,
+                        capability_token=snapshot.provider_capability_token,
                     )
-                    for record in records
-                ]
-                if not colors or not inspection.colors:
-                    raise ValueError("3MF colors and active inventory are required for calibration.")
-                payload = [{"source_color": c.source_color, "occurrence_count": c.occurrence_count} for c in inspection.colors]
-                inventory = [{"inventory_id": str(r.id), "name": r.name, "hex_srgb": r.hex_srgb, "material": r.material, "brand": r.brand, "aliases": list(r.aliases)} for r in records]
-                raw = await self._color_matcher_for_use().match_colors(payload, inventory)
-                assignments = [ColorMatchAssignment.model_validate(item) for item in raw]
-                inventory_by_id = {item.id: item for item in colors}
-                assignments = [
-                    assignment.model_copy(
-                        update={
-                            "inventory_name": inventory_by_id.get(assignment.inventory_id).name
-                            if inventory_by_id.get(assignment.inventory_id) else None,
-                            "matched_hex_srgb": inventory_by_id.get(assignment.inventory_id).hex_srgb.upper()
-                            if inventory_by_id.get(assignment.inventory_id) else None,
-                        }
-                    )
-                    for assignment in assignments
-                ]
-                output_path = self._calibrated_print_file_path(session_id, source_path)
-                await asyncio.to_thread(calibrate_3mf, source_path, colors, [ColorAssignment(a.source_color, a.inventory_id, a.rationale) for a in assignments], output_path=output_path)
+                    self._repository.save_pending_artifact_url(session_id, "print_file", file_url)
+                temporary_path = await self._artifact_store.download_print_file(session_id, file_url)
                 snapshot = self._repository.get(session_id)
+                output_path = self._calibrated_print_file_path(session_id, temporary_path)
+                if mode == "white":
+                    await asyncio.to_thread(geometry_only_3mf, temporary_path, output_path=output_path)
+                    assignments: list[ColorMatchAssignment] = []
+                    source_colors: list[str] = []
+                else:
+                    inspection = await asyncio.to_thread(inspect_3mf, temporary_path)
+                    records = await self._inventory_records_for_use()
+                    colors = [InventoryColor(id=str(record.id), name=record.name, material=record.material, brand=record.brand, hex_srgb=record.hex_srgb or "") for record in records]
+                    if not colors or not inspection.colors:
+                        raise ValueError("3MF colors and active inventory are required for calibration.")
+                    raw = await self._color_matcher_for_use().match_colors(
+                        [{"source_color": item.source_color, "occurrence_count": item.occurrence_count} for item in inspection.colors],
+                        [{"inventory_id": str(record.id), "name": record.name, "hex_srgb": record.hex_srgb, "material": record.material, "brand": record.brand, "aliases": list(record.aliases)} for record in records],
+                    )
+                    inventory_by_id = {item.id: item for item in colors}
+                    assignments = [ColorMatchAssignment.model_validate(item).model_copy(update={"inventory_name": inventory_by_id.get(str(item.inventory_id)).name if inventory_by_id.get(str(item.inventory_id)) else None, "matched_hex_srgb": inventory_by_id.get(str(item.inventory_id)).hex_srgb.upper() if inventory_by_id.get(str(item.inventory_id)) else None}) for item in raw]
+                    await asyncio.to_thread(calibrate_3mf, temporary_path, colors, [ColorAssignment(item.source_color, item.inventory_id, item.rationale) for item in assignments], output_path=output_path)
+                    source_colors = [item.source_color for item in inspection.colors]
+                snapshot = self._repository.get(session_id)
+                snapshot.print_file.status = SubworkflowStatus.SUCCEEDED
+                snapshot.print_file_path = None
+                snapshot.print_file.error = None
                 snapshot.color_calibration.status = SubworkflowStatus.SUCCEEDED
-                snapshot.color_calibration.source_colors = [c.source_color for c in inspection.colors]
+                snapshot.color_calibration.source_colors = source_colors
                 snapshot.color_calibration.assignments = assignments
                 snapshot.color_calibration.error = None
                 snapshot.calibrated_print_file_path = str(output_path)
-                self._record_sub(snapshot, "color_calibration", "succeeded", "色彩校准 3MF 已保存；原始文件未修改。")
+                self._repository.clear_pending_artifact_url(session_id, "print_file")
+                self._record_sub(snapshot, "color_calibration", "succeeded", "最终校准 3MF 已保存。")
             except asyncio.CancelledError:
                 snapshot = self._repository.get(session_id)
                 self._fail_sub(snapshot, "color_calibration", "服务停止，色彩校准任务已中断。")
+                self._fail_sub(snapshot, "print_file", "服务停止，3MF 生成已中断。")
                 self._repository.save(snapshot)
                 raise
             except Exception as exc:
                 snapshot = self._repository.get(session_id)
                 self._fail_sub(snapshot, "color_calibration", f"{type(exc).__name__}: {exc}")
+                self._fail_sub(snapshot, "print_file", f"{type(exc).__name__}: {exc}")
+            finally:
+                if temporary_path is not None:
+                    await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
             return self._detach(self._repository.save(snapshot))
 
+
+    async def generate_task_title(self, session_id: str) -> str:
+        """Generate a concise title from the persisted creative brief."""
+        snapshot = self._repository.get(session_id)
+        title = await self._task_title_provider_for_use().generate_task_title(snapshot.brief)
+        return title.title.strip()
 
     def _calibrated_print_file_path(self, session_id: str, source_path: Path) -> Path:
         configured_path = getattr(self._artifact_store, "calibrated_print_file_path", None)
@@ -758,6 +635,16 @@ class ThreeDPrintAgent:
         if self._color_matcher is None:
             raise RuntimeError("DeepSeek color matcher is not configured.")
         return self._color_matcher
+
+    def _print_assessor_for_use(self) -> PrintAssessmentProvider:
+        if self._print_assessor is None:
+            raise RuntimeError("DeepSeek print assessor is not configured.")
+        return self._print_assessor
+
+    def _task_title_provider_for_use(self) -> TaskTitleProvider:
+        if self._task_title_provider is None:
+            raise RuntimeError("DeepSeek task title generator is not configured.")
+        return self._task_title_provider
 
     def _active_inventory_for_use(self) -> FilamentInventoryRepository:
         if self._filament_inventory is None:

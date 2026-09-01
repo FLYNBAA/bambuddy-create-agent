@@ -58,7 +58,7 @@ GET /health
 GET /api/v1/creator/config
 ```
 
-`/api/v1/creator/config` returns plaintext Provider values. Access it only from controlled administrator browsers or API clients; it is `private, no-store`.
+`/api/v1/creator/config` returns plaintext Provider values only to controlled administrators with `SETTINGS_UPDATE`; read-only status/API-key scopes cannot retrieve it. Responses are `private, no-store`.
 
 ## Updating Docker
 
@@ -67,8 +67,8 @@ From the BCA repository root:
 ```bash
 # Back up data and the database first.
 # Build the current BCA checkout; do not pull an upstream-only image.
-docker compose build
-docker compose up -d
+docker compose --env-file .env.bca build
+docker compose --env-file .env.bca up -d
 docker compose ps
 docker compose logs -f bambuddy
 ```

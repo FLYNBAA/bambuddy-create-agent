@@ -9,7 +9,7 @@ BCA is built from the current `bambuddy-create-agent` working tree. Do not pull 
 Linux:
 
 ```bash
-docker compose up -d --build
+docker compose --env-file .env.bca up -d --build
 docker compose ps
 docker compose logs -f bambuddy
 ```
@@ -17,7 +17,7 @@ docker compose logs -f bambuddy
 Windows Docker Desktop:
 
 ```powershell
-docker compose -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
+docker compose --env-file .env.bca -f .\docker-compose.yml -f .\docker-compose.windows.yml up -d --build
 curl http://127.0.0.1:8012/health
 ```
 
@@ -40,6 +40,6 @@ With external PostgreSQL, the database is not in `/app/data`. Back up the Postgr
 
 ## Networking
 
-Linux defaults to host networking. Windows Docker Desktop uses bridge override and requires manual printer LAN IP setup plus extra mappings where Virtual Printer/passive FTP capabilities are needed.
+Linux defaults to host networking and retains SSDP. Windows Docker Desktop uses the bridge override; `BCA_DISCOVERY_SUBNETS` in `.env.bca` enables unicast scanning of explicit private/Tailscale-routed CIDRs, while Virtual Printer/passive FTP still needs deliberate extra port mappings.
 
 See the full [English deployment guide](DEPLOYMENT_BCA.md) for reverse proxy, plaintext configuration, backup, and smoke policy.

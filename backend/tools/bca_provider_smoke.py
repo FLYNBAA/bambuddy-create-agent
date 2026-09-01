@@ -20,10 +20,11 @@ async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--api-key", default=os.environ.get("BCA_SMOKE_API_KEY", ""))
+    parser.add_argument("--token", default=os.environ.get("BCA_SMOKE_BEARER_TOKEN", ""))
     parser.add_argument("--confirm-paid", action="store_true")
     args = parser.parse_args()
 
-    headers = {"X-API-Key": args.api_key} if args.api_key else {}
+    headers = {"Authorization": f"Bearer {args.token}"} if args.token else {"X-API-Key": args.api_key} if args.api_key else {}
     base = args.base_url.rstrip("/") + "/api/v1/creator"
     async with httpx.AsyncClient(timeout=30, headers=headers) as client:
         config = await client.get(f"{base}/config")
@@ -45,16 +46,16 @@ async def main() -> int:
                 files={"message": (None, "主体：英短猫；风格：Q版；作品类型：桌面摆件")},
             )
             prepared.raise_for_status()
-            if prepared.json().get("status") != "awaiting_image_confirmation":
-                print("Preparation did not reach the paid confirmation gate.", file=sys.stderr)
+            if prepared.json().get("status") != "ready_for_images":
+                print("Preparation did not produce a complete creative brief.", file=sys.stderr)
                 return 3
-            submitted = await client.post(f"{base}/sessions/{session_id}/confirm-image")
+            submitted = await client.post(f"{base}/sessions/{session_id}/images/generate")
             submitted.raise_for_status()
-            print(f"Paid four-image generation accepted for session {session_id}.")
+            print(f"Direct four-image generation accepted for session {session_id}.")
             return 0
         finally:
-            # Do not delete a queued/running paid session: its persisted record is
-            # evidence for the operator to inspect in the BCA UI.
+            # Do not delete a queued/running billed session: its persisted record is
+            # evidence for the operator to inspect in the BCA card workflow.
             pass
 
 

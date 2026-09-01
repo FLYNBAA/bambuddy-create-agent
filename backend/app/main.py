@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -8302,6 +8303,14 @@ PUBLIC_API_PREFIXES = [
     "/api/v1/auth/oidc/authorize/",
 ]
 
+# High-entropy, Provider-only BCA capability routes. Browser artifact routes
+# remain protected; only exact UUID session IDs and exact capability suffixes
+# bypass the global middleware before route-level confinement validation.
+PUBLIC_API_REGEXES = (
+    re.compile(r"^/api/v1/creator/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/provider/[A-Za-z0-9_-]{32,128}/model\.glb$"),
+    re.compile(r"^/api/v1/creator/sessions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/provider/[A-Za-z0-9_-]{32,128}/calibrated\.3mf$"),
+)
+
 # Route patterns that are public (read-only display data)
 # These are checked with "in path" - needed because browsers load images/videos
 # via <img src> and <video src> which don't include Authorization headers
@@ -8504,6 +8513,10 @@ async def auth_middleware(request, call_next):
     for prefix in PUBLIC_API_PREFIXES:
         if path.startswith(prefix):
             return await call_next(request)
+
+    # Allow only exact, high-entropy Provider capability routes.
+    if any(pattern.fullmatch(path) for pattern in PUBLIC_API_REGEXES):
+        return await call_next(request)
 
     # Allow public patterns (read-only display data like thumbnails)
     for pattern in PUBLIC_API_PATTERNS:

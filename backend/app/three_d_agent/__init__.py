@@ -1,19 +1,5 @@
 """Composable 3D printing agent backend."""
 
-from .contracts import (
-    ColorMatchAssignment,
-    ColorMatchResponse,
-    CreativeBrief,
-    ConversationMessage,
-    ModelRepairState,
-    PrintAnalysisState,
-    PrintFileState,
-    PrintabilityMetrics,
-    PrintabilityReport,
-    SessionSnapshot,
-    SessionStatus,
-    SubworkflowStatus,
-)
 from .calibration import (
     CalibrationError,
     CalibrationInspection,
@@ -25,9 +11,23 @@ from .calibration import (
     InventoryColor,
     SourceColor,
     calibrate_3mf,
-    inspect_3mf,
     geometry_only_3mf,
+    inspect_3mf,
 )
+from .contracts import (
+    ColorMatchAssignment,
+    ColorMatchResponse,
+    CreativeBrief,
+    ModelRepairState,
+    PrintabilityMetrics,
+    PrintabilityReport,
+    PrintAnalysisState,
+    PrintFileState,
+    SessionSnapshot,
+    SessionStatus,
+    SubworkflowStatus,
+)
+from .factory import create_agent
 from .filament_inventory import (
     FilamentColorMapping,
     FilamentColorRecord,
@@ -35,14 +35,11 @@ from .filament_inventory import (
     InventoryConfigurationError,
     InventoryDataError,
 )
-
-from .factory import create_agent
 from .service import ThreeDPrintAgent
 
 __all__ = [
     "CreativeBrief",
     "ModelRepairState",
-    "ConversationMessage",
     "PrintAnalysisState",
     "PrintFileState",
     "PrintabilityMetrics",

@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import JSZip from 'jszip';
@@ -54,6 +55,8 @@ interface BuildVolume {
   z: number;
 }
 
+const DEFAULT_BUILD_VOLUME: BuildVolume = { x: 256, y: 256, z: 256 };
+
 interface ModelViewerProps {
   url: string;
   fileType?: string;
@@ -61,6 +64,7 @@ interface ModelViewerProps {
   filamentColors?: string[];
   selectedPlateId?: number | null;
   className?: string;
+  showControls?: boolean;
 }
 
 interface MeshData {
@@ -535,22 +539,31 @@ function createGeometryFromMesh(mesh: MeshData): THREE.BufferGeometry {
 
   // Compute normals
   geometry.computeVertexNormals();
-
   return geometry;
 }
 
-function disposeGroup(group: THREE.Group) {
+function disposeMaterial(material: THREE.Material, textures: Set<THREE.Texture>): void {
+  for (const value of Object.values(material)) {
+    if (value && typeof value === 'object' && 'isTexture' in value) textures.add(value as THREE.Texture);
+  }
+  material.dispose();
+}
+
+function disposeGroup(group: THREE.Group): void {
+  const materials = new Set<THREE.Material>();
+  const textures = new Set<THREE.Texture>();
   group.traverse((child) => {
-    if (child instanceof THREE.Mesh) {
+    if (child instanceof THREE.Mesh || child instanceof THREE.Line) {
       child.geometry.dispose();
-      if (Array.isArray(child.material)) {
-        for (const material of child.material) {
-          material.dispose();
-        }
-      } else {
-        child.material.dispose();
-      }
+      if (Array.isArray(child.material)) child.material.forEach((material) => materials.add(material));
+      else materials.add(child.material);
     }
+  });
+  materials.forEach((material) => disposeMaterial(material, textures));
+  textures.forEach((texture) => {
+    const image = texture.source.data;
+    if (typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap) image.close();
+    texture.dispose();
   });
 }
 
@@ -669,10 +682,11 @@ function buildModelGroup(
 export function ModelViewer({
   url,
   fileType,
-  buildVolume = { x: 256, y: 256, z: 256 },
+  buildVolume = DEFAULT_BUILD_VOLUME,
   filamentColors,
   selectedPlateId = null,
   className = '',
+  showControls = true,
 }: ModelViewerProps) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -693,6 +707,7 @@ export function ModelViewer({
   const [error, setError] = useState<string | null>(null);
   const [parsedData, setParsedData] = useState<Parsed3MFData | null>(null);
   const [stlGeometry, setStlGeometry] = useState<THREE.BufferGeometry | null>(null);
+  const [gltfScene, setGltfScene] = useState<THREE.Group | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -819,6 +834,7 @@ export function ModelViewer({
     setError(null);
     setParsedData(null);
     setStlGeometry(null);
+    setGltfScene(null);
 
     const normalizedType = (fileType || url.split('?')[0].split('.').pop() || '').toLowerCase();
 
@@ -829,6 +845,7 @@ export function ModelViewer({
       headers['Authorization'] = `Bearer ${token}`;
     }
 
+    let gltfCancelled = false;
     if (normalizedType === 'stl') {
       fetch(url, { headers })
         .then((res) => {
@@ -863,6 +880,28 @@ export function ModelViewer({
           setError(err.message);
           setLoading(false);
         });
+    } else if (normalizedType === 'glb' || normalizedType === 'gltf') {
+      fetch(url, { headers })
+        .then((res) => {
+          if (!res.ok) throw new Error(t('modelViewer.errors.failedToLoad'));
+          return res.arrayBuffer();
+        })
+        .then((buffer) => new Promise<THREE.Group>((resolve, reject) => {
+          new GLTFLoader().parse(buffer, '', (gltf) => resolve(gltf.scene), reject);
+        }))
+        .then((scene) => {
+          if (gltfCancelled) {
+            disposeGroup(scene);
+            return;
+          }
+          setGltfScene(scene);
+        })
+        .catch((err) => {
+          if (!gltfCancelled) {
+            setError(err instanceof Error ? err.message : t('modelViewer.errors.failedToLoad'));
+            setLoading(false);
+          }
+        });
     } else {
       setError(t('modelViewer.errors.unsupportedFormat'));
       setLoading(false);
@@ -887,6 +926,7 @@ export function ModelViewer({
     return () => {
       window.removeEventListener('resize', handleResize);
       resizeObserver.disconnect();
+      gltfCancelled = true;
       cancelAnimationFrame(animationId);
       controls.dispose();
       // The environment map is a render target; disposing the renderer alone
@@ -897,9 +937,12 @@ export function ModelViewer({
       pmremRef.current?.dispose();
       pmremRef.current = null;
       scene.environment = null;
+      if (modelGroupRef.current) {
+        disposeGroup(modelGroupRef.current);
+        modelGroupRef.current = null;
+      }
       renderer.dispose();
       container.removeChild(renderer.domElement);
-      modelGroupRef.current = null;
       plateRef.current = null;
       gridRef.current = null;
       keyLightRef.current = null;
@@ -909,47 +952,46 @@ export function ModelViewer({
 
   useEffect(() => {
     if (!sceneRef.current || !cameraRef.current || !controlsRef.current) return;
-    if (!parsedData && !stlGeometry) return;
+    if (!parsedData && !stlGeometry && !gltfScene) return;
 
     if (modelGroupRef.current) {
       sceneRef.current.remove(modelGroupRef.current);
       disposeGroup(modelGroupRef.current);
     }
 
-    const isStlModel = !!stlGeometry;
-    const group = isStlModel
-      ? (() => {
-          const materialColor = filamentColors?.[0] || '#00ae42';
-          const material = new THREE.MeshStandardMaterial({
-            color: new THREE.Color(materialColor),
-            roughness: 0.62,
-            metalness: 0.0,
-            envMapIntensity: 0.55,
-          });
-          const mesh = new THREE.Mesh(stlGeometry!, material);
-          mesh.castShadow = true;
-          const stlGroup = new THREE.Group();
-          stlGroup.add(mesh);
-          return stlGroup;
-        })()
-      : buildModelGroup(parsedData!, selectedPlateId ?? null, filamentColors);
+    const isStandaloneModel = !!stlGeometry || !!gltfScene;
+    const group = gltfScene
+      ? gltfScene
+      : stlGeometry
+        ? (() => {
+            const materialColor = filamentColors?.[0] || '#00ae42';
+            const material = new THREE.MeshStandardMaterial({
+              color: new THREE.Color(materialColor),
+              roughness: 0.62,
+              metalness: 0.0,
+              envMapIntensity: 0.55,
+            });
+            const mesh = new THREE.Mesh(stlGeometry, material);
+            mesh.castShadow = true;
+            const stlGroup = new THREE.Group();
+            stlGroup.add(mesh);
+            return stlGroup;
+          })()
+        : buildModelGroup(parsedData!, selectedPlateId ?? null, filamentColors);
     modelGroupRef.current = group;
     sceneRef.current.add(group);
 
-    // Get bounding box to position model
     const box = new THREE.Box3().setFromObject(group);
     const center = box.getCenter(new THREE.Vector3());
-
-    // Always place models on the build plate (Y=0)
     group.position.y = -box.min.y;
 
-    const selectedPlateBounds = (!isStlModel && selectedPlateId != null && parsedData!.buildItems.length > 0)
+    const selectedPlateBounds = (!isStandaloneModel && selectedPlateId != null && parsedData!.buildItems.length > 0)
       ? parsedData!.plateBounds.get(selectedPlateId)
       : undefined;
-    const selectedPlateOffset = (!isStlModel && selectedPlateId != null)
+    const selectedPlateOffset = (!isStandaloneModel && selectedPlateId != null)
       ? parsedData!.plateOffsets.get(selectedPlateId)
       : undefined;
-    const shouldCenterOnPlate = isStlModel
+    const shouldCenterOnPlate = isStandaloneModel
       || parsedData!.buildItems.length === 0
       || (selectedPlateId != null && !selectedPlateBounds && !selectedPlateOffset);
     const centerOffsetX = shouldCenterOnPlate ? -center.x : 0;
@@ -957,7 +999,7 @@ export function ModelViewer({
 
     let plateOffsetX = 0;
     let plateOffsetZ = 0;
-    if (!isStlModel && selectedPlateId != null && parsedData!.buildItems.length > 0 && selectedPlateBounds) {
+    if (!isStandaloneModel && selectedPlateId != null && parsedData!.buildItems.length > 0 && selectedPlateBounds) {
       const plateBox = new THREE.Box3().setFromObject(group);
       plateOffsetX = plateBox.min.x - selectedPlateBounds.minX;
       plateOffsetZ = plateBox.min.z - selectedPlateBounds.minY;
@@ -965,11 +1007,10 @@ export function ModelViewer({
 
     const plateCenterX = buildVolume.x / 2;
     const plateCenterZ = buildVolume.y / 2;
-
-    if (!isStlModel && selectedPlateId != null && parsedData!.buildItems.length > 0 && selectedPlateBounds) {
+    if (!isStandaloneModel && selectedPlateId != null && parsedData!.buildItems.length > 0 && selectedPlateBounds) {
       group.position.x = centerOffsetX - plateOffsetX;
       group.position.z = centerOffsetZ - plateOffsetZ;
-    } else if (!isStlModel && selectedPlateId != null && selectedPlateOffset) {
+    } else if (!isStandaloneModel && selectedPlateId != null && selectedPlateOffset) {
       group.position.x = centerOffsetX + (plateCenterX - selectedPlateOffset.offsetX);
       group.position.z = centerOffsetZ + (plateCenterZ - selectedPlateOffset.offsetY);
     } else if (shouldCenterOnPlate) {
@@ -984,26 +1025,18 @@ export function ModelViewer({
       plateRef.current.position.x = plateCenterX;
       plateRef.current.position.z = plateCenterZ;
     }
-
     if (gridRef.current) {
       gridRef.current.position.x = plateCenterX;
       gridRef.current.position.z = plateCenterZ;
     }
-
-    // Follows the plate, or the shadow lands on empty space beside the bed.
     if (shadowCatcherRef.current) {
       shadowCatcherRef.current.position.x = plateCenterX;
       shadowCatcherRef.current.position.z = plateCenterZ;
     }
 
-    // Recalculate bounding box after positioning
-    const finalBox = new THREE.Box3().setFromObject(group);
-
-    // Adjust camera to fit model
-    fitCameraToBox(cameraRef.current, controlsRef.current, finalBox);
-
+    fitCameraToBox(cameraRef.current, controlsRef.current, new THREE.Box3().setFromObject(group));
     setLoading(false);
-  }, [parsedData, stlGeometry, selectedPlateId, filamentColors, buildVolume]);
+  }, [parsedData, stlGeometry, gltfScene, selectedPlateId, filamentColors, buildVolume]);
 
   const resetView = () => {
     if (cameraRef.current && controlsRef.current) {
@@ -1035,15 +1068,15 @@ export function ModelViewer({
         </div>
       )}
 
-      {!loading && !error && (
+      {showControls && !loading && !error && (
         <div className="absolute bottom-4 right-4 flex gap-2">
-          <Button variant="secondary" size="sm" onClick={() => zoom(0.8)}>
+          <Button variant="secondary" size="sm" onClick={() => zoom(0.8)} aria-label="Zoom in model">
             <ZoomIn className="w-4 h-4" />
           </Button>
-          <Button variant="secondary" size="sm" onClick={() => zoom(1.25)}>
+          <Button variant="secondary" size="sm" onClick={() => zoom(1.25)} aria-label="Zoom out model">
             <ZoomOut className="w-4 h-4" />
           </Button>
-          <Button variant="secondary" size="sm" onClick={resetView}>
+          <Button variant="secondary" size="sm" onClick={resetView} aria-label="Reset model view">
             <RotateCcw className="w-4 h-4" />
           </Button>
         </div>
