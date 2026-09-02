@@ -7,30 +7,32 @@ This plan covers BCA multi-color calibration using Bambuddy manual inventory. BC
 ## Preconditions
 
 - Bambuddy database migration is complete and writable;
-- At least one active, unarchived manual spool exists;
-- The spool has valid `rgba`, material, brand, and color name;
-- BCA Provider configuration has been hot-reloaded at `/creator/settings`;
+- At least one active, unarchived `spool` row exists;
+- The row has valid `rgba` and non-empty `material`; `color_catalog` entries alone are not calibration candidates;
+- Brand and color name improve matching evidence but are not eligibility requirements;
 - Default tests use fake Providers. Real multi-color/image/3D calls need separate approval.
 
 ## Calibration candidate rules
 
 | Condition | Expected result |
 |---|---|
-| Active manual spool with valid RGB | Included as a DeepSeek color-matching candidate. |
+| Active `spool` with valid RGB/RGBA and non-empty material | Included as a DeepSeek color-matching candidate. |
+| Color-catalog-only entry with no matching spool | Excluded. |
 | Archived spool | Excluded. |
-| Missing or invalid RGBA | Excluded. |
-| No candidates | Calibration subworkflow fails and original 3MF remains available. |
+| Missing/invalid RGBA or empty material | Excluded. |
+| No candidates | Calibration subworkflow fails; no final artifact is published. |
 | A source model color is uncovered | Calibration fails; no nearest-color fallback. |
 | Returned `inventory_id` does not exist | Calibration fails. |
+| `succeeded` but assignments empty in multicolor mode | Treat as invalid/incomplete verification; do not claim matching succeeded. |
 
 ## BCA end-to-end checks
 
-1. Create a completed creator session with an original multi-color 3MF.
-2. Run `/print/calibrate`.
-3. Verify `color_calibration` transitions `queued → running → succeeded|failed`.
-4. On success, confirm `print-calibrated.3mf` is independent and original `print.3mf` remains.
-5. On no candidates, incomplete mappings, or Provider errors, confirm the main session remains `completed`.
-6. Only successful calibrated 3MF may enter BCA task through `/sessions/{id}/task`.
+1. Create a completed creator session and start multi-color calibration with `{ "mode": "multicolor", "max_colors": 1-8 }`.
+2. Verify `color_calibration` transitions `queued → running → succeeded|failed`.
+3. On success, verify `assignments` is non-empty and every assignment references an eligible active spool.
+4. Confirm `calibrated_print_file_download_url` exists and the final calibrated 3MF is independent from the transient Meshy download.
+5. On no candidates, incomplete mappings, or Provider errors, confirm no final artifact is published and the completed GLB remains available.
+6. Only a successful final calibrated 3MF may enter BCA task through `/sessions/{id}/task`.
 
 ## Regression command
 

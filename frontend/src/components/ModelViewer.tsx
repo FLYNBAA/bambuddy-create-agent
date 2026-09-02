@@ -2,61 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import JSZip from 'jszip';
+import { ThreeMFLoader } from 'three/addons/loaders/3MFLoader.js';
 import { Loader2, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
 import { Button } from './Button';
 import { getAuthToken } from '../api/client';
 
-/**
- * Frame the camera on a bounding box.
- *
- * The previous heuristic was `maxDim * 1.8`, which ignores both the camera's
- * field of view and the viewport's aspect ratio. In a tall, narrow panel the
- * horizontal field of view is much narrower than the vertical one, so that
- * distance pushed the model into the middle of the frame with a screenful of
- * empty space above it. Solving the distance from the bounding *sphere*
- * against both fields of view fills the frame at any viewport shape.
- */
-function fitCameraToBox(
-  camera: THREE.PerspectiveCamera,
-  controls: OrbitControls,
-  box: THREE.Box3,
-  padding = 1.15,
-): void {
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  // Circumscribed sphere: conservative, so the model never crops on rotation.
-  const radius = Math.max(size.length() / 2, 0.001);
-
-  const vFov = THREE.MathUtils.degToRad(camera.fov);
-  const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
-  const distance = padding * Math.max(radius / Math.sin(vFov / 2), radius / Math.sin(hFov / 2));
-
-  // Keep the established three-quarter view; only the distance changes.
-  const direction = new THREE.Vector3(0.7, 0.5, 0.7).normalize();
-  camera.position.copy(center).addScaledVector(direction, distance);
-  // Clip planes scaled to the subject, so a small model doesn't z-fight and a
-  // large one isn't sliced by the far plane.
-  camera.near = Math.max(distance / 1000, 0.01);
-  camera.far = distance + radius * 4;
-  camera.updateProjectionMatrix();
-
-  controls.target.copy(center);
-  controls.update();
-}
-
-interface BuildVolume {
-  x: number;
-  y: number;
-  z: number;
-}
-
-const DEFAULT_BUILD_VOLUME: BuildVolume = { x: 256, y: 256, z: 256 };
-
+interface BuildVolume { x: number; y: number; z: number; }
 interface ModelViewerProps {
   url: string;
   fileType?: string;
@@ -67,1020 +21,155 @@ interface ModelViewerProps {
   showControls?: boolean;
 }
 
-interface MeshData {
-  vertices: number[];
-  triangles: number[];
-  extruder: number; // Per-mesh extruder index for coloring
-}
+const DEFAULT_BUILD_VOLUME: BuildVolume = { x: 256, y: 256, z: 256 };
 
-interface ObjectData {
-  id: string;
-  meshes: MeshData[];
-  defaultExtruder: number; // Default extruder for object (used if mesh doesn't have specific one)
-  plateId?: number | null;
-}
-
-interface BuildItem {
-  objectId: string;
-  transform: THREE.Matrix4;
-  extruder?: number; // Can override object's extruder
-  plateId?: number | null;
-}
-
-interface Parsed3MFData {
-  objects: Map<string, ObjectData>;
-  buildItems: BuildItem[];
-  plateBounds: Map<number, { minX: number; minY: number; maxX: number; maxY: number }>;
-  plateOffsets: Map<number, { offsetX: number; offsetY: number }>;
-}
-
-// Yield to the browser event loop so the main thread can repaint, process
-// user input (especially the modal's close button), and avoid the
-// "page unresponsive" dialog while we crunch through large 3MFs in
-// straight-line JS. setTimeout(_, 0) is sufficient — we don't need rAF
-// here, the goal is just to surrender control so queued tasks run.
-function nextTick(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-// Yield once per N iterations of a hot loop. Picked so each batch is
-// ~5-10 ms of work on a typical desktop — fine-grained enough to keep
-// frames flowing, coarse enough not to drown the loop in setTimeout
-// dispatch overhead. Adjust if profiling shows otherwise.
-const YIELD_EVERY_N_VERTICES = 20000;
-const YIELD_EVERY_N_TRIANGLES = 20000;
-
-// Parse 3MF transform - keep in 3MF coordinate space (Z-up)
-function parseTransform3MF(transformStr: string | null): THREE.Matrix4 {
-  const matrix = new THREE.Matrix4();
-  if (!transformStr) {
-    return matrix; // Identity matrix
-  }
-
-  // 3MF transform is a 3x4 affine matrix in row-major order:
-  // "m00 m01 m02 m10 m11 m12 m20 m21 m22 m30 m31 m32"
-  // Where (m30, m31, m32) is the translation vector
-  const values = transformStr.trim().split(/\s+/).map(parseFloat);
-  if (values.length >= 12) {
-    // Three.js Matrix4.set takes row-major order arguments:
-    // set(n11, n12, n13, n14, n21, n22, n23, n24, n31, n32, n33, n34, n41, n42, n43, n44)
-    // 3MF row-major: m00, m01, m02, m10, m11, m12, m20, m21, m22, m30, m31, m32
-    matrix.set(
-      values[0], values[1], values[2], values[9],   // m00, m01, m02, tx
-      values[3], values[4], values[5], values[10],  // m10, m11, m12, ty
-      values[6], values[7], values[8], values[11],  // m20, m21, m22, tz
-      0, 0, 0, 1
-    );
-  }
-  return matrix;
-}
-
-// Alias for backwards compatibility
-const parseTransform = parseTransform3MF;
-
-async function parseMeshFromDoc(doc: Document, defaultExtruder: number = 0): Promise<MeshData[]> {
-  const meshes: MeshData[] = [];
-  const meshElements = doc.getElementsByTagName('mesh');
-
-  for (let j = 0; j < meshElements.length; j++) {
-    const meshEl = meshElements[j];
-    const vertices: number[] = [];
-    const triangles: number[] = [];
-
-    const vertexElements = meshEl.getElementsByTagName('vertex');
-    for (let k = 0; k < vertexElements.length; k++) {
-      const v = vertexElements[k];
-      vertices.push(
-        parseFloat(v.getAttribute('x') || '0'),
-        parseFloat(v.getAttribute('y') || '0'),
-        parseFloat(v.getAttribute('z') || '0')
-      );
-      if (k > 0 && k % YIELD_EVERY_N_VERTICES === 0) {
-        await nextTick();
-      }
-    }
-
-    const triangleElements = meshEl.getElementsByTagName('triangle');
-    for (let k = 0; k < triangleElements.length; k++) {
-      const t = triangleElements[k];
-      triangles.push(
-        parseInt(t.getAttribute('v1') || '0'),
-        parseInt(t.getAttribute('v2') || '0'),
-        parseInt(t.getAttribute('v3') || '0')
-      );
-      if (k > 0 && k % YIELD_EVERY_N_TRIANGLES === 0) {
-        await nextTick();
-      }
-    }
-
-    if (vertices.length > 0 && triangles.length > 0) {
-      meshes.push({ vertices, triangles, extruder: defaultExtruder });
-    }
-  }
-  return meshes;
-}
-
-function parsePlateIdFromAttributes(element: Element): number | null {
-  const plateAttribute = Array.from(element.attributes).find((attr) => {
-    const name = attr.name.toLowerCase();
-    return (
-      name === 'plate_id' ||
-      name === 'plater_id' ||
-      name === 'plateid' ||
-      name === 'platerid' ||
-      name.endsWith(':plate_id') ||
-      name.endsWith(':plater_id')
-    );
-  });
-
-  if (!plateAttribute?.value) return null;
-  const parsed = Number.parseInt(plateAttribute.value, 10);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-async function parse3MF(arrayBuffer: ArrayBuffer): Promise<Parsed3MFData> {
-  let zip: JSZip;
-  try {
-    zip = await JSZip.loadAsync(arrayBuffer);
-  } catch {
-    throw new Error('Unsupported file format');
-  }
-  const objects = new Map<string, ObjectData>();
-  const buildItems: BuildItem[] = [];
-  const plateBounds = new Map<number, { minX: number; minY: number; maxX: number; maxY: number }>();
-  const plateOffsets = new Map<number, { offsetX: number; offsetY: number }>();
-  const parser = new DOMParser();
-
-  // Helper to load and parse a model file from the zip
-  async function loadModelFile(path: string): Promise<Document | null> {
-    // Normalize path (remove leading slash)
-    const normalizedPath = path.startsWith('/') ? path.slice(1) : path;
-    const file = zip.files[normalizedPath];
-    if (!file) return null;
-    const content = await file.async('string');
-    return parser.parseFromString(content, 'application/xml');
-  }
-
-  // Parse model_settings.config to get extruder assignments
-  // Maps: object ID -> default extruder, and (object ID, part ID) -> part-specific extruder
-  const extruderMapById = new Map<string, number>();
-  const partExtruderMap = new Map<string, number>(); // Key: "objectId:partId"
-  const objectNameById = new Map<string, string>();
-  const plateAssignmentsByObjectId = new Map<string, number>();
-  const modelSettingsFile = zip.files['Metadata/model_settings.config'];
-  if (modelSettingsFile) {
-    try {
-      const content = await modelSettingsFile.async('string');
-      const doc = parser.parseFromString(content, 'application/xml');
-      const objectElements = doc.getElementsByTagName('object');
-      for (let i = 0; i < objectElements.length; i++) {
-        const objEl = objectElements[i];
-        const objectId = objEl.getAttribute('id');
-        if (!objectId) continue;
-
-        // Find object-level extruder + name
-        const directMetadata = Array.from(objEl.children).filter(
-          (el) => el.tagName === 'metadata' && el.getAttribute('key') === 'extruder'
-        );
-        if (directMetadata.length > 0) {
-          const extruderVal = directMetadata[0].getAttribute('value');
-          if (extruderVal) {
-            extruderMapById.set(objectId, Math.max(0, parseInt(extruderVal, 10) - 1));
-          }
-        }
-
-        const nameMetadata = Array.from(objEl.children).find(
-          (el) => el.tagName === 'metadata' && el.getAttribute('key') === 'name'
-        );
-        const objectName = nameMetadata?.getAttribute('value');
-        if (objectName) {
-          objectNameById.set(objectId, objectName);
-        }
-
-        // Find part-level extruders
-        const partElements = objEl.getElementsByTagName('part');
-        for (let j = 0; j < partElements.length; j++) {
-          const partEl = partElements[j];
-          const partId = partEl.getAttribute('id');
-          if (!partId) continue;
-
-          // Look for extruder in part's direct children
-          const partMetadata = Array.from(partEl.children).filter(
-            (el) => el.tagName === 'metadata' && el.getAttribute('key') === 'extruder'
-          );
-          if (partMetadata.length > 0) {
-            const extruderVal = partMetadata[0].getAttribute('value');
-            if (extruderVal) {
-              partExtruderMap.set(`${objectId}:${partId}`, Math.max(0, parseInt(extruderVal, 10) - 1));
-            }
-          }
-        }
-      }
-
-      // Parse plate -> object assignments
-      const plateElements = doc.getElementsByTagName('plate');
-      for (let i = 0; i < plateElements.length; i++) {
-        const plateEl = plateElements[i];
-        let plateId: number | null = null;
-        const metadataElements = plateEl.getElementsByTagName('metadata');
-        let plateOffsetX = 0;
-        let plateOffsetY = 0;
-        for (let j = 0; j < metadataElements.length; j++) {
-          const metaEl = metadataElements[j];
-          const key = metaEl.getAttribute('key');
-          if (key === 'plater_id' || key === 'plate_id') {
-            const value = metaEl.getAttribute('value');
-            if (value) {
-              const parsed = Number.parseInt(value, 10);
-              if (Number.isFinite(parsed)) {
-                plateId = parsed;
-              }
-            }
-          } else if (key === 'pos_x') {
-            const value = metaEl.getAttribute('value');
-            const parsed = value ? Number.parseFloat(value) : Number.NaN;
-            if (Number.isFinite(parsed)) {
-              plateOffsetX = parsed;
-            }
-          } else if (key === 'pos_y') {
-            const value = metaEl.getAttribute('value');
-            const parsed = value ? Number.parseFloat(value) : Number.NaN;
-            if (Number.isFinite(parsed)) {
-              plateOffsetY = parsed;
-            }
-          }
-        }
-        if (plateId == null) continue;
-        if (plateOffsetX !== 0 || plateOffsetY !== 0) {
-          plateOffsets.set(plateId, { offsetX: plateOffsetX, offsetY: plateOffsetY });
-        }
-
-        const modelInstances = plateEl.getElementsByTagName('model_instance');
-        for (let j = 0; j < modelInstances.length; j++) {
-          const instanceEl = modelInstances[j];
-          const instanceMetadata = instanceEl.getElementsByTagName('metadata');
-          for (let k = 0; k < instanceMetadata.length; k++) {
-            const metaEl = instanceMetadata[k];
-            if (metaEl.getAttribute('key') === 'object_id') {
-              const value = metaEl.getAttribute('value');
-              if (value) {
-                plateAssignmentsByObjectId.set(value, plateId);
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      // Silently ignore model_settings.config parsing errors
-    }
-  }
-
-  // Parse plate_*.json for plate assignments by object name (source-only / unsliced files)
-  const plateAssignmentsByName = new Map<string, number>();
-  const plateJsonNames = Object.keys(zip.files).filter(
-    (name) => name.startsWith('Metadata/plate_') && name.endsWith('.json')
-  );
-  for (const name of plateJsonNames) {
-    const match = name.match(/^Metadata\/plate_(\d+)\.json$/);
-    if (!match) continue;
-    const plateIndex = Number.parseInt(match[1], 10);
-    if (!Number.isFinite(plateIndex)) continue;
-    try {
-      const payload = await zip.files[name].async('string');
-      const json = JSON.parse(payload) as { bbox_objects?: Array<{ name?: string }>; bbox_all?: number[] };
-      const objectsList = json.bbox_objects ?? [];
-      for (const entry of objectsList) {
-        if (entry?.name) {
-          plateAssignmentsByName.set(entry.name, plateIndex);
-        }
-      }
-      if (Array.isArray(json.bbox_all) && json.bbox_all.length >= 4) {
-        const [minX, minY, maxX, maxY] = json.bbox_all;
-        if ([minX, minY, maxX, maxY].every((value) => Number.isFinite(value))) {
-          plateBounds.set(plateIndex, { minX, minY, maxX, maxY });
-        }
-      }
-    } catch {
-      // Ignore plate json parsing errors
-    }
-  }
-
-  // Find the main 3D model file
-  const mainModelPath = Object.keys(zip.files).find(
-    (name) => name === '3D/3dmodel.model' || name.endsWith('/3dmodel.model')
-  );
-
-  if (!mainModelPath) {
-    // Fallback: try to find any .model file
-    const anyModelPath = Object.keys(zip.files).find((name) => name.endsWith('.model'));
-    if (anyModelPath) {
-      const doc = await loadModelFile(anyModelPath);
-      if (doc) {
-        const meshes = await parseMeshFromDoc(doc, 0);
-        if (meshes.length > 0) {
-          objects.set('1', { id: '1', meshes, defaultExtruder: 0 });
-        }
-      }
-    }
-    return { objects, buildItems, plateBounds, plateOffsets };
-  }
-
-  const mainDoc = await loadModelFile(mainModelPath);
-  if (!mainDoc) return { objects, buildItems, plateBounds, plateOffsets };
-
-  // Parse objects - Bambu Studio uses components to reference external files
-  const objectElements = mainDoc.getElementsByTagName('object');
-  for (let i = 0; i < objectElements.length; i++) {
-    // Yield once per top-level object so the modal stays interactive
-    // throughout the parse (#1412). Inner vertex/triangle/component
-    // loops yield on their own. See nextTick() comment near the top.
-    if (i > 0) {
-      await nextTick();
-    }
-    const objEl = objectElements[i];
-    const objectId = objEl.getAttribute('id');
-    if (!objectId) continue;
-
-    const objectPlateId = parsePlateIdFromAttributes(objEl) ?? plateAssignmentsByObjectId.get(objectId) ?? null;
-
-    // Get default extruder from model_settings.config map, falling back to attribute or default
-    let defaultExtruder = extruderMapById.get(objectId) ?? -1;
-    if (defaultExtruder < 0) {
-      const extruderAttr = objEl.getAttribute('p:extruder') || objEl.getAttributeNS('http://schemas.microsoft.com/3dmanufacturing/production/2015/06', 'extruder') || '1';
-      defaultExtruder = Math.max(0, parseInt(extruderAttr, 10) - 1);
-    }
-
-    const meshes: MeshData[] = [];
-
-    // Check for direct mesh in this object
-    const objMeshElements = objEl.getElementsByTagName('mesh');
-    for (let j = 0; j < objMeshElements.length; j++) {
-      const meshEl = objMeshElements[j];
-      const vertices: number[] = [];
-      const triangles: number[] = [];
-
-      const vertexElements = meshEl.getElementsByTagName('vertex');
-      for (let k = 0; k < vertexElements.length; k++) {
-        const v = vertexElements[k];
-        vertices.push(
-          parseFloat(v.getAttribute('x') || '0'),
-          parseFloat(v.getAttribute('y') || '0'),
-          parseFloat(v.getAttribute('z') || '0')
-        );
-        if (k > 0 && k % YIELD_EVERY_N_VERTICES === 0) {
-          await nextTick();
-        }
-      }
-
-      const triangleElements = meshEl.getElementsByTagName('triangle');
-      for (let k = 0; k < triangleElements.length; k++) {
-        const t = triangleElements[k];
-        triangles.push(
-          parseInt(t.getAttribute('v1') || '0'),
-          parseInt(t.getAttribute('v2') || '0'),
-          parseInt(t.getAttribute('v3') || '0')
-        );
-        if (k > 0 && k % YIELD_EVERY_N_TRIANGLES === 0) {
-          await nextTick();
-        }
-      }
-
-      if (vertices.length > 0 && triangles.length > 0) {
-        meshes.push({ vertices, triangles, extruder: defaultExtruder });
-      }
-    }
-
-    // Check for component references (Bambu Studio style)
-    const componentElements = objEl.getElementsByTagName('component');
-    for (let j = 0; j < componentElements.length; j++) {
-      // Yield before each component — each one triggers another async file
-      // load + DOM parse + vertex/triangle iteration. Multi-color "parted"
-      // statues from MakerWorld can have dozens of components; without
-      // this yield the whole chain runs as one long synchronous burst
-      // between awaits and freezes the modal close button (#1412).
-      await nextTick();
-      const compEl = componentElements[j];
-      // p:path attribute contains the external file reference
-      const extPath = compEl.getAttribute('p:path') || compEl.getAttributeNS('http://schemas.microsoft.com/3dmanufacturing/production/2015/06', 'path');
-      // objectid in component corresponds to part id in model_settings
-      const compObjectId = compEl.getAttribute('objectid');
-
-      if (extPath) {
-        const extDoc = await loadModelFile(extPath);
-        if (extDoc) {
-          // Look up per-part extruder, falling back to object's default
-          const partKey = compObjectId ? `${objectId}:${compObjectId}` : null;
-          const compExtruder = partKey ? (partExtruderMap.get(partKey) ?? defaultExtruder) : defaultExtruder;
-
-          const extMeshes = await parseMeshFromDoc(extDoc, compExtruder);
-
-          // Apply component transform if present
-          const compTransformStr = compEl.getAttribute('transform');
-          const compTransform = parseTransform(compTransformStr);
-
-          for (const mesh of extMeshes) {
-            if (compTransformStr) {
-              // Apply transform to vertices (in 3MF coordinate space, before Y/Z swap)
-              const transformedVertices: number[] = [];
-              for (let k = 0; k < mesh.vertices.length; k += 3) {
-                const v = new THREE.Vector3(mesh.vertices[k], mesh.vertices[k + 1], mesh.vertices[k + 2]);
-                v.applyMatrix4(compTransform);
-                transformedVertices.push(v.x, v.y, v.z);
-              }
-              meshes.push({ vertices: transformedVertices, triangles: mesh.triangles, extruder: mesh.extruder });
-            } else {
-              meshes.push(mesh);
-            }
-          }
-        }
-      }
-    }
-
-    if (meshes.length > 0) {
-      objects.set(objectId, { id: objectId, meshes, defaultExtruder, plateId: objectPlateId });
-    }
-  }
-
-  // Parse build items (placement on build plate)
-  const buildElements = mainDoc.getElementsByTagName('build');
-  if (buildElements.length > 0) {
-    const itemElements = buildElements[0].getElementsByTagName('item');
-    for (let i = 0; i < itemElements.length; i++) {
-      const itemEl = itemElements[i];
-      const objectId = itemEl.getAttribute('objectid');
-      if (!objectId) continue;
-
-      const transform = parseTransform(itemEl.getAttribute('transform'));
-      const itemPlateId = parsePlateIdFromAttributes(itemEl);
-      const objectPlateId = objects.get(objectId)?.plateId ?? null;
-      const objectName = objectNameById.get(objectId);
-      const namePlateId = objectName ? plateAssignmentsByName.get(objectName) ?? null : null;
-      buildItems.push({ objectId, transform, plateId: itemPlateId ?? objectPlateId ?? namePlateId ?? null });
-    }
-  }
-
-  return { objects, buildItems, plateBounds, plateOffsets };
-}
-
-function createGeometryFromMesh(mesh: MeshData): THREE.BufferGeometry {
-  const geometry = new THREE.BufferGeometry();
-
-  // Convert from 3MF Z-up to Three.js Y-up coordinate system
-  // 3MF: X right, Y back, Z up -> Three.js: X right, Y up, Z forward
-  const positions = new Float32Array(mesh.vertices.length);
-  for (let i = 0; i < mesh.vertices.length; i += 3) {
-    positions[i] = mesh.vertices[i];       // X stays X
-    positions[i + 1] = mesh.vertices[i + 2]; // Y becomes Z (up)
-    positions[i + 2] = mesh.vertices[i + 1]; // Z becomes Y
-  }
-
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setIndex(mesh.triangles);
-
-  // Compute normals
-  geometry.computeVertexNormals();
-  return geometry;
-}
-
-function disposeMaterial(material: THREE.Material, textures: Set<THREE.Texture>): void {
-  for (const value of Object.values(material)) {
-    if (value && typeof value === 'object' && 'isTexture' in value) textures.add(value as THREE.Texture);
-  }
-  material.dispose();
-}
-
-function disposeGroup(group: THREE.Group): void {
+function disposeGroup(group: THREE.Object3D): void {
   const materials = new Set<THREE.Material>();
   const textures = new Set<THREE.Texture>();
   group.traverse((child) => {
-    if (child instanceof THREE.Mesh || child instanceof THREE.Line) {
-      child.geometry.dispose();
-      if (Array.isArray(child.material)) child.material.forEach((material) => materials.add(material));
-      else materials.add(child.material);
+    if (!(child instanceof THREE.Mesh)) return;
+    child.geometry.dispose();
+    const values = Array.isArray(child.material) ? child.material : [child.material];
+    for (const material of values) {
+      for (const value of Object.values(material)) {
+        if (value && typeof value === 'object' && 'isTexture' in value) textures.add(value as THREE.Texture);
+      }
+      materials.add(material);
     }
   });
-  materials.forEach((material) => disposeMaterial(material, textures));
+  materials.forEach((material) => material.dispose());
   textures.forEach((texture) => {
-    const image = texture.source.data;
-    if (typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap) image.close();
+    const source = texture.source.data;
+    if (typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap) source.close();
     texture.dispose();
   });
 }
 
-function buildModelGroup(
-  parsedData: Parsed3MFData,
-  selectedPlateId: number | null,
-  filamentColors?: string[],
-): THREE.Group {
-  const { objects, buildItems } = parsedData;
-  const group = new THREE.Group();
-
-  // Create materials for each extruder color
-  const getMaterial = (extruder: number): THREE.MeshStandardMaterial => {
-    const defaultColor = '#00ae42';
-    const colorStr = filamentColors?.[extruder] || defaultColor;
-    // Convert hex color string to THREE.js color
-    const color = new THREE.Color(colorStr);
-    // Matte plastic against the scene's environment map. Phong lit only by
-    // direct lights gave every same-facing surface an identical colour, which
-    // is what flattened models into silhouettes. Roughness is high because
-    // FDM prints are not glossy, but not 1.0 -- a little specular is what
-    // makes layer-scale surface detail legible.
-    return new THREE.MeshStandardMaterial({
-      color,
-      roughness: 0.62,
-      metalness: 0.0,
-      envMapIntensity: 0.55,
-      flatShading: false,
-    });
-  };
-
-  // Group geometries by extruder index (using per-mesh extruder)
-  const geometriesByExtruder = new Map<number, THREE.BufferGeometry[]>();
-
-  const hasPlateAssignments = buildItems.some((item) => item.plateId != null);
-  const plateFilteredItems = selectedPlateId == null || !hasPlateAssignments
-    ? buildItems
-    : buildItems.filter((item) => item.plateId === selectedPlateId);
-  const activeBuildItems = plateFilteredItems.length > 0 ? plateFilteredItems : buildItems;
-
-  // If we have build items, use them for positioning
-  if (activeBuildItems.length > 0) {
-    for (const item of activeBuildItems) {
-      const objectData = objects.get(item.objectId);
-      if (!objectData) continue;
-
-      for (const meshData of objectData.meshes) {
-        // Use mesh's extruder, or item override, or object default
-        const extruder = item.extruder ?? meshData.extruder;
-
-        // Apply build transform to vertices in 3MF space BEFORE coordinate conversion
-        const transformedVertices: number[] = [];
-        for (let k = 0; k < meshData.vertices.length; k += 3) {
-          const v = new THREE.Vector3(
-            meshData.vertices[k],
-            meshData.vertices[k + 1],
-            meshData.vertices[k + 2]
-          );
-          v.applyMatrix4(item.transform);
-          transformedVertices.push(v.x, v.y, v.z);
-        }
-        // Now create geometry with coordinate conversion
-        const geometry = createGeometryFromMesh({
-          vertices: transformedVertices,
-          triangles: meshData.triangles,
-          extruder: extruder,
-        });
-
-        if (!geometriesByExtruder.has(extruder)) {
-          geometriesByExtruder.set(extruder, []);
-        }
-        geometriesByExtruder.get(extruder)!.push(geometry);
-      }
-    }
-  } else {
-    // Fallback: just add all objects without transforms
-    for (const objectData of objects.values()) {
-      for (const meshData of objectData.meshes) {
-        // Use per-mesh extruder
-        const extruder = meshData.extruder;
-        const geometry = createGeometryFromMesh(meshData);
-        if (!geometriesByExtruder.has(extruder)) {
-          geometriesByExtruder.set(extruder, []);
-        }
-        geometriesByExtruder.get(extruder)!.push(geometry);
-      }
-    }
-  }
-
-  // Create meshes for each extruder group
-  for (const [extruder, geometries] of geometriesByExtruder) {
-    if (geometries.length === 0) continue;
-
-    const mergedGeometry = geometries.length === 1
-      ? geometries[0]
-      : mergeGeometries(geometries, false);
-
-    if (mergedGeometry) {
-      const material = getMaterial(extruder);
-      const mesh = new THREE.Mesh(mergedGeometry, material);
-      mesh.castShadow = true;
-      group.add(mesh);
-    }
-
-    // Dispose individual geometries if merged
-    if (geometries.length > 1) {
-      for (const geom of geometries) {
-        geom.dispose();
-      }
-    }
-  }
-
-  return group;
+function fitCamera(camera: THREE.PerspectiveCamera, controls: OrbitControls, group: THREE.Object3D): void {
+  const box = new THREE.Box3().setFromObject(group);
+  if (box.isEmpty()) throw new Error('Model contains no renderable geometry');
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 0.001);
+  const verticalFov = THREE.MathUtils.degToRad(camera.fov);
+  const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
+  const distance = 1.18 * Math.max(radius / Math.sin(verticalFov / 2), radius / Math.sin(horizontalFov / 2));
+  camera.position.copy(center).addScaledVector(new THREE.Vector3(.7, .5, .7).normalize(), distance);
+  camera.near = Math.max(distance / 1000, .01);
+  camera.far = distance + radius * 4;
+  camera.updateProjectionMatrix();
+  controls.target.copy(center);
+  controls.update();
 }
 
-export function ModelViewer({
-  url,
-  fileType,
-  buildVolume = DEFAULT_BUILD_VOLUME,
-  filamentColors,
-  selectedPlateId = null,
-  className = '',
-  showControls = true,
-}: ModelViewerProps) {
+async function loadModel(url: string, fileType: string, headers: HeadersInit): Promise<THREE.Group> {
+  const response = await fetch(url, { headers });
+  if (!response.ok) throw new Error(`Model request failed (${response.status})`);
+  const data = await response.arrayBuffer();
+  if (fileType === '3mf') {
+    const group = new ThreeMFLoader().parse(data);
+    // 3MF coordinates are Z-up whereas this WebGL scene is Y-up. ThreeMFLoader
+    // preserves source positions, so convert the loaded root once instead of
+    // mutating every geometry and losing its material/color associations.
+    group.rotation.x = -Math.PI / 2;
+    return group;
+  }
+  if (fileType === 'glb' || fileType === 'gltf') {
+    return await new Promise<THREE.Group>((resolve, reject) => new GLTFLoader().parse(data, '', (gltf) => resolve(gltf.scene), reject));
+  }
+  if (fileType === 'stl') {
+    const geometry = new STLLoader().parse(data);
+    geometry.computeVertexNormals();
+    geometry.rotateX(-Math.PI / 2);
+    const material = new THREE.MeshStandardMaterial({ color: new THREE.Color('#00ae42'), roughness: .62, metalness: 0 });
+    const group = new THREE.Group();
+    group.add(new THREE.Mesh(geometry, material));
+    return group;
+  }
+  throw new Error('Unsupported model format');
+}
+
+export function ModelViewer({ url, fileType, buildVolume = DEFAULT_BUILD_VOLUME, filamentColors, selectedPlateId, className = '', showControls = true }: ModelViewerProps) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  // Held so the environment map and its generator can be released on unmount;
-  // a PMREM render target is GPU memory the garbage collector cannot reclaim.
-  const pmremRef = useRef<THREE.PMREMGenerator | null>(null);
-  const environmentRef = useRef<THREE.Texture | null>(null);
-  const keyLightRef = useRef<THREE.DirectionalLight | null>(null);
-  const shadowCatcherRef = useRef<THREE.Mesh | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
-  const modelGroupRef = useRef<THREE.Group | null>(null);
-  const plateRef = useRef<THREE.Mesh | null>(null);
-  const gridRef = useRef<THREE.GridHelper | null>(null);
+  const renderRef = useRef<(() => void) | null>(null);
+  const modelRef = useRef<THREE.Group | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [parsedData, setParsedData] = useState<Parsed3MFData | null>(null);
-  const [stlGeometry, setStlGeometry] = useState<THREE.BufferGeometry | null>(null);
-  const [gltfScene, setGltfScene] = useState<THREE.Group | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current) return;
-
+    void filamentColors;
+    void selectedPlateId;
     const container = containerRef.current;
-    const width = container.clientWidth;
-    const height = container.clientHeight;
-
-    // Scene
+    if (!container) return;
+    let cancelled = false;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x1a1a1a);
-    sceneRef.current = scene;
-
-    // Camera
-    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 10000);
-    camera.position.set(150, 150, 150);
-    cameraRef.current = camera;
-
-    // Renderer
+    const camera = new THREE.PerspectiveCamera(45, Math.max(container.clientWidth, 1) / Math.max(container.clientHeight, 1), .1, 10000);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(width, height);
-    // Cap the device pixel ratio: a 3x phone screen quadruples the fragment
-    // load for no visible gain on a model this simple.
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    // Filmic tone mapping keeps the bright side of a saturated filament colour
-    // from clipping to white, which is what made every model read as flat paint.
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    // Deliberately below 1.0: RoomEnvironment is a bright white box, and
-    // anything at or above unity clipped the lit side of a saturated
-    // filament colour to white, draining the hue out of the model.
-    renderer.toneMappingExposure = 0.85;
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMappingExposure = .85;
     container.appendChild(renderer.domElement);
-    rendererRef.current = renderer;
-
-    // Controls
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
-    controlsRef.current = controls;
-
-    // Image-based lighting. A generated room gives the model a real light
-    // environment -- soft gradients across curved surfaces, a hint of
-    // reflection -- which is the single biggest difference between this and a
-    // desktop slicer's viewport. Two directional lights on flat ambient could
-    // never produce that; every surface facing the same way got the same
-    // colour, so the model read as a flat silhouette.
+    controls.enableDamping = false;
     const pmrem = new THREE.PMREMGenerator(renderer);
-    const environment = pmrem.fromScene(new RoomEnvironment(), 0.04);
+    const environment = pmrem.fromScene(new RoomEnvironment(), .04);
     scene.environment = environment.texture;
-    pmremRef.current = pmrem;
-    environmentRef.current = environment.texture;
+    const light = new THREE.DirectionalLight(0xffffff, .8);
+    light.position.set(60, 200, 90);
+    scene.add(light, new THREE.HemisphereLight(0xffffff, 0x303030, 1.1));
+    const render = () => renderer.render(scene, camera);
+    controls.addEventListener('change', render);
+    cameraRef.current = camera;
+    controlsRef.current = controls;
+    renderRef.current = render;
 
-    // One key light on top, purely for the contact shadow and a highlight
-    // direction; the environment supplies the fill.
-    // Mostly overhead. An oblique key threw a long shadow across the whole
-    // bed; a print sitting on a plate wants a contact shadow beneath it.
-    const keyLight = new THREE.DirectionalLight(0xffffff, 0.75);
-    keyLight.position.set(60, 260, 90);
-    keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(2048, 2048);
-    keyLight.shadow.bias = -0.0005;
-    keyLight.shadow.normalBias = 0.02;
-    // Three's default shadow camera is a +/-5 unit box; on a 256mm bed the
-    // model falls entirely outside it and no shadow is drawn at all.
-    const shadowExtent = Math.max(buildVolume.x, buildVolume.y) * 0.75;
-    keyLight.shadow.camera.left = -shadowExtent;
-    keyLight.shadow.camera.right = shadowExtent;
-    keyLight.shadow.camera.top = shadowExtent;
-    keyLight.shadow.camera.bottom = -shadowExtent;
-    keyLight.shadow.camera.near = 1;
-    keyLight.shadow.camera.far = shadowExtent * 6;
-    keyLight.shadow.camera.updateProjectionMatrix();
-    scene.add(keyLight);
-    keyLightRef.current = keyLight;
-
-    // Grid - use the larger dimension for the grid size
-    const gridSize = Math.max(buildVolume.x, buildVolume.y);
-    const gridDivisions = Math.ceil(gridSize / 16);
-    const gridHelper = new THREE.GridHelper(gridSize, gridDivisions, 0x444444, 0x333333);
-    scene.add(gridHelper);
-    gridRef.current = gridHelper;
-
-    // Build plate indicator
-    const plateGeometry = new THREE.PlaneGeometry(buildVolume.x, buildVolume.y);
-    const plateMaterial = new THREE.MeshBasicMaterial({
-      color: 0x00ae42,
-      transparent: true,
-      opacity: 0.15,
-      side: THREE.DoubleSide,
-    });
-    const plate = new THREE.Mesh(plateGeometry, plateMaterial);
-    plate.rotation.x = -Math.PI / 2;
-    plate.position.y = -0.5; // Slightly below Y=0 so models sit on top
-    scene.add(plate);
-    plateRef.current = plate;
-
-    // Dedicated shadow catcher just above the plate. The plate itself is an
-    // unlit MeshBasicMaterial and cannot receive shadows; ShadowMaterial draws
-    // nothing but the shadow, so the tinted plate shows through unchanged.
-    // Without a contact shadow the model reads as pasted onto the background
-    // rather than resting on the bed.
-    const shadowCatcher = new THREE.Mesh(
-      new THREE.PlaneGeometry(buildVolume.x, buildVolume.y),
-      new THREE.ShadowMaterial({ opacity: 0.22 }),
-    );
-    shadowCatcher.rotation.x = -Math.PI / 2;
-    shadowCatcher.position.y = -0.49;
-    shadowCatcher.receiveShadow = true;
-    scene.add(shadowCatcher);
-    shadowCatcherRef.current = shadowCatcher;
-
-    // Animation loop - keep it simple for reliability
-    let animationId: number;
-    const animate = () => {
-      animationId = requestAnimationFrame(animate);
-      controls.update();
-      renderer.render(scene, camera);
-    };
-    animate();
-
-    setLoading(true);
-    setError(null);
-    setParsedData(null);
-    setStlGeometry(null);
-    setGltfScene(null);
-
-    const normalizedType = (fileType || url.split('?')[0].split('.').pop() || '').toLowerCase();
-
-    // Build auth headers for fetch
-    const headers: HeadersInit = {};
-    const token = getAuthToken();
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-
-    let gltfCancelled = false;
-    if (normalizedType === 'stl') {
-      fetch(url, { headers })
-        .then((res) => {
-          if (!res.ok) throw new Error(t('modelViewer.errors.failedToLoad'));
-          return res.arrayBuffer();
-        })
-        .then((buffer) => {
-          const loader = new STLLoader();
-          const geometry = loader.parse(buffer);
-          geometry.computeVertexNormals();
-          geometry.rotateX(-Math.PI / 2);
-          setStlGeometry(geometry);
-        })
-        .catch((err) => {
-          setError(err.message);
-          setLoading(false);
-        });
-    } else if (normalizedType === '3mf') {
-      fetch(url, { headers })
-        .then((res) => {
-          if (!res.ok) throw new Error(t('modelViewer.errors.failedToLoad'));
-          return res.arrayBuffer();
-        })
-        .then(parse3MF)
-        .then((parsed) => {
-          if (parsed.objects.size === 0) {
-            throw new Error(t('modelViewer.errors.noMeshes'));
-          }
-          setParsedData(parsed);
-        })
-        .catch((err) => {
-          setError(err.message);
-          setLoading(false);
-        });
-    } else if (normalizedType === 'glb' || normalizedType === 'gltf') {
-      fetch(url, { headers })
-        .then((res) => {
-          if (!res.ok) throw new Error(t('modelViewer.errors.failedToLoad'));
-          return res.arrayBuffer();
-        })
-        .then((buffer) => new Promise<THREE.Group>((resolve, reject) => {
-          new GLTFLoader().parse(buffer, '', (gltf) => resolve(gltf.scene), reject);
-        }))
-        .then((scene) => {
-          if (gltfCancelled) {
-            disposeGroup(scene);
-            return;
-          }
-          setGltfScene(scene);
-        })
-        .catch((err) => {
-          if (!gltfCancelled) {
-            setError(err instanceof Error ? err.message : t('modelViewer.errors.failedToLoad'));
-            setLoading(false);
-          }
-        });
-    } else {
-      setError(t('modelViewer.errors.unsupportedFormat'));
-      setLoading(false);
-    }
-
-    // Handle resize (window + container)
-    const handleResize = () => {
-      if (!container) return;
-      const w = container.clientWidth;
-      const h = container.clientHeight;
-      if (w === 0 || h === 0) return;
-      camera.aspect = w / h;
+    const resize = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (!width || !height) return;
+      camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
+      renderer.setSize(width, height);
+      render();
     };
-    window.addEventListener('resize', handleResize);
-    const resizeObserver = new ResizeObserver(() => {
-      handleResize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(container);
+    resize(); setLoading(true); setError(null);
+    const normalizedType = (fileType || url.split('?')[0].split('.').pop() || '').toLowerCase();
+    const headers: Record<string, string> = {};
+    const token = getAuthToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    void loadModel(url, normalizedType, headers).then((group) => {
+      if (cancelled) { disposeGroup(group); return; }
+      modelRef.current = group;
+      scene.add(group);
+      const box = new THREE.Box3().setFromObject(group);
+      group.position.y -= box.min.y;
+      fitCamera(camera, controls, group);
+      render(); setLoading(false);
+    }).catch((reason: unknown) => {
+      if (!cancelled) { setError(reason instanceof Error ? reason.message : t('modelViewer.errors.failedToLoad')); setLoading(false); }
     });
-    resizeObserver.observe(container);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
-      resizeObserver.disconnect();
-      gltfCancelled = true;
-      cancelAnimationFrame(animationId);
-      controls.dispose();
-      // The environment map is a render target; disposing the renderer alone
-      // leaves it allocated on the GPU, and this viewer is opened and closed
-      // repeatedly from the file manager.
-      environmentRef.current?.dispose();
-      environmentRef.current = null;
-      pmremRef.current?.dispose();
-      pmremRef.current = null;
-      scene.environment = null;
-      if (modelGroupRef.current) {
-        disposeGroup(modelGroupRef.current);
-        modelGroupRef.current = null;
-      }
-      renderer.dispose();
-      container.removeChild(renderer.domElement);
-      plateRef.current = null;
-      gridRef.current = null;
-      keyLightRef.current = null;
-      shadowCatcherRef.current = null;
+      cancelled = true;
+      observer.disconnect(); controls.removeEventListener('change', render); controls.dispose();
+      if (modelRef.current) { scene.remove(modelRef.current); disposeGroup(modelRef.current); modelRef.current = null; }
+      scene.environment = null; environment.texture.dispose(); pmrem.dispose(); renderer.dispose(); renderer.domElement.remove();
+      cameraRef.current = null; controlsRef.current = null; renderRef.current = null;
     };
-  }, [url, buildVolume, fileType, t]);
+  }, [url, fileType, buildVolume, filamentColors, selectedPlateId, t]);
 
-  useEffect(() => {
-    if (!sceneRef.current || !cameraRef.current || !controlsRef.current) return;
-    if (!parsedData && !stlGeometry && !gltfScene) return;
-
-    if (modelGroupRef.current) {
-      sceneRef.current.remove(modelGroupRef.current);
-      disposeGroup(modelGroupRef.current);
-    }
-
-    const isStandaloneModel = !!stlGeometry || !!gltfScene;
-    const group = gltfScene
-      ? gltfScene
-      : stlGeometry
-        ? (() => {
-            const materialColor = filamentColors?.[0] || '#00ae42';
-            const material = new THREE.MeshStandardMaterial({
-              color: new THREE.Color(materialColor),
-              roughness: 0.62,
-              metalness: 0.0,
-              envMapIntensity: 0.55,
-            });
-            const mesh = new THREE.Mesh(stlGeometry, material);
-            mesh.castShadow = true;
-            const stlGroup = new THREE.Group();
-            stlGroup.add(mesh);
-            return stlGroup;
-          })()
-        : buildModelGroup(parsedData!, selectedPlateId ?? null, filamentColors);
-    modelGroupRef.current = group;
-    sceneRef.current.add(group);
-
-    const box = new THREE.Box3().setFromObject(group);
-    const center = box.getCenter(new THREE.Vector3());
-    group.position.y = -box.min.y;
-
-    const selectedPlateBounds = (!isStandaloneModel && selectedPlateId != null && parsedData!.buildItems.length > 0)
-      ? parsedData!.plateBounds.get(selectedPlateId)
-      : undefined;
-    const selectedPlateOffset = (!isStandaloneModel && selectedPlateId != null)
-      ? parsedData!.plateOffsets.get(selectedPlateId)
-      : undefined;
-    const shouldCenterOnPlate = isStandaloneModel
-      || parsedData!.buildItems.length === 0
-      || (selectedPlateId != null && !selectedPlateBounds && !selectedPlateOffset);
-    const centerOffsetX = shouldCenterOnPlate ? -center.x : 0;
-    const centerOffsetZ = shouldCenterOnPlate ? -center.z : 0;
-
-    let plateOffsetX = 0;
-    let plateOffsetZ = 0;
-    if (!isStandaloneModel && selectedPlateId != null && parsedData!.buildItems.length > 0 && selectedPlateBounds) {
-      const plateBox = new THREE.Box3().setFromObject(group);
-      plateOffsetX = plateBox.min.x - selectedPlateBounds.minX;
-      plateOffsetZ = plateBox.min.z - selectedPlateBounds.minY;
-    }
-
-    const plateCenterX = buildVolume.x / 2;
-    const plateCenterZ = buildVolume.y / 2;
-    if (!isStandaloneModel && selectedPlateId != null && parsedData!.buildItems.length > 0 && selectedPlateBounds) {
-      group.position.x = centerOffsetX - plateOffsetX;
-      group.position.z = centerOffsetZ - plateOffsetZ;
-    } else if (!isStandaloneModel && selectedPlateId != null && selectedPlateOffset) {
-      group.position.x = centerOffsetX + (plateCenterX - selectedPlateOffset.offsetX);
-      group.position.z = centerOffsetZ + (plateCenterZ - selectedPlateOffset.offsetY);
-    } else if (shouldCenterOnPlate) {
-      group.position.x = centerOffsetX + plateCenterX;
-      group.position.z = centerOffsetZ + plateCenterZ;
-    } else {
-      group.position.x = centerOffsetX;
-      group.position.z = centerOffsetZ;
-    }
-
-    if (plateRef.current) {
-      plateRef.current.position.x = plateCenterX;
-      plateRef.current.position.z = plateCenterZ;
-    }
-    if (gridRef.current) {
-      gridRef.current.position.x = plateCenterX;
-      gridRef.current.position.z = plateCenterZ;
-    }
-    if (shadowCatcherRef.current) {
-      shadowCatcherRef.current.position.x = plateCenterX;
-      shadowCatcherRef.current.position.z = plateCenterZ;
-    }
-
-    fitCameraToBox(cameraRef.current, controlsRef.current, new THREE.Box3().setFromObject(group));
-    setLoading(false);
-  }, [parsedData, stlGeometry, gltfScene, selectedPlateId, filamentColors, buildVolume]);
-
-  const resetView = () => {
-    if (cameraRef.current && controlsRef.current) {
-      cameraRef.current.position.set(150, 150, 150);
-      controlsRef.current.target.set(0, 50, 0);
-      controlsRef.current.update();
-    }
-  };
-
-  const zoom = (factor: number) => {
-    if (cameraRef.current) {
-      cameraRef.current.position.multiplyScalar(factor);
-    }
-  };
-
-  return (
-    <div className={`relative ${className}`}>
-      <div ref={containerRef} className="w-full h-full min-h-[400px]" />
-
-      {loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-bambu-dark/80">
-          <Loader2 className="w-8 h-8 text-bambu-green animate-spin" />
-        </div>
-      )}
-
-      {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-bambu-dark/80">
-          <p className="text-red-400">{error}</p>
-        </div>
-      )}
-
-      {showControls && !loading && !error && (
-        <div className="absolute bottom-4 right-4 flex gap-2">
-          <Button variant="secondary" size="sm" onClick={() => zoom(0.8)} aria-label="Zoom in model">
-            <ZoomIn className="w-4 h-4" />
-          </Button>
-          <Button variant="secondary" size="sm" onClick={() => zoom(1.25)} aria-label="Zoom out model">
-            <ZoomOut className="w-4 h-4" />
-          </Button>
-          <Button variant="secondary" size="sm" onClick={resetView} aria-label="Reset model view">
-            <RotateCcw className="w-4 h-4" />
-          </Button>
-        </div>
-      )}
-    </div>
-  );
+  const zoom = (factor: number) => { if (cameraRef.current) { cameraRef.current.position.multiplyScalar(factor); renderRef.current?.(); } };
+  const reset = () => { if (cameraRef.current && controlsRef.current && modelRef.current) { fitCamera(cameraRef.current, controlsRef.current, modelRef.current); renderRef.current?.(); } };
+  return <div className={`relative ${className}`}>
+    <div ref={containerRef} className="w-full h-full min-h-[400px]" />
+    {loading && <div className="absolute inset-0 flex items-center justify-center bg-bambu-dark/80"><Loader2 className="w-8 h-8 text-bambu-green animate-spin" /></div>}
+    {error && <div className="absolute inset-0 flex items-center justify-center bg-bambu-dark/80"><p className="text-red-400">{error}</p></div>}
+    {showControls && !loading && !error && <div className="absolute bottom-4 right-4 flex gap-2"><Button variant="secondary" size="sm" onClick={() => zoom(.8)} aria-label="Zoom in model"><ZoomIn className="w-4 h-4" /></Button><Button variant="secondary" size="sm" onClick={() => zoom(1.25)} aria-label="Zoom out model"><ZoomOut className="w-4 h-4" /></Button><Button variant="secondary" size="sm" onClick={reset} aria-label="Reset model view"><RotateCcw className="w-4 h-4" /></Button></div>}
+  </div>;
 }

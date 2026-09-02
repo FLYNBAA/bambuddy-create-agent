@@ -29,6 +29,7 @@ from backend.app.api.routes import (
     camwall,
     cloud,
     creator,
+    creator_modules,
     discovery,
     external_links,
     filaments,
@@ -8732,6 +8733,7 @@ app.include_router(obico.router, prefix=app_settings.api_prefix)
 app.include_router(metrics.router, prefix=app_settings.api_prefix)
 app.include_router(virtual_printers.router, prefix=app_settings.api_prefix)
 app.include_router(creator.router, prefix=app_settings.api_prefix)
+app.include_router(creator_modules.router, prefix=app_settings.api_prefix)
 app.include_router(bca_tasks.router, prefix=app_settings.api_prefix)
 app.include_router(spoolbuddy.router, prefix=app_settings.api_prefix)
 

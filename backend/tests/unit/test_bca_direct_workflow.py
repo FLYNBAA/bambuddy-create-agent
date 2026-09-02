@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from backend.app.api.routes import creator_modules
 from backend.app.api.routes.creator import router
 from backend.app.three_d_agent.contracts import (
     ColorCalibrationState,
@@ -62,6 +65,28 @@ def test_creator_router_exposes_only_direct_generation_actions() -> None:
     assert "/creator/sessions/{session_id}/print/generate" not in paths
 
 
+
+def test_creator_module_router_exposes_independent_capabilities() -> None:
+    paths = {route.path for route in creator_modules.router.routes}
+    assert paths == {
+        "/creator/modules/brief/prepare",
+        "/creator/modules/image2/generate",
+        "/creator/modules/model/generate",
+        "/creator/modules/print/multicolor",
+        "/creator/modules/print/calibrate",
+        "/creator/modules/print/analyze",
+    }
+
+
+@pytest.mark.asyncio
+async def test_large_calibration_slot_rejects_second_request_until_release() -> None:
+    assert await creator_modules._try_acquire_calibration_slot()
+    try:
+        assert not await creator_modules._try_acquire_calibration_slot()
+        assert creator_modules._CALIBRATION_RETRY_AFTER_SECONDS == 120
+    finally:
+        creator_modules._CALIBRATION_SLOT.release()
+
 @pytest.mark.asyncio
 async def test_post_calibration_analysis_uses_persisted_glb() -> None:
     snapshot = SessionSnapshot(
@@ -107,6 +132,6 @@ async def test_post_calibration_analysis_uses_persisted_glb() -> None:
     await agent.queue_print_analysis("session")
     result = await agent.run_print_analysis("session")
 
-    assert str(provider.analyzed_path) == "/models/model.glb"
+    assert provider.analyzed_path == Path("/models/model.glb")
     assert result.print_analysis.status is SubworkflowStatus.SUCCEEDED
     assert result.print_analysis.score == 92

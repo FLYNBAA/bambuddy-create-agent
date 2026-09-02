@@ -8,13 +8,12 @@ BCA is a local root administration surface. First-run onboarding must establish 
 
 1. **Authentication and administrator**: complete Setup and understand permission boundaries around plaintext Provider values at `/creator/settings`.
 2. **Printers**: add printers by LAN IP or native discovery; emphasize manual IP in Windows bridge mode.
-3. **Inventory**: add at least one active manual spool with RGB, material, brand, and name for multi-color calibration.
-4. **Creator**: create a session and submit an idea or reference image; answer missing fields.
-5. **Image confirmation**: clearly explain that four concept images incur charges and submit only after confirmation.
-6. **3D confirmation**: after selecting a candidate, independently confirm GLB generation.
-7. **Analysis and 3MF**: explain `healthy` versus warning/error; non-healthy analysis requires a separate acknowledgement.
-8. **Task and slicing**: explain that model 3MF cannot enter queue directly; root must upload `.gcode.3mf`.
-9. **Native queue**: select a `name (model)` printer and submit to Bambuddy's native queue.
+3. **Inventory**: add active manual spools with valid RGB/RGBA, material, brand, and name; explain that Creator calibration reads these `spool` rows, not the color catalog.
+4. **Creator**: create a session, submit an idea/reference image, then select every missing brief field. Explain that the bilingual presentation streams fully before the style-image card appears, while Provider-only `image_prompt` is never shown.
+5. **Direct stages**: explain that Image2, Hunyuan, calibration, and analysis begin from their direct cards without repeated payment or issue-acknowledgement gates; routine onboarding never invokes billed stages.
+6. **Analysis and 3MF**: explain score/insights without advice. A multicolor calibration is complete only with succeeded status, non-empty assignments, and a final artifact.
+7. **Task and slicing**: explain that model 3MF cannot enter queue directly; root must upload `.gcode.3mf`.
+8. **Native queue**: select a `name (model)` printer and submit to Bambuddy's native queue.
 
 ## Never do during onboarding
 

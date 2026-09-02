@@ -8,11 +8,14 @@ The React + TypeScript + Vite frontend is built into repository-level `static/` 
 
 | Route | Component | Current responsibility |
 |---|---|---|
-| `/creator` | `pages/CreatorPage.tsx` | Direct Creator cards for DeepSeek creative presentation, Image2 style images, Hunyuan 3D concept image/model generation, calibration, analysis, and order-task submission. |
+| `/creator` | `pages/CreatorPage.tsx` | Independent API test bench for source-language brief expansion, structured prompt inspection, Image2, model generation, calibration, analysis, and artifact preview. |
 | `/tasks` | `pages/TaskListPage.tsx` | Preserve title/user/customer/phone/address/notes, a currently blank price, and model/style previews; accept root slicing, select a printer, and submit to Bambuddy’s native queue. |
 | `/creator/settings` | `pages/CreatorSettingsPage.tsx` | Update provider credentials, models, and request endpoint/Base URLs, including the Meshy base URL. |
 
-The direct order is Creative presentation → style image → 3D concept image/model → white or 1–8-color calibration using Meshy and material color matching → final color-calibrated 3MF → Meshy + DeepSeek score/insights without advice → order task submission.
+The direct order is brief expansion → Image2 → 3D concept image/model → white or 1–8-color calibration using Meshy and material color matching → final color-calibrated 3MF → Meshy + DeepSeek score/insights without advice → order task submission.
+
+Brief expansion preserves the caller’s source language. Once `subject`, `style`, and `product_type` are populated, it returns `positive_prompt`, `negative_prompt`, `print_constraints`, and the composed `image2_prompt`; the bench makes that completed Image2 text the next-tab input. No presentation streaming or bilingual display shim gates the direct API surface. Model previews preserve source color/materials; a visual fallback colors untextured near-white GLBs without altering downloaded artifacts.
+
 
 ## UI contracts
 

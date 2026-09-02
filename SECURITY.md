@@ -46,8 +46,7 @@ Cache-Control: private, no-store
 
 - Provider Base URL 必须经过 LAN-service HTTP(S) URL 安全检查；危险 scheme、metadata endpoint、数值编码 IP 等必须拒绝。
 - 用户和 Provider URL 下载必须保持域名/重定向/路径安全边界。
-- `MESHY_MODEL_INPUT_MODE=public_url` 只能通过配置的 HTTPS `BCA_PUBLIC_BASE_URL` 和受控 GLB route 暴露。
-- 公网、反向代理或 Tailnet 部署必须启用 Bambuddy 认证；Tailscale 不取代应用身份认证。
+- `MESHY_MODEL_INPUT_MODE=public_url` 使用配置的 HTTPS `BCA_PUBLIC_BASE_URL` 和独立不可猜测的 Provider capability token。这类能力 URL 只供 Meshy 使用，绝不返回浏览器或普通会话客户端。
 
 ### 文件与 3MF
 
@@ -57,9 +56,9 @@ Cache-Control: private, no-store
 
 ### 付费与 Provider
 
-- 图像、3D、多色阶段必须人工明确确认。
-- 付费 POST 不自动重试。
-- 非健康打印分析必须有独立确认，且 smoke 恢复使用相同 session。
+- 产品 UI 没有计费确认门或问题确认门。付费 POST 绝不自动重试；遇到含糊网络结果时调用方必须查询会话状态。
+- `image_prompt` 是仅供 Provider 使用的规范英文输入。浏览器和嵌入客户端只能展示双语 `presentation_*` / `questions` 字段。
+- 多色校准只读取符合条件的活动 `spool` 行，不读取 `color_catalog`；成功映射需要非空 `assignments` 和最终产物。
 - 不要把真实付费凭据或请求/响应复制到公开报告。
 
 ## 贡献者检查

@@ -31,72 +31,103 @@ class OpenAICompatibleImageGenerator:
         image_ready: ImageProgressCallback | None = None,
     ) -> list[GeneratedImage]:
         """Generate exactly four images, preserving a supplied reference input."""
-        api_key = self._settings.image_api_key.get_secret_value().strip()
-        if not api_key:
-            raise ProviderConfigurationError(
-                "Image API key is required to generate concept images."
-            )
-
-        try:
-            import httpx
-        except ImportError as exc:
-            raise ProviderConfigurationError(
-                "httpx is required for OpenAI-compatible image generation."
-            ) from exc
-
-        if reference_image is not None and not reference_image.is_file():
-            raise ProviderError(
-                "The supplied reference image is unavailable; image generation was not attempted."
-            )
-
+        api_key, httpx, base_url = self._generation_client_dependencies()
+        reference_content = await self._reference_content(reference_image)
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
-        base_url = self._settings.image_base_url.rstrip("/")
         trust_env = await self._select_trust_env(httpx, headers, base_url)
-        timeout = httpx.Timeout(self._settings.image_timeout_seconds)
         async with httpx.AsyncClient(
             headers=headers,
-            timeout=timeout,
+            timeout=httpx.Timeout(self._settings.image_timeout_seconds),
             follow_redirects=True,
             **httpx_route_kwargs(trust_env),
         ) as client:
-            reference_content: bytes | None = None
-            if reference_image is not None:
-                try:
-                    reference_content = await asyncio.to_thread(reference_image.read_bytes)
-                except OSError as exc:
-                    raise ProviderError(
-                        "The supplied reference image could not be read; image generation was not attempted."
-                    ) from exc
-                if not reference_content:
-                    raise ProviderError("The supplied reference image is empty.")
-
             images: list[GeneratedImage] = []
             for index in range(4):
-                if reference_image is None:
-                    response = await self._post_generation(client, base_url, prompt)
-                else:
-                    response = await self._post_edit(
-                        client,
-                        base_url,
-                        prompt,
-                        reference_image.name,
-                        reference_content,
-                    )
-                item = self._single_image_item(self._json_response(response))
-                content, media_type = await self._image_from_item(item)
-                image = GeneratedImage(
-                    content=content,
-                    media_type=media_type,
-                    revised_prompt=item.get("revised_prompt") if isinstance(item.get("revised_prompt"), str) else None,
+                image = await self._generate_one_with_client(
+                    client,
+                    base_url,
+                    prompt,
+                    reference_image.name if reference_image else None,
+                    reference_content,
                 )
                 images.append(image)
                 if image_ready is not None:
                     await image_ready(index, image)
-
         return images
+
+    async def generate_one(
+        self,
+        prompt: str,
+        reference_image: Path | None = None,
+    ) -> GeneratedImage:
+        """Generate one square style image for a standalone public module call."""
+        api_key, httpx, base_url = self._generation_client_dependencies()
+        reference_content = await self._reference_content(reference_image)
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        trust_env = await self._select_trust_env(httpx, headers, base_url)
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=httpx.Timeout(self._settings.image_timeout_seconds),
+            follow_redirects=True,
+            **httpx_route_kwargs(trust_env),
+        ) as client:
+            return await self._generate_one_with_client(
+                client,
+                base_url,
+                prompt,
+                reference_image.name if reference_image else None,
+                reference_content,
+            )
+
+    def _generation_client_dependencies(self) -> tuple[str, Any, str]:
+        api_key = self._settings.image_api_key.get_secret_value().strip()
+        if not api_key:
+            raise ProviderConfigurationError("Image API key is required to generate concept images.")
+        try:
+            import httpx
+        except ImportError as exc:
+            raise ProviderConfigurationError("httpx is required for OpenAI-compatible image generation.") from exc
+        return api_key, httpx, self._settings.image_base_url.rstrip("/")
+
+    async def _reference_content(self, reference_image: Path | None) -> bytes | None:
+        if reference_image is None:
+            return None
+        if not reference_image.is_file():
+            raise ProviderError("The supplied reference image is unavailable; image generation was not attempted.")
+        try:
+            content = await asyncio.to_thread(reference_image.read_bytes)
+        except OSError as exc:
+            raise ProviderError("The supplied reference image could not be read; image generation was not attempted.") from exc
+        if not content:
+            raise ProviderError("The supplied reference image is empty.")
+        return content
+
+    async def _generate_one_with_client(
+        self,
+        client: Any,
+        base_url: str,
+        prompt: str,
+        reference_name: str | None,
+        reference_content: bytes | None,
+    ) -> GeneratedImage:
+        response = (
+            await self._post_generation(client, base_url, prompt)
+            if reference_name is None
+            else await self._post_edit(client, base_url, prompt, reference_name, reference_content or b"")
+        )
+        item = self._single_image_item(self._json_response(response))
+        content, media_type = await self._image_from_item(item)
+        return GeneratedImage(
+            content=content,
+            media_type=media_type,
+            revised_prompt=item.get("revised_prompt") if isinstance(item.get("revised_prompt"), str) else None,
+        )
 
     async def _select_trust_env(
         self,

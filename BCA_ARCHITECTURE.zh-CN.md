@@ -4,7 +4,7 @@
 
 ## 范围
 
-BCA 是 Bambuddy 内嵌的单进程创作工作流。身份、打印机、耗材、Library 文件、原生队列交接、认证、WebSocket 传输和部署均由 Bambuddy 唯一负责。BCA 管理创作状态、生成产物、校准、分析和订单任务交接；它不是独立服务，也不是独立 Agent 对话 UI。
+BCA 是 Bambuddy 内嵌的创作 API 功能层。身份、打印机、耗材、Library 文件、原生队列交接、认证、WebSocket 传输和部署均由 Bambuddy 唯一负责。Creator 对外暴露可独立调用的 brief、Image2、图生 GLB、GLB 转 3MF、3MF 校色和分析模块；旧会话只保留为兼容适配器，不再是公网集成模型。
 
 ## 工作流与交接
 
@@ -22,21 +22,26 @@ BCA 是 Bambuddy 内嵌的单进程创作工作流。身份、打印机、耗材
 
 任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、可空价格（当前留空），以及模型/风格预览。Creator 模型 3MF 绝不直接发送到打印机。root 提供的切片包必须包含 `Metadata/plate_N.gcode` 与 `Metadata/slice_info.config`，BCA 才能交给原生队列。
 
+### 源语言提示词契约
+
+最新创意消息决定整个响应语言：中文输入返回中文 brief、问题、展示文案和提示词包；英文输入则全部为英文。`subject`、`style`、`product_type` 全部完成后，BCA 派生 `positive_prompt`、`negative_prompt`、`print_constraints` 及确定性的 `image2_prompt`。固定 Image2 条款明确构图、可打印性、排除项和输出边界；测试台展示完整提示词包，并将 `image2_prompt` 自动带入 Image2 输入框。
+
 ## Creator 与任务职责
 
 | 范围 | 职责 |
 |---|---|
-| Creator 卡片 | 运行直接分阶段工作流；展示风格和模型预览；创建校准产物、分析和订单任务。 |
-| 校准 | 生成白色 3MF，或以 Meshy 与 Bambuddy 耗材颜色匹配生成 1–8 色 3MF；最终多色输出是颜色校准 3MF。 |
+| Creator API 模块 | 执行一个明确请求的能力；绝不为调用方创建或推进工作流。 |
+| Creator 测试台 | 发送单个模块请求，展示原始响应元数据/JSON，并预览返回的图片或模型产物。 |
+| 校准 | 将 GLB 转换为 1–8 色 3MF，再独立将 3MF 颜色匹配到 Bambuddy 耗材库存。 |
 | 分析 | 获取 Meshy 数据及 DeepSeek 评分/洞察；不生成面向用户的建议。 |
-| BCA 任务 | 在 root 附加已验证切片并选择打印机前保留标题、用户、订单和预览。 |
+| BCA 任务 | 旧交接：在 root 附加已验证切片并选择打印机前保留标题、用户、订单和预览。 |
 | Bambuddy | 负责 Library 文件、打印机选择、队列生命周期、派发、取消和打印机状态。 |
 
 ## API 与配置边界
 
-Creator 和任务路由仍在 Bambuddy 应用与其授权模型中。普通产物下载受控；Provider 临时 URL 和服务器文件系统路径不是前端契约。
+Creator 与任务路由仍在 Bambuddy 授权模型中。公网模块客户端使用 queue 范围 API Key；普通产物下载受控；Provider 临时 URL 和服务器文件系统路径绝不是前端契约。
 
-Creator 配置页（`/creator/settings`）可更新 DeepSeek、Image2、Hunyuan 与 Meshy 的 Provider 凭据、模型和请求端点/Base URL，包括 Meshy Base URL。部署值通过显式 `.env.bca` 提供初始配置；BCA 不会发现或读取 source-project `.env` / `.env.local`。持久化 Provider 设置是敏感 Bambuddy 数据库数据。
+`/creator/settings` 仅管理员可访问。Provider 密钥为只写：`GET` 返回非秘密运行参数和 `configured` 状态，`PUT` 可替换密钥但绝不回显。部署值通过显式 `.env.bca` 提供初始配置；BCA 不会发现或读取 source-project `.env` / `.env.local` 文件。
 
 ## 批准与安全边界
 

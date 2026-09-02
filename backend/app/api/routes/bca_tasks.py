@@ -85,13 +85,13 @@ def _response(task: BCATask, user_name: str | None = None) -> BCATaskResponse:
 
 def _archive_members(content: bytes) -> set[str]:
     if len(content) > _MAX_BCA_TASK_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="3MF exceeds the 100 MB upload limit")
+        raise HTTPException(status_code=413, detail=f"3MF exceeds the {_MAX_BCA_TASK_UPLOAD_BYTES // (1024 * 1024)} MB upload limit")
     try:
         validate_3mf_package(content, limits=_BCA_TASK_3MF_LIMITS)
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             return set(archive.namelist())
     except CalibrationError as exc:
-        raise HTTPException(status_code=422, detail="File is not a safe valid 3MF archive") from exc
+        raise HTTPException(status_code=422, detail=f"File is not a safe valid 3MF archive: {exc}") from exc
     except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as exc:
         raise HTTPException(status_code=422, detail="File is not a valid 3MF archive") from exc
 

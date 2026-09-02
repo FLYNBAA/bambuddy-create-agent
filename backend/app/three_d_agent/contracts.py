@@ -95,13 +95,26 @@ class ColorCalibrationState(BaseModel):
 
 
 
+class PromptPackage(BaseModel):
+    """Complete, caller-visible prompt set after the brief becomes actionable."""
+
+    language: Literal["zh", "en"]
+    positive_prompt: str = Field(min_length=1, max_length=6000)
+    negative_prompt: str = Field(min_length=1, max_length=4000)
+    print_constraints: list[str] = Field(min_length=1, max_length=12)
+    image2_prompt: str = Field(min_length=1, max_length=12000)
+
 class CreativeBrief(BaseModel):
-    """The three required decisions for creative generation."""
+    """Canonical English fields with Chinese display counterparts."""
 
     subject: str | None = Field(default=None, max_length=500)
     style: str | None = Field(default=None, max_length=120)
     product_type: str | None = Field(default=None, max_length=120)
     details: str | None = Field(default=None, max_length=1000)
+    subject_zh: str | None = Field(default=None, max_length=500)
+    style_zh: str | None = Field(default=None, max_length=120)
+    product_type_zh: str | None = Field(default=None, max_length=120)
+    details_zh: str | None = Field(default=None, max_length=1000)
 
     @computed_field
     @property
@@ -118,18 +131,24 @@ class CreativeBrief(BaseModel):
 
 
 class BriefExtraction(BaseModel):
-    """Structured DeepSeek result. Existing values may be repeated, never erased."""
+    """Bilingual structured output. Canonical fields are English for downstream prompts."""
 
     subject: str | None = None
     style: str | None = None
     product_type: str | None = None
     details: str | None = None
+    subject_zh: str | None = None
+    style_zh: str | None = None
+    product_type_zh: str | None = None
+    details_zh: str | None = None
 
 
 class ClarificationQuestion(BaseModel):
     field: str
     prompt: str
     options: list[str]
+    prompt_en: str = ""
+    options_en: list[str] = Field(default_factory=list)
 
 
 class StageEvent(BaseModel):
@@ -149,6 +168,8 @@ class SessionSnapshot(BaseModel):
     brief: CreativeBrief = Field(default_factory=CreativeBrief)
     questions: list[ClarificationQuestion] = Field(default_factory=list)
     image_prompt: str | None = None
+    presentation_en: str | None = Field(default=None, max_length=2500)
+    presentation_zh: str | None = Field(default=None, max_length=2500)
     reference_image_path: str | None = None
     generated_image_paths: list[str] = Field(default_factory=list)
     selected_image_index: int | None = Field(default=None, ge=0, le=3)

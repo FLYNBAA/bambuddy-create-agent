@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Final
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .calibration import CalibrationError, CalibrationLimits, validate_3mf_package
 from .config import Settings
 from .contracts import SessionSnapshot, SessionStatus
 from .network import assert_allowed_provider_artifact_url
@@ -40,6 +41,21 @@ _LEGACY_STATUSES: Final[dict[str, str]] = {
     "awaiting_3d_confirmation": SessionStatus.AWAITING_IMAGE_SELECTION.value,
     "queued": SessionStatus.QUEUED_IMAGE.value,
     "generating_image": SessionStatus.GENERATING_IMAGES.value,
+}
+
+_LEGACY_QUESTION_ENGLISH: Final[dict[str, tuple[str, tuple[str, ...]]]] = {
+    "subject": (
+        "What single subject should this creation depict?",
+        ("Animal", "Person", "Anime character", "Mechanical model", "Everyday object", "Other"),
+    ),
+    "style": (
+        "Which visual style should the subject use?",
+        ("Chibi", "Anime", "Realistic", "Minimal", "Low poly", "Chinese style", "Other"),
+    ),
+    "product_type": (
+        "What type of 3D-printed object should this become?",
+        ("Figurine", "Desk ornament", "Pendant", "Keychain", "Phone stand", "Blind-box character", "Other"),
+    ),
 }
 
 
@@ -129,6 +145,37 @@ class SessionRepository:
                     and payload.get("selected_image_index") is None
                 ):
                     payload["selected_image_index"] = 0
+
+            questions = payload.get("questions")
+            if isinstance(questions, list):
+                for question in questions:
+                    if not isinstance(question, dict):
+                        continue
+                    defaults = _LEGACY_QUESTION_ENGLISH.get(question.get("field"))
+                    if defaults is None:
+                        continue
+                    prompt_en, options_en = defaults
+                    if not question.get("prompt_en"):
+                        question["prompt_en"] = prompt_en
+                        changed = True
+                    if not question.get("options_en"):
+                        question["options_en"] = list(options_en)
+                        changed = True
+
+            brief = payload.get("brief")
+            if isinstance(brief, dict) and payload.get("image_prompt"):
+                english = " · ".join(str(brief[field]) for field in ("subject", "style", "product_type", "details") if brief.get(field))
+                chinese = " · ".join(
+                    str(brief.get(f"{field}_zh") or brief[field])
+                    for field in ("subject", "style", "product_type", "details")
+                    if brief.get(f"{field}_zh") or brief.get(field)
+                )
+                if not payload.get("presentation_en") and english:
+                    payload["presentation_en"] = english
+                    changed = True
+                if not payload.get("presentation_zh") and chinese:
+                    payload["presentation_zh"] = chinese
+                    changed = True
 
             if changed:
                 connection.execute(
@@ -273,17 +320,16 @@ class ArtifactStore:
         content: bytes,
         media_type: str = "image/png",
     ) -> Path:
-        """Decode and atomically persist one indexed provider image as PNG."""
+        """Persist a provider image as a normalized, letterboxed square PNG."""
         if image_index not in range(4):
             raise ValueError("Generated image index must be between 0 and 3")
         del media_type
-        normalized = self._normalize_to_png(content, "Generated image")
+        normalized = self._normalize_to_png(content, "Generated image", square=True)
         return self._atomic_write(
-            self._session_directory(self._images_dir, session_id) / f"image-{image_index}.png",
-            normalized,
+            self._session_directory(self._images_dir, session_id) / f"image-{image_index}.png", normalized
         )
 
-    def _normalize_to_png(self, content: bytes, label: str) -> bytes:
+    def _normalize_to_png(self, content: bytes, label: str, *, square: bool = False) -> bytes:
         data = self._as_byte_view(content)
         if data.nbytes == 0:
             raise ValueError(f"{label} is empty")
@@ -311,6 +357,15 @@ class ArtifactStore:
                         image = image.convert("RGBA")
                     else:
                         image = image.convert("RGB")
+                    if square and image.width != image.height:
+                        side = min(max(image.width, image.height), int(self._max_upload_pixels**0.5))
+                        fill = (255, 255, 255, 0) if image.mode == "RGBA" else (255, 255, 255)
+                        image = ImageOps.pad(
+                            image,
+                            (side, side),
+                            method=Image.Resampling.LANCZOS,
+                            color=fill,
+                        )
                     output = io.BytesIO()
                     image.save(output, format="PNG")
         except ValueError:
@@ -430,22 +485,16 @@ class ArtifactStore:
             raise ValueError("Downloaded GLB has an invalid header")
 
     def _validate_3mf(self, path: Path) -> None:
+        """Apply the same safe-package contract to downloads and uploads."""
+        limits = CalibrationLimits(
+            max_input_bytes=self._max_remote_download_bytes,
+            max_member_bytes=self._max_remote_download_bytes,
+            max_total_uncompressed=self._max_uncompressed_3mf_bytes,
+        )
         try:
-            with zipfile.ZipFile(path) as archive:
-                members = archive.infolist()
-                total_size = sum(member.file_size for member in members)
-                if total_size > self._max_uncompressed_3mf_bytes:
-                    raise ValueError("Downloaded 3MF exceeds the allowed uncompressed size")
-                names = {member.filename for member in members}
-                has_model = any(
-                    name.startswith("3D/") and name.endswith(".model") for name in names
-                )
-                if "[Content_Types].xml" not in names or not has_model:
-                    raise ValueError("Downloaded print file is not a valid 3MF archive")
-                if archive.testzip() is not None:
-                    raise ValueError("Downloaded print file is corrupt")
-        except zipfile.BadZipFile as exc:
-            raise ValueError("Downloaded print file is not a valid 3MF archive") from exc
+            validate_3mf_package(path, limits=limits)
+        except CalibrationError as exc:
+            raise ValueError("Downloaded print file is not a safe valid 3MF archive") from exc
 
     def _session_directory(self, root: Path, session_id: str) -> Path:
         if not _SESSION_ID_PATTERN.fullmatch(session_id):

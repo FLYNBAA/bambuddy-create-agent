@@ -16,8 +16,12 @@ This inventory covers the BCA-specific Markdown documents that define current wo
 
 ## Current cross-document contract
 
-- BCA’s direct order is Creative presentation (DeepSeek) → style image (Image2) → 3D concept image/model (Hunyuan) → white or 1–8-color calibration using Meshy and material color matching → final color-calibrated 3MF → Meshy + DeepSeek score/insights without advice → order task submission.
+- BCA’s direct order is source-language brief expansion → Image2 → 3D concept image/model → white or 1–8-color calibration using Meshy and material color matching → final color-calibrated 3MF → Meshy + DeepSeek score/insights without advice → order task submission.
 - Tasks retain title, user, order, model preview, and style preview while awaiting root slicing and native queueing. Model 3MF is not directly printable; root supplies the validated sliced `.gcode.3mf`.
+- Brief responses use the newest message language end-to-end. When `subject`, `style`, and `product_type` are complete, the API returns a visible `positive_prompt`, `negative_prompt`, `print_constraints`, and deterministic `image2_prompt`; the direct test bench seeds Image2 from that final string.
+- GLB/3MF previews preserve model colors and mapped materials. Untextured near-white GLBs use a presentation-only fallback tint.
+- Calibration inventory is active eligible `spool` data, not `color_catalog`. A multicolor success claim requires succeeded status, non-empty assignments, and a final calibrated artifact.
+- The workspace-root `BCA_EXTERNAL_API_AND_CALIBRATION.md` records the external REST contract, API-Key boundary, current production spool evidence, and the distinction between recognized candidates and a completed multicolor assignment.
 - Creator configuration edits provider request endpoints/Base URLs, including the Meshy base URL, alongside credentials and model settings. Explicit `.env.bca` provides deployment initial values; source-project `.env` and `.env.local` are not BCA configuration inputs.
 - Linux Compose builds local BCA source as `bambuddy-bca:local` and uses explicit `.env.bca`. Linux host networking retains SSDP. Windows and bridge deployments use declared `BCA_DISCOVERY_SUBNETS` CIDRs and unicast scans.
 - The supported Nginx template is [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf); it preserves upstream authentication and forwards WebSocket and forwarded-request headers.

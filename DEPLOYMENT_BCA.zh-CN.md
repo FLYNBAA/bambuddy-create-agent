@@ -30,15 +30,17 @@ docker compose --env-file .env.bca -f .\docker-compose.yml -f .\docker-compose.w
 
 ## 2. Provider 配置
 
-`/creator/settings` 的 Creator 配置可编辑 DeepSeek、Image2、Hunyuan 和 Meshy 的凭据、模型及 Provider 请求端点/Base URL；Meshy Base URL 可配置。显式 `.env.bca` 提供部署初始值；BCA 不读取 source-project `.env` 或 `.env.local`。
+`/creator/settings` 的 Creator 配置可编辑非秘密运行参数，并接受 DeepSeek、Image2、Hunyuan 和 Meshy 的只写凭据替换。`GET /api/v1/creator/config` 永不返回凭据，只返回运行参数和 `configured` 状态。显式 `.env.bca` 提供部署初始值；BCA 不读取 source-project `.env` 或 `.env.local`。
 
-持久化 Creator 配置是敏感数据库状态。配置页、数据库、备份和 `.env.bca` 都必须在管理员控制下。不要把凭据放入任务记录、预览、源码或公开文档。
+持久化 Creator 配置仍是敏感数据库状态。配置页、数据库、备份和 `.env.bca` 都必须在管理员控制下。不要把凭据放入任务记录、预览、源码或公开文档。
+
+公网集成应使用 `BCA_EXTERNAL_API_AND_CALIBRATION.md` 说明的独立 `/api/v1/creator/modules/*` 能力路由。`/creator` 页面是逐请求测试台，不是工作流编排器。
 
 ## 3. 反向代理与公网 origin
 
-仓库中的生产 Nginx 模板为 [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf)。用它作为静态应用服务及 API/WebSocket 到 Bambuddy 代理的拓扑参考。它保留上游认证，并转发 WebSocket 与 forwarded-request 头。
+仓库中的生产 Nginx 模板为 [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf)。用它作为静态应用服务及 API/WebSocket 到 Bambuddy 代理的拓扑参考。它保留上游认证和 forwarded 头，为产物/上传关闭代理缓冲，并设置 1000 秒 API 读/发送超时，因为 Meshy/Hunyuan 模块调用可持续至 900 秒。
 
-使用 `MESHY_MODEL_INPUT_MODE=public_url` 时，将 `BCA_PUBLIC_BASE_URL` 设置为可从外部访问、且代理受控模型路由的 HTTPS origin。反向代理、DNS、证书签发和可信 forwarded-header 策略均由运维基础设施负责。不得声称 BCA 会提供证书或信任任意 forwarded headers。
+上线前必须通过已部署的 HTTPS/Nginx origin 下载受认证的大型 3MF，并把 `Content-Length` 与 SHA-256 和持久化文件逐一比较。进程内 FastAPI 测试不足以验证代理路径。
 
 ## 4. Tailscale 与发现
 

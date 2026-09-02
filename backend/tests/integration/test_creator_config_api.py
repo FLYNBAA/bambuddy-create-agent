@@ -35,7 +35,7 @@ async def test_creator_config_persists_safe_meshy_base_url(async_client, db_sess
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_creator_config_persists_plaintext_provider_credentials(async_client, db_session) -> None:
+async def test_creator_config_persists_write_only_provider_credentials(async_client, db_session) -> None:
     credentials = {
         "deepseek_api_key": "test-deepseek-plain",
         "image_api_key": "test-image-plain",
@@ -48,7 +48,7 @@ async def test_creator_config_persists_plaintext_provider_credentials(async_clie
 
     assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "private, no-store"
-    assert {key: response.json()[key] for key in credentials} == credentials
+    assert not set(credentials).intersection(response.json())
     rows = await db_session.execute(
         select(Settings).where(Settings.key.in_([f"bca_creator_{key}" for key in credentials]))
     )
@@ -57,4 +57,10 @@ async def test_creator_config_persists_plaintext_provider_credentials(async_clie
     loaded = await async_client.get("/api/v1/creator/config")
     assert loaded.status_code == 200
     assert loaded.headers["cache-control"] == "private, no-store"
-    assert {key: loaded.json()[key] for key in credentials} == credentials
+    assert not set(credentials).intersection(loaded.json())
+    assert loaded.json()["configured"] == {
+        "deepseek": True,
+        "image": True,
+        "hunyuan": True,
+        "meshy": True,
+    }

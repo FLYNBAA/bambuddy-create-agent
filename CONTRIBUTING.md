@@ -74,10 +74,10 @@ DEPLOYMENT_BCA.md / DEPLOYMENT_BCA.zh-CN.md
 
 ## 付费和状态机改动
 
-- 图像、3D 与 Meshy 多色请求需要明确确认。
-- 付费 POST 不得自动重试。
-- 非 `healthy` 分析必须有独立问题确认；full smoke 应恢复同一 session，不能重跑图像/3D。
-- 新状态同步更新 contracts、service、API、frontend、测试和文档。
+- 产品 UI 没有付费/问题确认门。计费 POST 由选定的直接卡片/API 阶段人工发起，绝不自动重试，常规测试不得调用。
+- 成功多色校准必须同时满足 `color_calibration.status == "succeeded"`、非空 `assignments` 和最终校准产物；候选来自符合条件的活动 `spool`，绝不来自 `color_catalog`。
+- Creator 展示层改动必须把规范英文 Provider 字段与双语 `presentation_*` 展示字段分开；所选 presentation 流式完成前不得暴露下一个卡片。
+- 新状态必须同步更新 contracts、storage migration、service、API、frontend、测试和文档。
 - 取消必须持久化失败状态再抛出 `CancelledError`。
 
 ## 前端改动

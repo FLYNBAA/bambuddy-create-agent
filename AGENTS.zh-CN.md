@@ -112,6 +112,8 @@ backend/app/
 4. 混元结果必须先下载、验证、持久化，再公开 GLB 预览路由。
 5. 打印校准在 GLB 完成后执行。白模使用一个逻辑色并将最终 3MF 统一为白色；多色接受 `1..8`，先由 Meshy 转换，再由 DeepSeek 匹配 Bambuddy 活动耗材。
 6. 打印分析只在最终校准后开放；Meshy 分析已持久化 GLB，DeepSeek 将指标转为评分与事实洞察；禁止输出建议。
+- Creator 把规范英文 Provider 提示字段与 `presentation_en` / `presentation_zh` 分开持久化。UI 只能流式显示当前语言的 presentation，不能展示 `image_prompt`；只有 `questions` 为空且该 presentation 的最后一个字符已输出后才允许展开下游卡片。
+- Creator 校准只读取实际 `spool` 表中 `archived_at IS NULL`、`material` 非空且 RGB/RGBA 合法的记录；`color_catalog` 不是校准库存来源。成功多色校准必须同时存在非空 `assignments` 和最终校准产物。
 7. UI 和 API 没有付费确认门或问题确认门。计费 smoke 仍需在执行点取得运维方明确批准，且禁止自动重试。
 8. 任一重做必须清除该阶段及所有下游路径、状态、待下载 Provider URL 和任务资格；旧产物不得继续下载。
 9. 取消、失败和进程恢复必须持久化终止状态，不能留下永久 running 会话。

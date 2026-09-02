@@ -46,8 +46,7 @@ Do not write credentials to ordinary creator snapshots, tasks, Provider errors, 
 
 - Provider base URLs must pass LAN-service HTTP(S) URL safety checks. Dangerous schemes, metadata endpoints, numeric encoded IPs, and similar targets are rejected.
 - User and Provider URL downloads keep domain, redirect, and path-security boundaries.
-- `MESHY_MODEL_INPUT_MODE=public_url` exposes GLB only through configured HTTPS `BCA_PUBLIC_BASE_URL` and the controlled route.
-- Public, reverse-proxy, or tailnet deployment requires Bambuddy authentication. Tailscale does not replace application identity.
+- `MESHY_MODEL_INPUT_MODE=public_url` uses configured HTTPS `BCA_PUBLIC_BASE_URL` plus independent, unguessable Provider capability tokens. These capability URLs are for Meshy only and are never returned to browser/session clients.
 
 ### Files and 3MF
 
@@ -57,9 +56,9 @@ Do not write credentials to ordinary creator snapshots, tasks, Provider errors, 
 
 ### Billing and Providers
 
-- Image, 3D, and multi-color stages require explicit human confirmation.
-- Billed POSTs are never automatically retried.
-- Non-healthy print analysis requires a separate acknowledgement and smoke must resume the same session.
+- Product UI has no billed-confirmation or issue-acknowledgement gates. Paid POSTs are never automatically retried; callers must inspect session state rather than retry after an ambiguous network outcome.
+- `image_prompt` is Provider-only canonical English input. Browser and embedded clients render only bilingual `presentation_*` / `questions` fields.
+- Multicolor calibration reads only active eligible `spool` rows, not `color_catalog`; successful mapping requires non-empty `assignments` and a final artifact.
 - Do not copy real paid credentials or request/response bodies into public reports.
 
 ## Contributor checks

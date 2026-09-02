@@ -48,8 +48,8 @@ dtoverlay=spi0-0cs
 ## BCA relationship
 
 - SpoolBuddy does not store BCA Provider credentials or creator sessions.
-- BCA multi-color calibration reads active, unarchived Bambuddy manual spools with valid RGBA.
-- SpoolBuddy can maintain inventory, but Creator receives calibration candidates through Bambuddy inventory APIs and database data.
+- BCA multi-color calibration reads active, unarchived Bambuddy `spool` rows with valid RGBA and non-empty material; it does not query the color catalog. Brand/name are matching evidence, not eligibility gates.
+- SpoolBuddy can maintain inventory, but Creator receives calibration candidates through Bambuddy inventory APIs and database data. A completed multicolor mapping has non-empty `assignments` plus a final calibrated artifact.
 
 ## Developer verification
 

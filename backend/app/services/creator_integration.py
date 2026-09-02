@@ -76,6 +76,8 @@ class CreatorSessionResponse(BaseModel):
     brief: dict[str, Any]
     questions: list[dict[str, Any]]
     image_prompt: str | None
+    presentation_en: str | None
+    presentation_zh: str | None
     generated_images: list[str]
     image_generation: dict[str, Any]
     model_generation: dict[str, Any]
@@ -126,6 +128,8 @@ class CreatorController:
             brief=snapshot.brief.model_dump(mode="json"),
             questions=[item.model_dump(mode="json") for item in snapshot.questions],
             image_prompt=snapshot.image_prompt,
+            presentation_en=snapshot.presentation_en,
+            presentation_zh=snapshot.presentation_zh,
             generated_images=[f"{base}/images/{index}" for index in range(len(snapshot.generated_image_paths))],
             image_generation={"status": image_status},
             model_generation={"status": model_status},

@@ -18,7 +18,9 @@ Creative presentation (DeepSeek)
   → root slicing and native queue handoff
 ```
 
-The workflow is driven by Creator cards, not by a separate agent-chat product. A task retains its title, user, customer name, phone, address, notes, intentionally blank price, and model/style previews while it awaits root slicing and queueing. A model 3MF is not a printer job: root attaches the slicer-produced `.gcode.3mf`, BCA validates it, and Bambuddy performs the native queue handoff.
+BCA operates as an external API capability layer and no longer requires Creator-card workflow orchestration. `/creator` is a one-module test bench: it sends one independent capability request, exposes a data window, and previews returned images, GLBs, or 3MFs. Public clients compose brief, Image2, image-to-model, multicolor conversion, calibration, and analysis as needed; printer handoff remains root's `.gcode.3mf` plus Bambuddy's native queue.
+
+GLB previews preserve native materials. 3MF previews use Three.js' official `ThreeMFLoader` for standard material/color/texture groups and convert its Z-up root to the WebGL Y-up scene. Image2 output is normalized to a 1:1 PNG without stretching the subject.
 
 A valid sliced package contains both:
 
@@ -31,16 +33,16 @@ Metadata/slice_info.config
 
 | Page | Route | Current responsibility |
 |---|---|---|
-| Creator | `/creator` | Direct workflow cards, style/model previews, calibration, analysis, and task submission. |
-| BCA Tasks | `/tasks` | Task title/user/order context, previews, root slicing attachment, printer selection, and native queue submission. |
-| Creator configuration | `/creator/settings` | Provider credentials, models, request endpoints, and runtime settings. |
+| Creator | `/creator` | Independent API module test bench: request, raw data window, image/model preview. |
+| BCA Tasks | `/tasks` | Legacy task/order context, root slicing attachment, printer selection, and native queue submission. |
+| Creator configuration | `/creator/settings` | Write-only provider credentials, non-secret runtime settings, and provider state. |
 | Native Bambuddy pages | printers, materials, Library, queue | Authoritative printer, material, Library, and queue behavior. |
 
 Authenticated previews use controlled, Bearer-authenticated Blob fetches; do not expose provider temporary URLs or use a protected artifact route as a raw `<img src>`.
 
 ## Provider configuration
 
-Creator configuration can edit the request endpoint/base URL as well as credentials and model settings for DeepSeek, Image2, Hunyuan, and Meshy. This includes the Meshy base URL. Initial deployment values come from the explicit `.env.bca` file; BCA does not read a source-project `.env` or `.env.local`. Persisted creator settings are sensitive database data and must be handled as credentials.
+Creator configuration returns non-secret runtime values and provider state only; credentials are write-only and never echoed by GET or save responses. Initial deployment values come from explicit `.env.bca`; BCA does not read a source-project `.env` or `.env.local`. Persisted creator settings are sensitive database data and must be handled as credentials.
 
 ## Deployment and discovery
 

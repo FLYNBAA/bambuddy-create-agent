@@ -74,10 +74,10 @@ Do not write credentials to ordinary creator snapshots, tasks, logs, public down
 
 ## Payment and state-machine changes
 
-- Image, 3D, and Meshy multi-color calls require explicit confirmation.
-- Billed POSTs are never automatically retried.
-- A non-`healthy` analysis requires a separate issue acknowledgement; full smoke must resume the same session instead of rerunning image/3D work.
-- New states update contracts, service, API, frontend, tests, and documents together.
+- Product UI has no payment/issue-acknowledgement gate. Billed POSTs are manually initiated by the chosen direct card/API stage, never automatically retried, and routine tests never invoke them.
+- A completed multi-color calibration requires `color_calibration.status == "succeeded"`, non-empty `assignments`, and a final calibrated artifact. Its candidates are eligible active `spool` rows, never `color_catalog`.
+- Changes to Creator presentation must keep canonical English Provider fields separate from bilingual `presentation_*` display fields; stream the selected presentation completely before exposing the next card.
+- New states update contracts, storage migration, service, API, frontend, tests, and documents together.
 - Cancellation persists failure state before re-raising `CancelledError`.
 
 ## Frontend changes

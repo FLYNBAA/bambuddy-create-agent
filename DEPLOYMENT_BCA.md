@@ -30,15 +30,17 @@ Use ordinary Compose stop/removal for normal shutdown. Do not remove data volume
 
 ## 2. Provider configuration
 
-Creator configuration at `/creator/settings` edits credentials, models, and provider request endpoints/Base URLs for DeepSeek, Image2, Hunyuan, and Meshy. Meshy’s base URL is configurable. The explicit `.env.bca` file provides initial deployment values; BCA does not read source-project `.env` or `.env.local` files.
+Creator configuration at `/creator/settings` edits non-secret runtime parameters and accepts write-only credential replacements for DeepSeek, Image2, Hunyuan, and Meshy. `GET /api/v1/creator/config` never returns credentials; it returns runtime values and `configured` state only. The explicit `.env.bca` file provides initial deployment values; BCA does not read source-project `.env` or `.env.local` files.
 
-Persisted creator configuration is sensitive database state. Keep the configuration page, database, backups, and `.env.bca` under administrator control. Do not put credentials in task records, previews, source code, or public documentation.
+Persisted creator configuration remains sensitive database state. Keep the configuration page, database, backups, and `.env.bca` under administrator control. Do not put credentials in task records, previews, source code, or public documentation.
+
+Public integrations should use the independently callable `/api/v1/creator/modules/*` capability routes described in `BCA_EXTERNAL_API_AND_CALIBRATION.md`. The `/creator` page is a test bench for one request at a time, not a workflow orchestrator.
 
 ## 3. Reverse proxy and public origin
 
-The repository production Nginx template is [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf). Use it as the topology reference for serving the static application and proxying API/WebSocket traffic to Bambuddy. It preserves upstream authentication and forwards WebSocket and forwarded-request headers.
+The repository production Nginx template is [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf). Use it as the topology reference for serving the static application and proxying API/WebSocket traffic to Bambuddy. It preserves upstream authentication and forwarded headers, disables proxy buffering for artifacts/uploads, and sets 1000-second API read/send timeouts because Meshy/Hunyuan module calls may take up to 900 seconds.
 
-If `MESHY_MODEL_INPUT_MODE=public_url`, set `BCA_PUBLIC_BASE_URL` to the externally reachable HTTPS origin that proxies the controlled model route. The reverse proxy, DNS, certificate issuance, and trusted-forwarded-header policy are operator infrastructure responsibilities. Do not claim BCA provisions certificates or trusts arbitrary forwarded headers.
+Before rollout, download a protected large 3MF through the deployed HTTPS/Nginx origin and compare both `Content-Length` and SHA-256 with the persisted file. This validates the proxy path; an in-process FastAPI test alone is insufficient.
 
 ## 4. Tailscale and discovery
 

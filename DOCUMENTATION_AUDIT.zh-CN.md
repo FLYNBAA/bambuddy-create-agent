@@ -16,8 +16,12 @@
 
 ## 当前跨文档契约
 
-- BCA 直接顺序为：创意展示（DeepSeek）→ 风格图（Image2）→ 3D 概念图/模型（Hunyuan）→ 以 Meshy 和耗材颜色匹配执行白色或 1–8 色校准 → 最终颜色校准 3MF → Meshy + DeepSeek 评分/洞察且不提供建议 → 订单任务提交。
+- BCA 直接顺序为：源语言创意扩充 → Image2 → 3D 概念图/模型 → 以 Meshy 和耗材颜色匹配执行白色或 1–8 色校准 → 最终颜色校准 3MF → Meshy + DeepSeek 评分/洞察且不提供建议 → 订单任务提交。
 - 任务等待 root 切片和原生排队时保留标题、用户、订单、模型预览和风格预览。模型 3MF 不能直接打印；root 提供通过验证的切片 `.gcode.3mf`。
+- brief 响应从最新消息开始全程保留源语言。`subject`、`style`、`product_type` 完成后，API 返回可见的 `positive_prompt`、`negative_prompt`、`print_constraints` 和确定性的 `image2_prompt`；直接测试台将该最终文本带入 Image2。
+- GLB/3MF 预览保留模型颜色和映射材质；无纹理近白 GLB 仅在展示层使用回退色彩。
+- 校准库存是符合条件的活动 `spool` 数据，不是 `color_catalog`。任何“多色校准成功”声明必须同时具备 succeeded、非空 assignments 和最终校准产物。
+- 工作根目录的 `BCA_EXTERNAL_API_AND_CALIBRATION.md` 记录外部 REST 契约、API Key 边界、当前生产 Spool 证据，以及“候选已识别”和“多色 assignments 已成功”的区别。
 - Creator 配置可编辑 Provider 请求端点/Base URL，包括 Meshy Base URL，以及凭据与模型设置。显式 `.env.bca` 提供部署初始值；source-project `.env` 与 `.env.local` 不是 BCA 配置输入。
 - Linux Compose 从本地 BCA 源码构建 `bambuddy-bca:local` 并使用显式 `.env.bca`。Linux host networking 保留 SSDP。Windows 与 bridge 部署使用声明的 `BCA_DISCOVERY_SUBNETS` CIDR 和单播扫描。
 - 支持的 Nginx 模板是 [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf)；它保留上游认证，并转发 WebSocket 和 forwarded-request 头。

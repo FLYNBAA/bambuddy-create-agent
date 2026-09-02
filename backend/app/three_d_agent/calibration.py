@@ -57,11 +57,13 @@ class SourceColor:
 
 @dataclass(frozen=True, slots=True)
 class CalibrationLimits:
-    max_input_bytes: int = 100 * 1024 * 1024
-    max_members: int = 512
-    max_member_bytes: int = 50 * 1024 * 1024
-    max_total_uncompressed: int = 200 * 1024 * 1024
-    max_compression_ratio: float = 200.0
+    # Meshy/Bambu model XML is highly compressible: a 34 MiB package can hold
+    # one legitimate object model far above 100 MiB after decompression.
+    max_input_bytes: int = 512 * 1024 * 1024
+    max_members: int = 2048
+    max_member_bytes: int = 512 * 1024 * 1024
+    max_total_uncompressed: int = 512 * 1024 * 1024
+    max_compression_ratio: float = 500.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,10 +153,24 @@ def _read_package(
             members: list[tuple[zipfile.ZipInfo, bytes]] = []
             for info in infos:
                 is_symlink = ((info.external_attr >> 16) & 0o170000) == 0o120000
+                # ZIP directory entries are optional metadata. Meshy and common
+                # 3MF exporters emit them; reject unsafe/non-empty directories,
+                # but never treat a harmless `3D/` or `_rels/` entry as model
+                # content or a validation failure.
+                if info.is_dir():
+                    directory_name = info.filename.rstrip("/")
+                    if (
+                        not _safe_name(directory_name)
+                        or info.file_size
+                        or info.compress_size
+                        or info.flag_bits & 0x1
+                        or is_symlink
+                    ):
+                        raise CalibrationError("unsafe 3MF directory member")
+                    continue
                 if (
                     info.filename in names
                     or not _safe_name(info.filename)
-                    or info.is_dir()
                     or info.flag_bits & 0x1
                     or is_symlink
                 ):

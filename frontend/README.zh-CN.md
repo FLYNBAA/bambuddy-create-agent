@@ -8,11 +8,13 @@ React + TypeScript + Vite 前端构建到仓库根目录 `static/`，由 Bambudd
 
 | 路由 | 组件 | 当前职责 |
 |---|---|---|
-| `/creator` | `pages/CreatorPage.tsx` | 用于 DeepSeek 创意展示、Image2 风格图、Hunyuan 3D 概念图/模型生成、校准、分析和订单任务提交的直接 Creator 卡片。 |
+| `/creator` | `pages/CreatorPage.tsx` | 面向源语言创意扩充、结构化提示词检查、Image2、模型生成、校色、分析和产物预览的独立 API 测试台。 |
 | `/tasks` | `pages/TaskListPage.tsx` | 保留标题、用户、姓名、手机号、地址、备注、当前留空价格及模型/风格预览，接收 root 切片、选择打印机并提交到 Bambuddy 原生队列。 |
 | `/creator/settings` | `pages/CreatorSettingsPage.tsx` | 更新 Provider 凭据、模型和请求端点/Base URL，包括 Meshy Base URL。 |
 
-直接顺序为：创意展示 → 风格图 → 3D 概念图/模型 → 通过 Meshy 和耗材颜色匹配进行白色或 1–8 色校准 → 最终颜色校准 3MF → Meshy + DeepSeek 评分/洞察且不提供建议 → 订单任务提交。
+直接顺序为：创意扩充 → Image2 → 3D 概念图/模型 → 通过 Meshy 和耗材颜色匹配进行白色或 1–8 色校准 → 最终颜色校准 3MF → Meshy + DeepSeek 评分/洞察且不提供建议 → 订单任务提交。
+
+创意扩充保留调用方源语言。`subject`、`style`、`product_type` 齐全时返回 `positive_prompt`、`negative_prompt`、`print_constraints` 和组合后的 `image2_prompt`；测试台将完成的 Image2 文本自动写入下一标签页输入框。直接 API 不使用 presentation 流式或双语展示 shim 作为门槛。模型预览保留源颜色/材质；无纹理近白 GLB 使用仅展示层的色彩回退，不修改下载产物。
 
 ## UI 契约
 

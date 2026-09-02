@@ -139,6 +139,8 @@ Rules:
 4. Hunyuan output is downloaded, validated, and persisted before the GLB preview route is exposed.
 5. Print calibration runs after GLB completion. White mode requests one logical color and normalizes the final 3MF to white. Multicolor accepts `1..8`, runs Meshy conversion, then DeepSeek matching against active Bambuddy inventory.
 6. Print analysis is exposed only after final calibration; Meshy analyzes the persisted GLB and DeepSeek turns those metrics into a score and factual insights. It must not emit recommendations.
+- Creator stores canonical English prompt fields separately from `presentation_en` / `presentation_zh`. The UI MUST stream only the active presentation language and MUST NOT expose `image_prompt`. A downstream card opens only after `questions` is empty **and** that presentation stream has emitted its last character.
+- Creator calibration consumes only active `spool` rows with `archived_at IS NULL`, non-empty `material`, and valid RGB/RGBA. It does not use `color_catalog` as a calibration inventory source. A successful multicolor calibration requires non-empty `assignments` plus the final calibrated artifact.
 7. The UI and API contain no paid-confirmation or issue-acknowledgement gates. Billed smoke runs still require explicit operator approval at the point of execution; automatic retries remain prohibited.
 8. Every redo clears the selected stage and all downstream paths, states, pending Provider URLs, and task eligibility. Stale artifacts must never remain downloadable.
 9. Main and subworkflow cancellation/failure persists a terminal failed state; no session may remain running after process recovery.

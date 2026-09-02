@@ -579,6 +579,9 @@ body {
 .creator-panel-heading p, .creator-workflow-heading p, .creator-card p, .bca-task-page header p, .bca-task-meta p { margin: .3rem 0 0; color: var(--text-secondary); font-size: .84rem; line-height: 1.5; }
 .creator-workflow-heading { padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
 .creator-workflow-heading h2 { font-size: 1.35rem; letter-spacing: -.02em; }
+.creator-language-toggle { display: inline-flex; flex: none; gap: .2rem; padding: .2rem; border: 1px solid var(--border-color); border-radius: 9px; background: var(--bg-tertiary); }
+.creator-language-toggle button { border: 0; border-radius: 6px; background: transparent; color: var(--text-secondary); padding: .3rem .55rem; font-size: .75rem; font-weight: 750; }
+.creator-language-toggle button.is-active { background: var(--bg-secondary); color: var(--accent); box-shadow: 0 1px 3px color-mix(in srgb, black 15%, transparent); }
 .icon-button, .small-action, .bca-task-actions button, .bca-task-process button { display: inline-flex; align-items: center; justify-content: center; gap: .35rem; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-tertiary); color: var(--text-primary); padding: .42rem .6rem; }
 .icon-button:hover:not(:disabled), .small-action:hover:not(:disabled), .bca-task-actions button:hover:not(:disabled), .bca-task-process button:hover:not(:disabled) { border-color: var(--accent); }
 .small-action { color: var(--accent); font-size: .78rem; font-weight: 750; }
@@ -604,6 +607,12 @@ body {
 .creator-creative-result { display: flex; gap: .55rem; margin-top: .85rem; padding-top: .8rem; border-top: 1px solid var(--border-color); color: var(--accent); }
 .creator-creative-result > div { min-width: 0; color: var(--text-primary); }
 .creator-creative-result p { max-width: 72ch; }
+.creator-clarifications { display: grid; gap: .8rem; margin-top: .9rem; padding-top: .9rem; border-top: 1px solid var(--border-color); }
+.creator-clarifications h4, .creator-clarifications legend { margin: 0; color: var(--text-primary); font-size: .88rem; font-weight: 750; }
+.creator-clarifications fieldset { display: grid; gap: .45rem; min-width: 0; margin: 0; padding: 0; border: 0; }
+.creator-options { display: flex; flex-wrap: wrap; gap: .4rem; }
+.creator-options button { border: 1px solid var(--border-color); border-radius: 999px; background: var(--bg-tertiary); color: var(--text-secondary); padding: .35rem .65rem; font-size: .78rem; }
+.creator-options button.is-selected, .creator-options button:hover, .creator-options button:focus-visible { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--text-primary); }
 .creator-stage-state { display: inline-flex; flex: none; align-items: center; gap: .35rem; color: var(--text-secondary); font-size: .74rem; text-transform: capitalize; white-space: nowrap; }
 .creator-stage-state > span { width: .55rem; height: .55rem; border-radius: 50%; background: var(--text-muted); }
 .creator-stage-state.is-running > span { background: var(--accent); animation: creator-pulse 1.2s ease-in-out infinite; }
@@ -644,3 +653,37 @@ body {
 .bca-config-section h2 { margin: 0; font-size: 1rem; }
 .bca-config-section p { margin: -.3rem 0 .1rem; color: var(--text-muted); font-size: .78rem; line-height: 1.45; }
 .bca-secret-note { display: flex; align-items: center; gap: .5rem; margin-top: 1rem; color: var(--text-muted); font-size: .8rem; }
+
+/* Creator is an API test bench: request parameters, raw response data, and
+   artifact inspection are the surface; no workflow or session UI remains. */
+.creator-console { max-width: 1320px; margin: 0 auto; padding: 1.5rem; color: var(--text-primary); }
+.creator-console-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
+.creator-console-heading h1, .creator-console-workspace h2 { margin: 0; letter-spacing: -.02em; }
+.creator-console-heading h1 { font-size: 1.5rem; }
+.creator-console-heading p, .creator-console-workspace header p { max-width: 70ch; margin: .35rem 0 0; color: var(--text-secondary); line-height: 1.5; }
+.creator-module-nav { display: flex; flex-wrap: wrap; gap: .4rem; margin: 1rem 0; }
+.creator-module-nav button { border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-secondary); color: var(--text-secondary); padding: .45rem .65rem; font-size: .8rem; font-weight: 650; }
+.creator-module-nav button:hover, .creator-module-nav button:focus-visible, .creator-module-nav button.is-active { border-color: var(--accent); color: var(--text-primary); background: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary)); }
+.creator-console-workspace { display: grid; grid-template-columns: minmax(320px, .9fr) minmax(0, 1.1fr); gap: 1.25rem; }
+.creator-console-request, .creator-console-result { min-width: 0; border: 1px solid var(--border-color); border-radius: 12px; background: var(--bg-secondary); padding: 1rem; }
+.creator-console-request { display: grid; align-content: start; gap: .85rem; }
+.creator-console-request header, .creator-console-result > header { display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem; }
+.creator-console-request h2, .creator-console-result h2 { font-size: 1rem; }
+.creator-console-request code { flex: none; max-width: 48%; overflow-wrap: anywhere; color: var(--accent); font-size: .72rem; }
+.creator-console-request label { display: grid; gap: .38rem; color: var(--text-secondary); font-size: .8rem; }
+.creator-console-request textarea, .creator-console-request input:not([type="range"]), .creator-console-request select { box-sizing: border-box; width: 100%; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-primary); color: var(--text-primary); padding: .55rem .65rem; font: inherit; }
+.creator-console-request textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .78rem; }
+.creator-console-request input[type="range"] { width: 100%; accent-color: var(--accent); }
+.creator-console-file { padding: .7rem; border: 1px dashed var(--border-color); border-radius: 8px; }
+.creator-console-file output { overflow: hidden; color: var(--text-muted); font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
+.creator-console-result > header > span { flex: none; color: var(--accent); font-size: .78rem; font-variant-numeric: tabular-nums; }
+.creator-console-result pre { max-height: 22rem; overflow: auto; margin: 1rem 0 0; padding: .8rem; border-radius: 8px; background: var(--bg-primary); color: var(--text-secondary); font: .76rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.creator-console-empty { display: grid; min-height: 16rem; place-content: center; justify-items: center; gap: .5rem; color: var(--text-muted); text-align: center; }
+.creator-console-empty p { margin: 0; }
+.creator-console-image { display: block; width: min(100%, 520px); aspect-ratio: 1; margin: 1rem auto 0; object-fit: contain; background: var(--bg-primary); }
+.creator-console-model { height: 420px; margin-top: 1rem; overflow: hidden; border-radius: 8px; background: #1a1a1a; }
+.creator-console-model .min-h-\[400px\] { min-height: 420px; }
+.creator-console-download { display: inline-flex; align-items: center; margin-top: .85rem; color: var(--accent); font-size: .8rem; font-weight: 700; text-decoration: underline; text-underline-offset: .18em; }
+.creator-console-download:hover, .creator-console-download:focus-visible { color: var(--accent-light); }
+.creator-console-footer { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; margin-top: 1rem; color: var(--text-muted); font-size: .78rem; }
+@media (max-width: 860px) { .creator-console { padding: .85rem; }.creator-console-workspace { grid-template-columns: 1fr; }.creator-console-heading { display: grid; }.creator-console-model { height: 320px; }.creator-console-model .min-h-\[400px\] { min-height: 320px; } }

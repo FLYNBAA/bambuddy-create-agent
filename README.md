@@ -18,7 +18,9 @@ BCA 是嵌入 Bambuddy 的 3D 创作工作流。用户、打印机、耗材、Li
   → root 切片并交接原生队列
 ```
 
-创作由 Creator 卡片直接驱动，而非独立 Agent 聊天产品。任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、暂空价格，以及模型和风格预览。模型 3MF 不是打印任务：root 附加 slicer 生成的 `.gcode.3mf`，BCA 验证后由 Bambuddy 执行原生队列交接。
+BCA 以对外 API 功能层运行，不再要求 Creator 卡片工作流。`/creator` 是逐模块测试台：它发起一个独立能力请求、展示数据窗口，并预览返回图片或 GLB/3MF。公网程序按需组合 brief、Image2、图生模型、多色转换、校色和分析；模型 3MF 仍不是打印任务，打印交接由 root 的 `.gcode.3mf` 与 Bambuddy 原生队列负责。
+
+GLB 预览保留原生材质；3MF 使用 Three.js 官方 `ThreeMFLoader` 解析标准材质/颜色/纹理组，并在根节点从 Z-up 转为 WebGL 的 Y-up。Image2 生成结果统一为不拉伸主体的 1:1 PNG。
 
 有效切片包必须同时包含：
 
@@ -31,16 +33,16 @@ Metadata/slice_info.config
 
 | 页面 | 路由 | 当前职责 |
 |---|---|---|
-| Creator | `/creator` | 直接工作流卡片、风格/模型预览、校准、分析和任务提交。 |
-| BCA Tasks | `/tasks` | 任务标题/用户/订单上下文、预览、root 切片附件、打印机选择和原生队列提交。 |
-| Creator 配置 | `/creator/settings` | Provider 凭据、模型、请求端点和运行参数。 |
+| Creator | `/creator` | 独立 API 模块测试台：请求、原始数据窗口、图片/模型预览。 |
+| BCA Tasks | `/tasks` | 旧任务标题/订单上下文、root 切片附件、打印机选择和原生队列提交。 |
+| Creator 配置 | `/creator/settings` | 只写 Provider 密钥、非秘密运行参数和 Provider 状态。 |
 | Bambuddy 原生页面 | 打印机、耗材、Library、队列 | 唯一权威的打印机、耗材、Library 与队列行为。 |
 
 认证开启时，预览使用受控的 Bearer Blob fetch；不要暴露 Provider 临时 URL，也不要把受保护的产物路由直接作为 `<img src>`。
 
 ## Provider 配置
 
-Creator 配置可编辑 DeepSeek、Image2、Hunyuan 与 Meshy 的请求端点/Base URL、凭据和模型参数，其中包括 Meshy Base URL。部署初始值来自显式 `.env.bca`；BCA 不读取 source-project `.env` 或 `.env.local`。持久化的 Creator 配置属于敏感数据库数据，必须按凭据处理。
+Creator 配置只会返回非秘密运行参数和 Provider 状态；密钥仅可写入、绝不通过 GET 或保存响应回显。部署初始值来自显式 `.env.bca`；BCA 不读取 source-project `.env` 或 `.env.local`。持久化的 Creator 配置属于敏感数据库数据，必须按凭据处理。
 
 ## 部署与发现
 

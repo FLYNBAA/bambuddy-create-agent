@@ -56,9 +56,9 @@ class Settings(BaseSettings):
     meshy_model_input_mode: str = "data_uri"
     meshy_poll_interval_seconds: float = 3.0
     meshy_timeout_seconds: float = 900.0
-    meshy_max_download_bytes: int = 100 * 1024 * 1024
+    meshy_max_download_bytes: int = 512 * 1024 * 1024
     meshy_proxy_mode: Literal["auto", "direct", "environment"] = "auto"
-    meshy_max_uncompressed_3mf_bytes: int = 200 * 1024 * 1024
+    meshy_max_uncompressed_3mf_bytes: int = 512 * 1024 * 1024
 
     def ensure_directories(self) -> None:
         for path in (

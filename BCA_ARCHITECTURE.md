@@ -4,7 +4,7 @@
 
 ## Scope
 
-BCA is the embedded, single-process creator workflow within Bambuddy. Bambuddy remains authoritative for identities, printers, materials, Library files, native queue dispatch, authentication, WebSocket transport, and deployment. BCA owns creator state, generated artifacts, calibration, analysis, and order-task handoff; it is neither a separate service nor a standalone agent-chat UI.
+BCA is Bambuddy's embedded API capability layer for creation assets. Bambuddy remains authoritative for identities, printers, materials, Library files, native queue dispatch, authentication, WebSocket transport, and deployment. Creator exposes independently callable brief, Image2, image-to-GLB, GLB-to-3MF, 3MF calibration, and analysis modules; legacy sessions remain a compatibility adapter, not the public integration model.
 
 ## Workflow and handoff
 
@@ -22,21 +22,26 @@ Creative presentation (DeepSeek)
 
 A task preserves title, user, customer name, phone, address, notes, a nullable price (currently blank), and model/style previews while pending root slicing and queueing. Creator model 3MF files never reach a printer directly. The root-supplied sliced package must contain `Metadata/plate_N.gcode` and `Metadata/slice_info.config` before BCA can hand it to the native queue.
 
+### Source-language prompt contract
+
+The latest creative message determines the entire response language: Chinese input returns Chinese brief values, questions, display copy, and prompt bundle; English input returns English equivalents. Once `subject`, `style`, and `product_type` are complete, BCA derives `positive_prompt`, `negative_prompt`, `print_constraints`, and one deterministic `image2_prompt`. The fixed Image2 clauses explicitly constrain composition, printability, exclusions, and output boundary; the test bench exposes the complete bundle and seeds its Image2 field from `image2_prompt`.
+
 ## Creator and task responsibilities
 
 | Area | Responsibility |
 |---|---|
-| Creator cards | Run the direct staged workflow; show style and model previews; create calibrated artifacts, analysis, and order tasks. |
-| Calibration | Produce either a white 3MF or a 1–8-color 3MF using Meshy and Bambuddy material-color matching. The final multicolor output is the color-calibrated 3MF. |
+| Creator API modules | Execute one explicitly requested capability; never create or advance a workflow for the caller. |
+| Creator test bench | Send one module request, show raw response metadata/JSON, and preview returned image or model artifacts. |
+| Calibration | Convert GLB to 1–8-color 3MF, then separately match 3MF colors to Bambuddy material inventory. |
 | Analysis | Obtain Meshy data and DeepSeek scoring/insights. It does not produce user-facing advice. |
-| BCA task | Retain title, user, order, and previews until root adds the validated slice and selects a printer. |
+| BCA task | Legacy handoff retaining title, user, order, and previews until root adds the validated slice and selects a printer. |
 | Bambuddy | Own Library files, printer selection, queue lifecycle, dispatch, cancellation, and printer state. |
 
 ## API and configuration boundary
 
-Creator and task routes remain within the Bambuddy application and its authorization model. Normal artifact downloads are controlled; provider temporary URLs and server filesystem paths are not frontend contracts.
+Creator and task routes remain within the Bambuddy authorization model. Public module clients use queue-scoped API keys; normal artifact downloads are controlled; provider temporary URLs and server filesystem paths are never frontend contracts.
 
-The Creator configuration page (`/creator/settings`) can update provider credentials, models, and request endpoints/Base URLs for DeepSeek, Image2, Hunyuan, and Meshy, including the Meshy base URL. Deployment values seed configuration through explicit `.env.bca`; BCA does not discover source-project `.env` or `.env.local` files. Persisted provider settings are sensitive Bambuddy database data.
+`/creator/settings` is administrator-only. Provider secrets are write-only: `GET` returns non-secret runtime values and `configured` state, while `PUT` accepts secret replacements without echoing them. Deployment values seed configuration through explicit `.env.bca`; BCA does not discover source-project `.env` or `.env.local` files.
 
 ## Approval and safety boundary
 

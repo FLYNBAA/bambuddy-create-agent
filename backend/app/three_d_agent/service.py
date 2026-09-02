@@ -25,7 +25,7 @@ from .contracts import (
     ThreeDGenerator,
 )
 from .filament_inventory import FilamentInventoryRepository
-from .graph import build_preparation_graph
+from .graph import build_preparation_graph, prepare_graph_input
 
 
 class _SessionRepository(Protocol):
@@ -186,6 +186,8 @@ class ThreeDPrintAgent:
                 snapshot.brief = type(snapshot.brief)()
                 snapshot.questions = []
                 snapshot.image_prompt = None
+                snapshot.presentation_en = None
+                snapshot.presentation_zh = None
                 snapshot.generated_image_paths = []
                 snapshot.selected_image_index = None
                 snapshot.model_path = None
@@ -246,6 +248,8 @@ class ThreeDPrintAgent:
                 snapshot.selected_image_index = None
                 snapshot.model_path = None
                 self._reset_after_model_change(session_id, snapshot)
+                snapshot.presentation_en = None
+                snapshot.presentation_zh = None
                 snapshot.status = SessionStatus.NEEDS_INPUT
 
             if reference_image_content is not None:
@@ -260,18 +264,20 @@ class ThreeDPrintAgent:
             if snapshot.reference_image_path:
                 snapshot.brief = snapshot.brief.model_copy(
                     update={
-                        "subject": snapshot.brief.subject or "参考图中的主体",
-                        "style": snapshot.brief.style or "参考图风格",
+                        "subject": snapshot.brief.subject or "subject in the reference image",
+                        "style": snapshot.brief.style or "style of the reference image",
+                        "subject_zh": snapshot.brief.subject_zh or "参考图中的主体",
+                        "style_zh": snapshot.brief.style_zh or "参考图风格",
                     }
                 )
 
             try:
                 result = await self._preparation_graph.ainvoke(
-                    {
-                        "message": message,
-                        "current_brief": snapshot.brief,
-                        "has_reference_image": snapshot.reference_image_path is not None,
-                    }
+                    prepare_graph_input(
+                        message,
+                        snapshot.brief,
+                        snapshot.reference_image_path is not None,
+                    )
                 )
             except Exception as exc:
                 self._fail(snapshot, "preparation", exc)
@@ -280,6 +286,8 @@ class ThreeDPrintAgent:
             snapshot.brief = result["brief"]
             snapshot.questions = result["questions"]
             snapshot.image_prompt = result["image_prompt"]
+            snapshot.presentation_en = result.get("presentation_en")
+            snapshot.presentation_zh = result.get("presentation_zh")
             snapshot.error = None
             if snapshot.brief.is_complete:
                 snapshot.status = SessionStatus.READY_FOR_IMAGES

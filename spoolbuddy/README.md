@@ -48,8 +48,8 @@ dtoverlay=spi0-0cs
 ## BCA 关系
 
 - SpoolBuddy 不是 BCA Provider 凭据或 creator session 的存储位置。
-- BCA 多色校准读取 Bambuddy 活动、未归档的手动耗材与有效 RGBA。
-- SpoolBuddy 可帮助维护耗材库存，但 Creator 仍通过 Bambuddy inventory API 和数据库取得校准候选。
+- BCA 多色校准读取 Bambuddy 活动、未归档、具有有效 RGBA 与非空 material 的 `spool` 行；不查询颜色目录。品牌/名称是匹配依据，不是候选资格门。
+- SpoolBuddy 可帮助维护耗材库存，但 Creator 仍通过 Bambuddy inventory API 和数据库取得校准候选。完成的多色映射必须具有非空 `assignments` 和最终校准产物。
 
 ## 开发验证
 

@@ -40,3 +40,25 @@ def test_model_validation_rejects_unsafe_duplicate_members() -> None:
 
     with pytest.raises(HTTPException, match="safe valid 3MF"):
         _validate_model_3mf(output.getvalue())
+
+
+def test_model_validation_accepts_standard_empty_directory_entries() -> None:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("_rels/", b"")
+        archive.writestr("3D/", b"")
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr("3D/3dmodel.model", "<model />")
+
+    _validate_model_3mf(output.getvalue())
+
+
+def test_model_validation_rejects_nonempty_directory_entry() -> None:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("3D/", b"not-a-directory")
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr("3D/3dmodel.model", "<model />")
+
+    with pytest.raises(HTTPException, match="unsafe 3MF directory member"):
+        _validate_model_3mf(output.getvalue())

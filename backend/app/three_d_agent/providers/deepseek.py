@@ -18,6 +18,7 @@ from ..contracts import (
     PrintAssessment,
 )
 from ..network import httpx_route_kwargs, proxy_route_candidates
+from ..prompts import response_language
 from .exceptions import ProviderConfigurationError, ProviderError
 
 _FIELD_LIMITS = {
@@ -25,7 +26,13 @@ _FIELD_LIMITS = {
     "style": 120,
     "product_type": 120,
     "details": 1000,
+    "subject_zh": 500,
+    "style_zh": 120,
+    "product_type_zh": 120,
+    "details_zh": 1000,
 }
+
+_BRIEF_BASE_FIELDS = ("subject", "style", "product_type", "details")
 
 
 class DeepSeekBriefEnricher:
@@ -61,14 +68,18 @@ class DeepSeekBriefEnricher:
                                 (
                                     "system",
                                     """Extract a 3D-print creative brief from the user's newest message.
-Return JSON matching the requested schema. Extract subject, style, product_type,
-and details. Put explicit color, pose, proportion, functional, structural, and
-other production constraints in details without repeating the three required
-fields. A value may be included only when the user states it or clearly corrects
-an existing value. Use null for fields the newest message does not establish.
-Never use an empty string to clear a field. Do not invent image contents: when a
+Return JSON matching the requested schema. The newest user message selects the
+response language: Simplified-Chinese input requires Simplified-Chinese values
+for every populated field; English input requires English values for every
+populated field. Translate established current-brief facts when necessary so
+the complete response never mixes languages. Fill every known field on every
+response; use null only when a fact is truly unknown. For Chinese, mirror each
+canonical field in its *_zh counterpart. For English, leave *_zh fields null.
+Put explicit color, pose, proportion, functional, structural, and production
+constraints in details without repeating the three required fields. Never use
+an empty string to clear a field. Do not invent image contents: when a
 reference image is present, it constrains the brief but is not visible to you.
-Keep each value concise and omit commentary.""",
+Keep each value concise and omit commentary."""
                                 ),
                                 (
                                     "human",
@@ -102,14 +113,7 @@ Keep each value concise and omit commentary.""",
             )
         except Exception as exc:
             raise ProviderError("DeepSeek returned an invalid creative brief.") from exc
-
-        return CreativeBrief(
-            **{
-                field: self._valid_value(field, getattr(extraction, field))
-                or getattr(current, field)
-                for field in _FIELD_LIMITS
-            }
-        )
+        return self._brief_in_language(extraction, current, response_language(user_input, current))
 
     async def _select_trust_env(self) -> bool:
         if self._trust_env is not None:
@@ -184,6 +188,7 @@ Keep each value concise and omit commentary.""",
             base_url=self._settings.deepseek_base_url.rstrip("/"),
             timeout=self._settings.deepseek_timeout_seconds,
             temperature=0,
+            extra_body={"thinking": {"type": "disabled"}},
             http_async_client=http_async_client,
             http_socket_options=(),
         )
@@ -228,6 +233,37 @@ Keep each value concise and omit commentary.""",
         if not normalized:
             return None
         return normalized if len(normalized) <= _FIELD_LIMITS[field] else None
+
+    @staticmethod
+    def _brief_in_language(
+        extraction: BriefExtraction,
+        current: CreativeBrief,
+        language: str,
+    ) -> CreativeBrief:
+        values: dict[str, str | None] = {}
+        for field in _BRIEF_BASE_FIELDS:
+            extracted = getattr(extraction, field)
+            extracted_zh = getattr(extraction, f"{field}_zh")
+            current_value = getattr(current, field)
+            current_zh = getattr(current, f"{field}_zh")
+            if language == "zh":
+                value = extracted if DeepSeekBriefEnricher._contains_chinese(extracted) else extracted_zh
+                value = value or current_zh
+                if value is None and DeepSeekBriefEnricher._contains_chinese(current_value):
+                    value = current_value
+                values[field] = value
+                values[f"{field}_zh"] = value
+            else:
+                value = extracted if not DeepSeekBriefEnricher._contains_chinese(extracted) else None
+                if value is None and not DeepSeekBriefEnricher._contains_chinese(current_value):
+                    value = current_value
+                values[field] = value
+                values[f"{field}_zh"] = None
+        return CreativeBrief(**values)
+
+    @staticmethod
+    def _contains_chinese(value: str | None) -> bool:
+        return bool(value and any("\u4e00" <= character <= "\u9fff" for character in value))
 
 
 class DeepSeekPrintAssessor(DeepSeekBriefEnricher):

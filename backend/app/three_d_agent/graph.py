@@ -7,8 +7,8 @@ from typing import Literal
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import NotRequired, TypedDict
 
-from .contracts import BriefEnricher, ClarificationQuestion, CreativeBrief
-from .prompts import build_print_aware_image_prompt, clarification_questions
+from .contracts import BriefEnricher, ClarificationQuestion, CreativeBrief, PromptPackage
+from .prompts import build_display_presentations, build_prompt_package, clarification_questions, response_language
 
 
 class PreparationState(TypedDict):
@@ -17,31 +17,28 @@ class PreparationState(TypedDict):
     message: str
     current_brief: CreativeBrief
     has_reference_image: bool
+    language: str
     brief: NotRequired[CreativeBrief]
     questions: NotRequired[list[ClarificationQuestion]]
     image_prompt: NotRequired[str | None]
+    prompt_package: NotRequired[PromptPackage | None]
+    presentation_en: NotRequired[str | None]
+    presentation_zh: NotRequired[str | None]
 
 
-def _merged_brief(current: CreativeBrief, extracted: CreativeBrief) -> CreativeBrief:
-    """Retain existing choices when an enricher omits or clears a field."""
-    return CreativeBrief(
-        subject=extracted.subject or current.subject,
-        style=extracted.style or current.style,
-        product_type=extracted.product_type or current.product_type,
-        details=extracted.details or current.details,
-    )
 
 
 def build_preparation_graph(enricher: BriefEnricher):
     """Compile the typed enrichment-to-clarification-or-prompt workflow."""
 
     async def enrich_brief(state: PreparationState) -> dict[str, CreativeBrief]:
-        extracted = await enricher.enrich(
-            state["message"],
-            state["current_brief"],
-            state["has_reference_image"],
-        )
-        return {"brief": _merged_brief(state["current_brief"], extracted)}
+        return {
+            "brief": await enricher.enrich(
+                state["message"],
+                state["current_brief"],
+                state["has_reference_image"],
+            )
+        }
 
     def route_after_enrichment(
         state: PreparationState,
@@ -50,14 +47,22 @@ def build_preparation_graph(enricher: BriefEnricher):
 
     def clarify(state: PreparationState) -> dict[str, object]:
         return {
-            "questions": clarification_questions(state["brief"]),
+            "questions": clarification_questions(state["brief"], state["language"]),
             "image_prompt": None,
+            "prompt_package": None,
+            "presentation_en": None,
+            "presentation_zh": None,
         }
 
     def construct_prompt(state: PreparationState) -> dict[str, object]:
+        package = build_prompt_package(state["brief"], state["language"])
+        presentation_en, presentation_zh = build_display_presentations(state["brief"], state["language"])
         return {
             "questions": [],
-            "image_prompt": build_print_aware_image_prompt(state["brief"]),
+            "image_prompt": package.image2_prompt,
+            "prompt_package": package,
+            "presentation_en": presentation_en,
+            "presentation_zh": presentation_zh,
         }
 
     workflow = StateGraph(PreparationState)
@@ -73,3 +78,13 @@ def build_preparation_graph(enricher: BriefEnricher):
     workflow.add_edge("clarify", END)
     workflow.add_edge("construct_prompt", END)
     return workflow.compile()
+
+
+def prepare_graph_input(message: str, current_brief: CreativeBrief, has_reference_image: bool) -> dict[str, object]:
+    """Keep the caller's response language stable across graph execution."""
+    return {
+        "message": message,
+        "current_brief": current_brief,
+        "has_reference_image": has_reference_image,
+        "language": response_language(message, current_brief),
+    }

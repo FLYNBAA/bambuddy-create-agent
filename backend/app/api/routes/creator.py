@@ -34,6 +34,10 @@ from backend.app.three_d_agent.providers.exceptions import ProviderConfiguration
 
 router = APIRouter(prefix="/creator", tags=["creator"])
 
+_SECRET_CONFIG_KEYS = frozenset(
+    {"deepseek_api_key", "image_api_key", "tencent_secret_id", "tencent_secret_key", "meshy_api_key"}
+)
+
 
 class ModelGenerationRequest(BaseModel):
     image_index: int = Field(ge=0, le=3)
@@ -77,17 +81,14 @@ class CreatorRestartRequest(BaseModel):
     stage: str = Field(pattern="^(brief|images|model|print)$")
 
 class CreatorConfigResponse(BaseModel):
-    deepseek_api_key: str
+    """Non-secret Creator provider configuration safe to expose to administrators."""
+
     deepseek_base_url: str
     deepseek_model: str
-    image_api_key: str
     image_base_url: str
     image_model: str
     image_quality: str
-    tencent_secret_id: str
-    tencent_secret_key: str
     tencent_region: str
-    meshy_api_key: str
     meshy_base_url: str
     meshy_model_input_mode: str
     app_public_base_url: str
@@ -95,6 +96,8 @@ class CreatorConfigResponse(BaseModel):
 
 
 class CreatorConfigUpdate(BaseModel):
+    # Secrets are write-only: they are accepted for a hot reload, persisted by
+    # the server, and never serialized in a response.
     deepseek_api_key: str | None = None
     deepseek_base_url: str | None = None
     deepseek_model: str | None = None
@@ -111,20 +114,36 @@ class CreatorConfigUpdate(BaseModel):
     app_public_base_url: str | None = None
 
 
+def _config_values(controller) -> dict[str, str]:
+    """Build the server-only complete configuration used for a hot reload."""
+    config = controller.settings
+    return {
+        "deepseek_api_key": config.deepseek_api_key.get_secret_value(),
+        "deepseek_base_url": config.deepseek_base_url,
+        "deepseek_model": config.deepseek_model,
+        "image_api_key": config.image_api_key.get_secret_value(),
+        "image_base_url": config.image_base_url,
+        "image_model": config.image_model,
+        "image_quality": config.image_quality,
+        "tencent_secret_id": config.tencent_secret_id.get_secret_value(),
+        "tencent_secret_key": config.tencent_secret_key.get_secret_value(),
+        "tencent_region": config.tencent_region,
+        "meshy_api_key": config.meshy_api_key.get_secret_value(),
+        "meshy_base_url": config.meshy_base_url,
+        "meshy_model_input_mode": config.meshy_model_input_mode,
+        "app_public_base_url": config.app_public_base_url,
+    }
+
+
 def _config_response(controller) -> CreatorConfigResponse:
     config = controller.settings
     return CreatorConfigResponse(
-        deepseek_api_key=config.deepseek_api_key.get_secret_value(),
         deepseek_base_url=config.deepseek_base_url,
         deepseek_model=config.deepseek_model,
-        image_api_key=config.image_api_key.get_secret_value(),
         image_base_url=config.image_base_url,
         image_model=config.image_model,
         image_quality=config.image_quality,
-        tencent_secret_id=config.tencent_secret_id.get_secret_value(),
-        tencent_secret_key=config.tencent_secret_key.get_secret_value(),
         tencent_region=config.tencent_region,
-        meshy_api_key=config.meshy_api_key.get_secret_value(),
         meshy_base_url=config.meshy_base_url,
         meshy_model_input_mode=config.meshy_model_input_mode,
         app_public_base_url=config.app_public_base_url,
@@ -181,24 +200,12 @@ async def update_creator_config(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc), headers={"Cache-Control": "private, no-store"}) from exc
     controller = _controller(request)
-    current = _config_response(controller)
-    values = {
-        "deepseek_api_key": current.deepseek_api_key,
-        "deepseek_base_url": current.deepseek_base_url,
-        "deepseek_model": current.deepseek_model,
-        "image_api_key": current.image_api_key,
-        "image_base_url": current.image_base_url,
-        "image_model": current.image_model,
-        "image_quality": current.image_quality,
-        "tencent_secret_id": current.tencent_secret_id,
-        "tencent_secret_key": current.tencent_secret_key,
-        "tencent_region": current.tencent_region,
-        "meshy_api_key": current.meshy_api_key,
-        "meshy_base_url": current.meshy_base_url,
-        "meshy_model_input_mode": current.meshy_model_input_mode,
-        "app_public_base_url": current.app_public_base_url,
-    }
-    values.update(payload.model_dump(exclude_none=True))
+    values = _config_values(controller)
+    values.update({
+        key: value
+        for key, value in payload.model_dump(exclude_none=True).items()
+        if key not in _SECRET_CONFIG_KEYS or value.strip()
+    })
     try:
         controller.reconfigure(**values)
     except ValueError as exc:
