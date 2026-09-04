@@ -18,9 +18,9 @@ BCA 是嵌入 Bambuddy 的 3D 创作工作流。用户、打印机、耗材、Li
   → root 切片并交接原生队列
 ```
 
-BCA 以对外 API 功能层运行，不再要求 Creator 卡片工作流。`/creator` 是逐模块测试台：它发起一个独立能力请求、展示数据窗口，并预览返回图片或 GLB/3MF。公网程序按需组合 brief、Image2、图生模型、多色转换、校色和分析；模型 3MF 仍不是打印任务，打印交接由 root 的 `.gcode.3mf` 与 Bambuddy 原生队列负责。
+BCA 以对外 API 功能层运行，不再要求 Creator 卡片工作流。`/creator` 是逐模块测试台：它发起一个独立能力请求、展示数据窗口，并预览返回的图片、交互式 GLB 或 3MF 内嵌彩色快照。公网程序按需组合 brief、Image2、图生模型、多色转换、校色和分析；模型 3MF 仍不是打印任务，打印交接由 root 的 `.gcode.3mf` 与 Bambuddy 原生队列负责。
 
-GLB 预览保留原生材质；3MF 使用 Three.js 官方 `ThreeMFLoader` 解析标准材质/颜色/纹理组，并在根节点从 Z-up 转为 WebGL 的 Y-up。Image2 生成结果统一为不拉伸主体的 1:1 PNG。
+GLB 预览保留原生材质并交互式渲染；BCA 3MF 不经 ThreeMFLoader/WebGL 几何渲染，预览只来自产物内嵌的彩色 512×512 `Metadata/plate_1.png` 静态快照。Image2 生成结果统一为不拉伸主体的 1:1 PNG。
 
 有效切片包必须同时包含：
 
@@ -33,8 +33,8 @@ Metadata/slice_info.config
 
 | 页面 | 路由 | 当前职责 |
 |---|---|---|
-| Creator | `/creator` | 独立 API 模块测试台：请求、原始数据窗口、图片/模型预览。 |
-| BCA Tasks | `/tasks` | 旧任务标题/订单上下文、root 切片附件、打印机选择和原生队列提交。 |
+| Creator | `/creator` | 独立 API 模块测试台：请求、原始数据窗口、图片、交互式 GLB 和 3MF 快照预览。 |
+| BCA Tasks | `/tasks` | 旧任务标题/订单上下文、root 切片附件、打印机选择和原生队列提交；预览只显示风格图与内嵌彩色 3MF 快照，完整 3MF 经 `source_3mf_url` 下载。 |
 | Creator 配置 | `/creator/settings` | 只写 Provider 密钥、非秘密运行参数和 Provider 状态。 |
 | Bambuddy 原生页面 | 打印机、耗材、Library、队列 | 唯一权威的打印机、耗材、Library 与队列行为。 |
 

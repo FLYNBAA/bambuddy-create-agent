@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
-vi.mock('../../components/ModelViewer', () => ({ ModelViewer: () => <div data-testid="model-viewer" /> }));
 
 import { TaskListPage } from '../../pages/TaskListPage';
 
@@ -29,12 +28,13 @@ describe('TaskListPage creator task cards', () => {
       style_image_preview_url: '/style.png',
       model_preview_url: '/model.glb',
       source_3mf_url: '/source.3mf',
+      source_3mf_snapshot_url: '/snapshot.png',
     };
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/api/v1/bca-tasks')) return json([task]);
       if (url.endsWith('/api/v1/printers/')) return json([]);
-      if (url === '/style.png') return new Response(new Blob(['image']));
+      if (url === '/style.png' || url === '/snapshot.png') return new Response(new Blob(['image']));
       throw new Error(`Unexpected request: ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -43,13 +43,13 @@ describe('TaskListPage creator task cards', () => {
 
     expect(await screen.findByRole('heading', { name: 'Cat desk figure' })).toBeInTheDocument();
     expect(screen.getByText('maker')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /GLB 模型/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /源 3MF/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /GLB 模型/ })).not.toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /彩色 3MF 快照/ })).toBeInTheDocument();
     await user.click(screen.getByText('配置 · 订单详情'));
     expect(screen.getByText('Ada')).toBeInTheDocument();
     expect(screen.getByText('Blue filament')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: /源 3MF/ }));
-    expect(screen.getByRole('dialog', { name: '源 3MF 预览' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /彩色 3MF 快照/ }));
+    expect(screen.getByRole('dialog', { name: '彩色 3MF 快照' })).toBeInTheDocument();
     vi.unstubAllGlobals();
   });
 });

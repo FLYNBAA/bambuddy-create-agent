@@ -2,31 +2,7 @@
 
 from __future__ import annotations
 
-from .contracts import ClarificationQuestion, CreativeBrief, PromptPackage
-
-_QUESTION_SPECS: tuple[tuple[str, str, str, tuple[str, ...], tuple[str, ...]], ...] = (
-    (
-        "subject",
-        "这件作品要表现哪个单一主体？",
-        "What single subject should this creation depict?",
-        ("动物", "人物", "动漫角色", "机械模型", "日常物品", "其他"),
-        ("Animal", "Person", "Anime character", "Mechanical model", "Everyday object", "Other"),
-    ),
-    (
-        "style",
-        "希望主体采用哪种视觉风格？",
-        "Which visual style should the subject use?",
-        ("Q版", "动漫", "写实", "极简", "低多边形", "中国风", "其他"),
-        ("Chibi", "Anime", "Realistic", "Minimal", "Low poly", "Chinese style", "Other"),
-    ),
-    (
-        "product_type",
-        "最终要制作成哪种 3D 打印作品？",
-        "What type of 3D-printed object should this become?",
-        ("手办", "桌面摆件", "挂件", "钥匙扣", "手机支架", "盲盒角色", "其他"),
-        ("Figurine", "Desk ornament", "Pendant", "Keychain", "Phone stand", "Blind-box character", "Other"),
-    ),
-)
+from .contracts import CreativeBrief, PromptPackage
 
 
 def response_language(message: str, brief: CreativeBrief | None = None) -> str:
@@ -37,28 +13,34 @@ def response_language(message: str, brief: CreativeBrief | None = None) -> str:
     return "zh" if any("\u4e00" <= character <= "\u9fff" for character in source) else "en"
 
 
-def clarification_questions(brief: CreativeBrief, language: str) -> list[ClarificationQuestion]:
-    """Return questions exclusively in the caller's language."""
-    return [
-        ClarificationQuestion(
-            field=field,
-            prompt=prompt_zh if language == "zh" else prompt_en,
-            options=list(options_zh if language == "zh" else options_en),
-            # Legacy fields retain the same language rather than translating
-            # the response into a second language.
-            prompt_en=prompt_zh if language == "zh" else prompt_en,
-            options_en=list(options_zh if language == "zh" else options_en),
+def complete_brief(brief: CreativeBrief, language: str) -> CreativeBrief:
+    """Fill every printable-prompt field without asking the caller to choose a type."""
+    if language == "zh":
+        subject = brief.subject_zh or brief.subject or "用户请求的三维打印对象"
+        style = brief.style_zh or brief.style or "简洁产品设计风格"
+        product_type = brief.product_type_zh or brief.product_type or "桌面摆件"
+        details = brief.details_zh or brief.details or "自动优化为结构完整、适合熔融沉积成型打印的设计"
+        return CreativeBrief(
+            subject=subject,
+            style=style,
+            product_type=product_type,
+            details=details,
+            subject_zh=subject,
+            style_zh=style,
+            product_type_zh=product_type,
+            details_zh=details,
         )
-        for field, prompt_zh, prompt_en, options_zh, options_en in _QUESTION_SPECS
-        if not getattr(brief, field)
-    ]
+    return CreativeBrief(
+        subject=brief.subject or "the requested 3D-printable object",
+        style=brief.style or "clean product design",
+        product_type=brief.product_type or "desk figurine",
+        details=brief.details or "automatically optimized as a complete FDM-printable design",
+    )
 
 
 def build_prompt_package(brief: CreativeBrief, language: str) -> PromptPackage:
-    """Expand a complete brief into explicit printable Image2 instructions."""
-    if not brief.is_complete:
-        missing = ", ".join(brief.missing_fields)
-        raise ValueError(f"Cannot build prompts without: {missing}")
+    """Expand every input into explicit printable Image2 instructions."""
+    brief = complete_brief(brief, language)
     if language == "zh":
         subject = brief.subject_zh or brief.subject
         style = brief.style_zh or brief.style
@@ -133,9 +115,8 @@ def build_print_aware_image_prompt(brief: CreativeBrief, language: str) -> str:
 
 
 def build_display_presentations(brief: CreativeBrief, language: str) -> tuple[str, str]:
-    """Return one-language display copy in both legacy response slots."""
-    if not brief.is_complete:
-        raise ValueError("Cannot build a presentation without a complete creative brief")
+    """Return one-language display copy for an automatically completed brief."""
+    brief = complete_brief(brief, language)
     values = (
         (brief.subject_zh or brief.subject, brief.style_zh or brief.style, brief.product_type_zh or brief.product_type, brief.details_zh or brief.details)
         if language == "zh"

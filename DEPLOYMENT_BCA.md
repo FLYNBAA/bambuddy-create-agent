@@ -34,7 +34,7 @@ Creator configuration at `/creator/settings` edits non-secret runtime parameters
 
 Persisted creator configuration remains sensitive database state. Keep the configuration page, database, backups, and `.env.bca` under administrator control. Do not put credentials in task records, previews, source code, or public documentation.
 
-Public integrations should use the independently callable `/api/v1/creator/modules/*` capability routes described in `BCA_EXTERNAL_API_AND_CALIBRATION.md`. The `/creator` page is a test bench for one request at a time, not a workflow orchestrator.
+Public integrations should use the independently callable `/api/v1/creator/modules/*` capability routes documented in `BCA_INTEGRATION_GUIDE.md`. The `/creator` page is a test bench for one request at a time, not a workflow orchestrator.
 
 ## 3. Reverse proxy and public origin
 
@@ -50,7 +50,7 @@ Tailscale provides network reachability, not application authentication, TLS cer
 
 The direct workflow is Creative presentation (DeepSeek) → style image (Image2) → 3D concept image/model (Hunyuan) → white or 1–8-color calibration (Meshy plus material color matching) → Meshy + DeepSeek score/insights without advice → order task submission.
 
-Tasks retain title, user, customer name, phone, address, notes, a currently blank nullable price, and model/style previews until root slicing and queueing. A model 3MF is not printable directly. Root attaches a slicer-produced `.gcode.3mf` containing:
+Tasks retain title, user, customer name, phone, address, notes, an optional price supplied by the session push or direct upload, and previews until root slicing and queueing. The task API keeps `source_3mf_url` for downloading the full model 3MF and adds `source_3mf_snapshot_url` for `GET /api/v1/bca-tasks/{id}/snapshot`, which returns only the embedded `Metadata/plate_1.png` color snapshot (404 when absent); the task UI displays that snapshot rather than rendered 3MF geometry. A model 3MF is not printable directly. Root attaches a slicer-produced `.gcode.3mf` containing:
 
 ```text
 Metadata/plate_N.gcode

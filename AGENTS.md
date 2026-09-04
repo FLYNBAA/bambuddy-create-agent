@@ -16,7 +16,7 @@ Creative input / optional reference image
   → Hunyuan 3D concept GLB
   → Meshy 3MF + white or 1–8-color inventory calibration
   → Meshy + DeepSeek print score/insights (no advice)
-  → order task (title, user, customer, phone, address, notes, blank price, previews)
+  → order task (title, user, customer, phone, address, notes, optional price, previews)
   → root supplies sliced .gcode.3mf
   → Bambuddy LibraryFile
   → Bambuddy PrintQueueItem
@@ -133,13 +133,13 @@ creative input → prepared brief
 
 Rules:
 
-1. `prepare()` enriches the brief, asks for missing information, and builds the Image2 prompt.
+1. `prepare()` always auto-completes: it enriches the brief, builds the Image2 prompt, and returns final prompts. There is no clarification or type-choice path; the compatibility `questions` field stays empty and `image_prompt_ready` is true for accepted input.
 2. Image generation requires a complete brief and prompt. It runs exactly four serial `n=1` calls; no paid Provider POST is retried automatically.
 3. Each completed image is persisted and exposed immediately. A persisted image selection is required for 3D concept generation.
 4. Hunyuan output is downloaded, validated, and persisted before the GLB preview route is exposed.
 5. Print calibration runs after GLB completion. White mode requests one logical color and normalizes the final 3MF to white. Multicolor accepts `1..8`, runs Meshy conversion, then DeepSeek matching against active Bambuddy inventory.
 6. Print analysis is exposed only after final calibration; Meshy analyzes the persisted GLB and DeepSeek turns those metrics into a score and factual insights. It must not emit recommendations.
-- Creator stores canonical English prompt fields separately from `presentation_en` / `presentation_zh`. The UI MUST stream only the active presentation language and MUST NOT expose `image_prompt`. A downstream card opens only after `questions` is empty **and** that presentation stream has emitted its last character.
+- Creator persists source-language prompt fields alongside `presentation_en` / `presentation_zh`. Direct `brief/prepare` returns the final prompt bundle; it has no clarification or presentation-stream gate, and `questions` remains empty. UI surfaces may show that returned bundle according to their API contract.
 - Creator calibration consumes only active `spool` rows with `archived_at IS NULL`, non-empty `material`, and valid RGB/RGBA. It does not use `color_catalog` as a calibration inventory source. A successful multicolor calibration requires non-empty `assignments` plus the final calibrated artifact.
 7. The UI and API contain no paid-confirmation or issue-acknowledgement gates. Billed smoke runs still require explicit operator approval at the point of execution; automatic retries remain prohibited.
 8. Every redo clears the selected stage and all downstream paths, states, pending Provider URLs, and task eligibility. Stale artifacts must never remain downloadable.
@@ -181,7 +181,7 @@ Metadata/plate_N.gcode
 Metadata/slice_info.config
 ```
 
-`bca_tasks.py` validates both before creating the LibraryFile. The sliced filename must end in `.gcode.3mf`. Both model and sliced BCA uploads are capped at 100 MB and use bounded 3MF ZIP member, compression-ratio and uncompressed-size validation. Never queue a model-only 3MF.
+Both model and sliced BCA uploads share the 512 MiB calibration package limit and use bounded 3MF ZIP member, duplicate-member, compression-ratio and uncompressed-size validation. Never queue a model-only 3MF.
 
 ### Calibration modes
 
@@ -189,6 +189,8 @@ Metadata/slice_info.config
 - **Multicolor mode**: Meshy generates a `1..8`-color model 3MF, then DeepSeek maps every source color to an active Bambuddy manual spool. `creator_inventory.py` excludes archived spools and rows without valid RGBA/material data; no fallback color is invented.
 
 The final calibrated 3MF is a separate persisted artifact and the only creator output eligible for order submission. The intermediate Meshy 3MF is never task-eligible.
+Multicolor and calibration artifacts embed a best-effort colored 512×512 `Metadata/plate_1.png` snapshot. Snapshot generation runs once per artifact, off the async event loop, bounded to 500k faces, and fails open (a missing or unrenderable snapshot never fails the artifact). The `X-BCA-Color-Snapshot` header reports `created|present|skipped` for multicolor and `replaced|skipped` for calibration.
+
 ## 8. BCA Task Contract
 
 `BCATask` state:
@@ -205,10 +207,15 @@ Task API:
 GET    /api/v1/bca-tasks
 POST   /api/v1/bca-tasks
 GET    /api/v1/bca-tasks/{id}/source
+GET    /api/v1/bca-tasks/{id}/snapshot
 POST   /api/v1/bca-tasks/{id}/sliced
 POST   /api/v1/bca-tasks/{id}/queue
 DELETE /api/v1/bca-tasks/{id}
 ```
+
+The task list response keeps `source_3mf_url` for downloading the full model 3MF and adds `source_3mf_snapshot_url` for `GET /api/v1/bca-tasks/{id}/snapshot`, which returns only the embedded `Metadata/plate_1.png` color snapshot and returns 404 when the 3MF has none. The task UI displays only that snapshot; it never renders full 3MF geometry.
+
+Direct `POST /api/v1/bca-tasks` accepts a model `.3mf` and rejects GLB and sliced `.gcode.3mf` files. Optional title, customer name, phone, address, notes, price, and reference image fields are accepted; a direct file without an embedded snapshot may have no task preview rather than a rendered one.
 
 Queue handoff uses native `add_to_queue()` and sets `manual_start=True`. Native Bambuddy controls own all subsequent start, cancel, AMS, material, FTPS, MQTT, print status and archive behavior.
 
@@ -295,7 +302,7 @@ Routes:
 UI requirements:
 
 - Creator: left session list, narrow middle chat/control, right workflow canvas.
-- Task list: creation time order, username/root display, source download, sliced-file attachment, printer `name (model)` picker and delete action.
+- Task list: creation time order, username/root display, embedded color-snapshot preview only (never rendered 3MF geometry), source 3MF download, sliced-file attachment, printer `name (model)` picker and delete action.
 - Queue and printer pages remain native Bambuddy pages.
 - Any new nav key must be added to every locale or `check:i18n` will fail.
 - UI changes require `npm run build` and browser verification of the actual surface.

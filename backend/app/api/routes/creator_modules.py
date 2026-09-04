@@ -31,6 +31,7 @@ from backend.app.three_d_agent.calibration import (
     calibrate_3mf,
     inspect_3mf,
 )
+from backend.app.three_d_agent.color_snapshot import has_color_snapshot, inject_color_snapshot
 from backend.app.three_d_agent.contracts import CreativeBrief
 from backend.app.three_d_agent.graph import build_preparation_graph, prepare_graph_input
 from backend.app.three_d_agent.prompts import response_language
@@ -284,6 +285,11 @@ async def generate_multicolor_module(
             # Meshy receives the validated input as a data URI.
             result_url = await provider.multi_color(operation_id, model_path, max_colors)
         output_path = await store.download_print_file(operation_id, result_url)
+        if await asyncio.to_thread(has_color_snapshot, output_path):
+            snapshot_status = "present"
+        else:
+            snapshot = await asyncio.to_thread(inject_color_snapshot, output_path, output_path=output_path)
+            snapshot_status = snapshot.status
         return _file_response(
             output_path,
             media_type="model/3mf",
@@ -292,7 +298,10 @@ async def generate_multicolor_module(
             operation_id=operation_id,
             background_tasks=background_tasks,
             workdir=workdir,
-            headers={"X-BCA-Meshy-Reused": str(bool(meshy_result_url)).lower()},
+            headers={
+                "X-BCA-Meshy-Reused": str(bool(meshy_result_url)).lower(),
+                "X-BCA-Color-Snapshot": snapshot_status,
+            },
         )
     except Exception as exc:
         _cleanup_module(store, operation_id, workdir)
@@ -361,6 +370,12 @@ async def calibrate_print_module(
             _LIMITS,
             output_path,
         )
+        snapshot = await asyncio.to_thread(
+            inject_color_snapshot,
+            output_path,
+            replace_existing=True,
+            output_path=output_path,
+        )
         return _file_response(
             output_path,
             media_type="model/3mf",
@@ -372,6 +387,7 @@ async def calibrate_print_module(
             headers={
                 "X-BCA-Calibration-Colors": str(len(result.report.mappings)),
                 "X-BCA-Calibration-Changes": str(result.report.changed_count),
+                "X-BCA-Color-Snapshot": snapshot.status,
             },
         )
     except Exception as exc:

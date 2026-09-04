@@ -34,7 +34,7 @@ docker compose --env-file .env.bca -f .\docker-compose.yml -f .\docker-compose.w
 
 持久化 Creator 配置仍是敏感数据库状态。配置页、数据库、备份和 `.env.bca` 都必须在管理员控制下。不要把凭据放入任务记录、预览、源码或公开文档。
 
-公网集成应使用 `BCA_EXTERNAL_API_AND_CALIBRATION.md` 说明的独立 `/api/v1/creator/modules/*` 能力路由。`/creator` 页面是逐请求测试台，不是工作流编排器。
+公网集成应使用工作目录的 `BCA_INTEGRATION_GUIDE.md` 说明的独立 `/api/v1/creator/modules/*` 能力路由。`/creator` 页面是逐请求测试台，不是工作流编排器。
 
 ## 3. 反向代理与公网 origin
 
@@ -50,7 +50,7 @@ Tailscale 提供网络可达性，不提供应用认证、TLS 证书或打印机
 
 直接工作流为：创意展示（DeepSeek）→ 风格图（Image2）→ 3D 概念图/模型（Hunyuan）→ 白色或 1–8 色校准（Meshy 加耗材颜色匹配）→ Meshy + DeepSeek 评分/洞察且不提供建议 → 订单任务提交。
 
-任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、当前留空的可空价格，以及模型/风格预览。模型 3MF 不能直接打印。root 附加的 slicer 生成 `.gcode.3mf` 必须包含：
+任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、可选价格（会话推送或直传任务时提供）、风格图和内嵌彩色 3MF 快照。任务清单响应保留 `source_3mf_url` 用于下载完整 3MF，`source_3mf_snapshot_url` 指向 `GET /api/v1/bca-tasks/{id}/snapshot`（只返回内嵌 `Metadata/plate_1.png`，缺失时 404）。直传 `POST /api/v1/bca-tasks` 接受模型 `.3mf`，拒绝 GLB 与切片 `.gcode.3mf`。
 
 ```text
 Metadata/plate_N.gcode

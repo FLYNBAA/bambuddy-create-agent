@@ -9,7 +9,7 @@ BCA is a local root administration surface. First-run onboarding must establish 
 1. **Authentication and administrator**: complete Setup and understand permission boundaries around plaintext Provider values at `/creator/settings`.
 2. **Printers**: add printers by LAN IP or native discovery; emphasize manual IP in Windows bridge mode.
 3. **Inventory**: add active manual spools with valid RGB/RGBA, material, brand, and name; explain that Creator calibration reads these `spool` rows, not the color catalog.
-4. **Creator**: create a session, submit an idea/reference image, then select every missing brief field. Explain that the bilingual presentation streams fully before the style-image card appears, while Provider-only `image_prompt` is never shown.
+4. **Creator**: use `/creator` as a one-module test bench. Submit any idea/reference image and explain that brief preparation auto-completes in the input language, returns final prompts with an empty compatibility `questions` list, and supplies `image2_prompt` directly to Image2; no field-selection or presentation-stream gate exists.
 5. **Direct stages**: explain that Image2, Hunyuan, calibration, and analysis begin from their direct cards without repeated payment or issue-acknowledgement gates; routine onboarding never invokes billed stages.
 6. **Analysis and 3MF**: explain score/insights without advice. A multicolor calibration is complete only with succeeded status, non-empty assignments, and a final artifact.
 7. **Task and slicing**: explain that model 3MF cannot enter queue directly; root must upload `.gcode.3mf`.

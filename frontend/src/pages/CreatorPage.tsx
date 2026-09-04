@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Box, FileJson, Image as ImageIcon, Loader2, Palette, Play, RefreshCw } from 'lucide-react';
 import { getAuthToken } from '../api/client';
 import { ModelViewer } from '../components/ModelViewer';
+import { ThreeMfSnapshot } from '../components/ThreeMfSnapshot';
 
 type ModuleId = 'brief' | 'image2' | 'model' | 'multicolor' | 'calibrate' | 'analyze';
 type ModuleDefinition = {
@@ -14,7 +15,7 @@ type ModuleDefinition = {
 };
 
 const modules: ModuleDefinition[] = [
-  { id: 'brief', title: 'Brief preparation', description: 'DeepSeek returns a source-language brief, clarification questions, and printable prompts; no session is created.', path: '/brief/prepare' },
+  { id: 'brief', title: 'Brief preparation', description: 'Any input expands directly into final printable prompts; no questions, no session.', path: '/brief/prepare' },
   { id: 'image2', title: 'Image2 style image', description: 'Returns one normalized 1:1 PNG style image.', path: '/image2/generate', fileLabel: 'Optional reference image', accept: 'image/*' },
   { id: 'model', title: 'Image → GLB', description: 'Runs Hunyuan image-to-3D and returns a GLB.', path: '/model/generate', fileLabel: 'Input image', accept: 'image/*' },
   { id: 'multicolor', title: 'GLB → multicolor 3MF', description: 'Runs Meshy conversion with an explicit color-count limit.', path: '/print/multicolor', fileLabel: 'GLB model', accept: '.glb,model/gltf-binary' },
@@ -22,7 +23,7 @@ const modules: ModuleDefinition[] = [
   { id: 'analyze', title: 'GLB print analysis', description: 'Returns Meshy printability and DeepSeek observations as JSON.', path: '/print/analyze', fileLabel: 'GLB model', accept: '.glb,model/gltf-binary' },
 ];
 
-type Artifact = { url: string; type: 'image' | 'glb' | '3mf'; name: string };
+type Artifact = { url: string; blob: Blob; type: 'image' | 'glb' | '3mf'; name: string };
 type RunResult = {
   status: number;
   elapsedMs: number;
@@ -98,7 +99,8 @@ export function CreatorPage() {
         if (activeId === 'brief' && typeof prompts?.image2_prompt === 'string') setPrompt(prompts.image2_prompt);
         setResult({ status: response.status, elapsedMs, headers: responseHeaders, json: payload });
       } else {
-        const artifact = { url: URL.createObjectURL(await response.blob()), type: artifactType(activeId), name: filenameFromDisposition(response.headers.get('content-disposition'), `creator-${activeId}.${artifactType(activeId)}`) };
+        const blob = await response.blob();
+        const artifact = { url: URL.createObjectURL(blob), blob, type: artifactType(activeId), name: filenameFromDisposition(response.headers.get('content-disposition'), `creator-${activeId}.${artifactType(activeId)}`) };
         setResult({ status: response.status, elapsedMs, headers: responseHeaders, artifact });
       }
     } catch (err) { setError(err instanceof Error ? err.message : 'Module request failed'); }
@@ -125,10 +127,11 @@ export function CreatorPage() {
           <pre>{JSON.stringify({ headers: result.headers, body: result.json }, null, 2)}</pre>
           {result.artifact && <a className="creator-console-download" href={result.artifact.url} download={result.artifact.name}>Download {result.artifact.name}</a>}
           {result.artifact?.type === 'image' && <img className="creator-console-image" src={result.artifact.url} alt="Returned style image" />}
-          {result.artifact?.type !== 'image' && result.artifact && <div className="creator-console-model"><ModelViewer url={result.artifact.url} fileType={result.artifact.type} showControls={false} /></div>}
+          {result.artifact?.type === 'glb' && <div className="creator-console-model"><ModelViewer url={result.artifact.url} fileType="glb" showControls={false} /></div>}
+          {result.artifact?.type === '3mf' && <ThreeMfSnapshot archive={result.artifact.blob} filename={result.artifact.name} />}
         </>}
       </section>
     </section>
-    <footer className="creator-console-footer"><ImageIcon size={16} /> Image2 output is normalized to 1:1. <Palette size={16} /> Calibration uses active filament inventory. <Box size={16} /> GLB and 3MF replies remain downloadable HTTP artifacts.</footer>
+    <footer className="creator-console-footer"><ImageIcon size={16} /> Image2 output is normalized to 1:1. <Palette size={16} /> Calibration uses active filament inventory. <Box size={16} /> GLB uses an interactive renderer; 3MF uses its embedded colored slicer snapshot.</footer>
   </main>;
 }

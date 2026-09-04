@@ -8,8 +8,8 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,8 @@ from backend.app.models.bca_task import BCATask
 from backend.app.models.user import User
 from backend.app.schemas.print_queue import PrintQueueItemCreate
 from backend.app.three_d_agent.calibration import CalibrationError, CalibrationLimits, validate_3mf_package
+from backend.app.three_d_agent.config import Settings as AgentSettings
+from backend.app.three_d_agent.storage import ArtifactStore
 
 _BCA_TASK_3MF_LIMITS = CalibrationLimits()
 _MAX_BCA_TASK_UPLOAD_BYTES = _BCA_TASK_3MF_LIMITS.max_input_bytes
@@ -49,6 +51,7 @@ class BCATaskResponse(BaseModel):
     style_image_preview_url: str | None
     model_preview_url: str | None
     source_3mf_url: str
+    source_3mf_snapshot_url: str
     created_at: str
     updated_at: str
 
@@ -78,6 +81,7 @@ def _response(task: BCATask, user_name: str | None = None) -> BCATaskResponse:
         style_image_preview_url=f"/api/v1/bca-tasks/{task.id}/style-image" if task.style_image_path else None,
         model_preview_url=f"/api/v1/bca-tasks/{task.id}/model-preview" if task.model_preview_path else None,
         source_3mf_url=f"/api/v1/bca-tasks/{task.id}/source",
+        source_3mf_snapshot_url=f"/api/v1/bca-tasks/{task.id}/snapshot",
         created_at=task.created_at.isoformat(),
         updated_at=task.updated_at.isoformat(),
     )
@@ -115,6 +119,14 @@ def _task_root() -> Path:
     root.mkdir(parents=True, exist_ok=True)
     return root
 
+def _normalized_optional_text(value: str | None) -> str:
+    return value.strip() if value else ""
+
+
+def _normalize_task_reference_image(content: bytes) -> bytes:
+    """Use the same safe PNG normalization path as Creator artifacts."""
+    return ArtifactStore(AgentSettings(data_dir=_task_root()))._normalize_to_png(content, "Reference image")
+
 
 @router.get("", response_model=list[BCATaskResponse])
 async def list_bca_tasks(
@@ -128,28 +140,69 @@ async def list_bca_tasks(
 @router.post("", response_model=BCATaskResponse, status_code=201)
 async def upload_bca_task(
     file: UploadFile = File(...),
+    title: str | None = Form(default=None, max_length=120),
+    customer_name: str | None = Form(default=None, max_length=120),
+    phone: str | None = Form(default=None, max_length=40),
+    address: str | None = Form(default=None, max_length=500),
+    notes: str | None = Form(default=None, max_length=2000),
+    price: str | None = Form(default=None, max_length=64),
+    reference_image: UploadFile | None = File(default=None),
     db: AsyncSession = Depends(get_db),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.LIBRARY_UPLOAD),
 ) -> BCATaskResponse:
+    """Create a task from a required model 3MF plus optional order metadata."""
     filename = file.filename or "model.3mf"
-    if not filename.lower().endswith(".3mf"):
-        raise HTTPException(status_code=422, detail="BCA task files must use .3mf")
+    if not filename.lower().endswith(".3mf") or filename.lower().endswith(".gcode.3mf"):
+        raise HTTPException(status_code=422, detail="Direct BCA tasks require a model .3mf file; GLB and sliced .gcode.3mf are not accepted")
     content = await file.read(_MAX_BCA_TASK_UPLOAD_BYTES + 1)
     _validate_model_3mf(content)
-    source = _task_root() / f"{uuid.uuid4().hex}.3mf"
-    await asyncio.to_thread(source.write_bytes, content)
-    task = BCATask(
-        filename=filename,
-        source_path=str(source),
-        username=current_user.username if current_user else "root",
-        title=Path(filename).stem,
-        status="awaiting_slice",
-        created_by_id=current_user.id if current_user else None,
-    )
-    db.add(task)
-    await db.commit()
-    await db.refresh(task)
-    return _response(task, current_user.username if current_user else "root")
+    task_root = _task_root()
+    token = uuid.uuid4().hex
+    source = task_root / f"{token}.3mf"
+    style_image_path: Path | None = None
+    try:
+        await asyncio.to_thread(source.write_bytes, content)
+        if reference_image is not None:
+            image_content = await reference_image.read(8 * 1024 * 1024 + 1)
+            if len(image_content) > 8 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Reference image exceeds the 8 MB upload limit")
+            normalized = await asyncio.to_thread(_normalize_task_reference_image, image_content)
+            style_image_path = task_root / f"{token}.png"
+            await asyncio.to_thread(style_image_path.write_bytes, normalized)
+        task = BCATask(
+            filename=filename,
+            source_path=str(source),
+            style_image_path=str(style_image_path) if style_image_path else None,
+            username=current_user.username if current_user else "root",
+            title=_normalized_optional_text(title) or Path(filename).stem,
+            customer_name=_normalized_optional_text(customer_name),
+            phone=_normalized_optional_text(phone),
+            address=_normalized_optional_text(address),
+            notes=_normalized_optional_text(notes) or None,
+            price=_normalized_optional_text(price) or None,
+            status="awaiting_slice",
+            created_by_id=current_user.id if current_user else None,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        return _response(task, current_user.username if current_user else "root")
+    except Exception:
+        await asyncio.to_thread(source.unlink, missing_ok=True)
+        if style_image_path is not None:
+            await asyncio.to_thread(style_image_path.unlink, missing_ok=True)
+        raise
+
+
+def _task_source(task: BCATask) -> Path:
+    source = Path(task.source_path).resolve()
+    try:
+        source.relative_to(_task_root().resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="BCA task file not found") from exc
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="BCA task file not found")
+    return source
 
 
 @router.get("/{task_id}/source")
@@ -161,14 +214,34 @@ async def download_bca_task_source(
     task = await db.get(BCATask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="BCA task not found")
-    source = Path(task.source_path).resolve()
+    return FileResponse(_task_source(task), media_type="model/3mf", filename=task.filename)
+
+
+@router.get("/{task_id}/snapshot")
+async def download_bca_task_snapshot(
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_READ_ALL),
+) -> Response:
+    """Return only the embedded BCA color snapshot; never send model geometry."""
+    task = await db.get(BCATask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="BCA task not found")
     try:
-        source.relative_to(_task_root().resolve())
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="BCA task file not found") from exc
-    if not source.is_file():
-        raise HTTPException(status_code=404, detail="BCA task file not found")
-    return FileResponse(source, media_type="model/3mf", filename=task.filename)
+        with zipfile.ZipFile(_task_source(task)) as archive:
+            info = archive.getinfo("Metadata/plate_1.png")
+            if info.file_size > 24 * 1024 * 1024:
+                raise HTTPException(status_code=404, detail="BCA task 3MF snapshot is unavailable")
+            snapshot = archive.read(info)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="BCA task 3MF snapshot is unavailable") from exc
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as exc:
+        raise HTTPException(status_code=404, detail="BCA task 3MF snapshot is unavailable") from exc
+    return Response(
+        snapshot,
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="task-{task_id}-snapshot.png"'},
+    )
 
 
 def _task_artifact(task: BCATask, value: str | None) -> Path:

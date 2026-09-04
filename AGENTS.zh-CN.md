@@ -16,7 +16,7 @@ BCA 是以 Bambuddy 为中心的自托管 3D 创作和打印管理后端：
   → 混元 3D 概念 GLB
   → Meshy 3MF + 白模或 1–8 色耗材匹配校准
   → Meshy + DeepSeek 打印评分/洞察（不提供建议）
-  → 订单 task（标题、用户、姓名、手机号、地址、备注、暂空价格、预览）
+  → 订单 task（标题、用户、姓名、手机号、地址、备注、可选价格、预览）
   → root 上传 .gcode.3mf
   → Bambuddy LibraryFile / PrintQueueItem
   → FTPS + MQTT project_file
@@ -93,7 +93,7 @@ backend/app/
 
 ## 5. 创作状态机
 
-产品页面是直接工作流卡片序列：
+会话状态机按以下顺序推进（`/creator` 测试台逐模块调用同一能力，产品页面不要求卡片工作流）：
 
 ```text
 创意输入 → 创意补全
@@ -106,13 +106,13 @@ backend/app/
 
 必须保持：
 
-1. `prepare()` 只负责补全 brief、追问缺项并生成 Image2 提示词。
+1. `prepare()` 始终自动补全 brief 并直接返回最终 Image2 提示词；不存在追问缺项的路径，兼容字段 `questions` 恒为空列表，`image_prompt_ready` 为 true。
 2. 风格图生成要求完整 brief 与提示词，严格执行四次串行 `n=1`；禁止自动重试计费 Provider POST。
 3. 每张风格图完成后立即持久化；生成 3D 概念图前必须选择一张已持久化风格图。
 4. 混元结果必须先下载、验证、持久化，再公开 GLB 预览路由。
 5. 打印校准在 GLB 完成后执行。白模使用一个逻辑色并将最终 3MF 统一为白色；多色接受 `1..8`，先由 Meshy 转换，再由 DeepSeek 匹配 Bambuddy 活动耗材。
 6. 打印分析只在最终校准后开放；Meshy 分析已持久化 GLB，DeepSeek 将指标转为评分与事实洞察；禁止输出建议。
-- Creator 把规范英文 Provider 提示字段与 `presentation_en` / `presentation_zh` 分开持久化。UI 只能流式显示当前语言的 presentation，不能展示 `image_prompt`；只有 `questions` 为空且该 presentation 的最后一个字符已输出后才允许展开下游卡片。
+- Creator 把规范 Provider 提示字段与 `presentation_en` / `presentation_zh` 分开持久化；提示词语言跟随调用方输入语言。API 不存在追问或 presentation 流式展示门槛：`brief/prepare` 返回最终提示词包，brief 完成即可调用后续能力。`image_prompt` 随提示词包公开返回。
 - Creator 校准只读取实际 `spool` 表中 `archived_at IS NULL`、`material` 非空且 RGB/RGBA 合法的记录；`color_catalog` 不是校准库存来源。成功多色校准必须同时存在非空 `assignments` 和最终校准产物。
 7. UI 和 API 没有付费确认门或问题确认门。计费 smoke 仍需在执行点取得运维方明确批准，且禁止自动重试。
 8. 任一重做必须清除该阶段及所有下游路径、状态、待下载 Provider URL 和任务资格；旧产物不得继续下载。
@@ -152,7 +152,7 @@ Metadata/plate_N.gcode
 Metadata/slice_info.config
 ```
 
-BCA 上传限制为 100 MB，并校验 ZIP 成员数量、成员大小、压缩比、解压总大小、重复成员和路径安全。白模与多色流程都只把最终颜色校准 3MF 暴露给订单任务；Meshy 中间 3MF 不可直接进入任务清单。
+BCA 3MF 上传限制为 512 MiB，并校验 ZIP 成员数量、成员大小、压缩比、解压总大小、重复成员和路径安全。校色与多色转换接受压缩/源包，共用该 512 MiB 包契约和单槽 429 守卫（忙时返回 429 与 `Retry-After`）。白模与多色流程都只把最终颜色校准 3MF 暴露给订单任务；Meshy 中间 3MF 不可直接进入任务清单。
 
 ## 8. BCA Task
 
@@ -168,12 +168,14 @@ awaiting_slice
 GET    /api/v1/bca-tasks
 POST   /api/v1/bca-tasks
 GET    /api/v1/bca-tasks/{id}/source
+GET    /api/v1/bca-tasks/{id}/snapshot
 POST   /api/v1/bca-tasks/{id}/sliced
 POST   /api/v1/bca-tasks/{id}/queue
 DELETE /api/v1/bca-tasks/{id}
 ```
 
 队列交接调用原生 `add_to_queue()`，设置 `manual_start=True`。BCA 不复制原生队列逻辑。
+任务响应保留 `source_3mf_url` 用于下载完整 3MF，并新增 `source_3mf_snapshot_url` 指向 `GET /api/v1/bca-tasks/{id}/snapshot`；快照端点只返回内嵌 `Metadata/plate_1.png`，缺失时 404。任务 UI 只显示风格图与该快照，不渲染完整 GLB 或 3MF 几何。直传 `POST /api/v1/bca-tasks` 接受模型 `.3mf`，拒绝 GLB 与切片 `.gcode.3mf`，支持可选的标题、客户、电话、地址、备注、价格与参考图。
 
 ## 9. 配置与外部接口
 
@@ -227,7 +229,7 @@ WebSocket 不是状态权威；SQLite snapshot 仍是权威，前端轮询可恢
 /creator/settings   CreatorSettingsPage
 ```
 
-Creator 页面为三列工作区：会话列表、对话/追问、工作流画布。效果图预览必须使用带认证的 Blob fetch，effect 清理中必须 abort 请求并 revoke 所有 object URL。`action()` 默认发送 POST，避免卡片操作变成 GET/405。
+Creator 页面是逐模块测试台：模块选择、输入与文件上传、结果窗口，以及图片、交互式 GLB 和 3MF 内嵌快照预览。预览必须使用带认证的 Blob fetch，effect 清理中必须 abort 请求并 revoke 所有 object URL。
 
 ## 13. 验证
 

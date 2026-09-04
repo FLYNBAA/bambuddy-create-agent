@@ -20,18 +20,22 @@ BCA 是 Bambuddy 内嵌的创作 API 功能层。身份、打印机、耗材、L
   → Bambuddy LibraryFile 与原生 PrintQueueItem
 ```
 
-任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、可空价格（当前留空），以及模型/风格预览。Creator 模型 3MF 绝不直接发送到打印机。root 提供的切片包必须包含 `Metadata/plate_N.gcode` 与 `Metadata/slice_info.config`，BCA 才能交给原生队列。
+任务在等待 root 切片和排队时保留标题、用户、姓名、手机号、地址、备注、可选价格（会话推送或直传任务时提供）、风格图和内嵌彩色 3MF 快照；任务 UI 不渲染完整模型。Creator 模型 3MF 绝不直接发送到打印机。root 提供的切片包必须包含 `Metadata/plate_N.gcode` 与 `Metadata/slice_info.config`，BCA 才能交给原生队列。
+
+多色转换与校色产物内嵌 best-effort 的彩色 512×512 `Metadata/plate_1.png` 静态快照；`X-BCA-Color-Snapshot` 响应头为 `created|present|skipped`（校色为 `replaced|skipped`）。快照一次性生成、以 50 万面为上限、在异步事件循环外渲染并 fail-open。Creator 测试台交互式预览 GLB，3MF 只通过该内嵌快照预览，不使用 ThreeMFLoader 渲染 BCA 3MF。
+
+任务列表响应保留 `source_3mf_url` 用于下载完整 3MF，并新增 `source_3mf_snapshot_url` 指向 `GET /api/v1/bca-tasks/{id}/snapshot`；该端点只返回内嵌的 `Metadata/plate_1.png`，快照缺失时返回 404。任务 UI 只显示风格图与该快照，不渲染完整 GLB 或 3MF 几何。直传 `POST /api/v1/bca-tasks` 接受模型 `.3mf`，拒绝 GLB 与切片 `.gcode.3mf`，并支持可选的标题、客户、电话、地址、备注、价格与参考图；没有内嵌快照的直传文件可能没有任务预览，而不是渲染几何。
 
 ### 源语言提示词契约
 
-最新创意消息决定整个响应语言：中文输入返回中文 brief、问题、展示文案和提示词包；英文输入则全部为英文。`subject`、`style`、`product_type` 全部完成后，BCA 派生 `positive_prompt`、`negative_prompt`、`print_constraints` 及确定性的 `image2_prompt`。固定 Image2 条款明确构图、可打印性、排除项和输出边界；测试台展示完整提示词包，并将 `image2_prompt` 自动带入 Image2 输入框。
+最新创意消息决定整个响应语言：中文输入返回中文 brief、展示文案和提示词包；英文输入则全部为英文。`brief/prepare` 始终自动补全并直接返回最终提示词，不存在追问缺项或类型选择的路径；兼容字段 `questions` 保留且恒为空列表，`image_prompt_ready` 对接受的输入为 true。`subject`、`style`、`product_type` 全部完成后，BCA 派生 `positive_prompt`、`negative_prompt`、`print_constraints` 及确定性的 `image2_prompt`。固定 Image2 条款明确构图、可打印性、排除项和输出边界；测试台展示完整提示词包，并将 `image2_prompt` 自动带入 Image2 输入框。
 
 ## Creator 与任务职责
 
 | 范围 | 职责 |
 |---|---|
 | Creator API 模块 | 执行一个明确请求的能力；绝不为调用方创建或推进工作流。 |
-| Creator 测试台 | 发送单个模块请求，展示原始响应元数据/JSON，并预览返回的图片或模型产物。 |
+| Creator 测试台 | 发送单个模块请求，展示原始响应元数据/JSON，并预览返回的图片、交互式 GLB 或 3MF 内嵌彩色快照。 |
 | 校准 | 将 GLB 转换为 1–8 色 3MF，再独立将 3MF 颜色匹配到 Bambuddy 耗材库存。 |
 | 分析 | 获取 Meshy 数据及 DeepSeek 评分/洞察；不生成面向用户的建议。 |
 | BCA 任务 | 旧交接：在 root 附加已验证切片并选择打印机前保留标题、用户、订单和预览。 |

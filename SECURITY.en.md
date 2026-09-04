@@ -51,13 +51,13 @@ Do not write credentials to ordinary creator snapshots, tasks, Provider errors, 
 ### Files and 3MF
 
 - Path joins use `safe_join_under` or explicit resolve/containment checks.
-- Uploads validate content. BCA 3MF uploads are limited to 100 MB and validate ZIP members, compression ratio, decompressed size, duplicate members, and required files.
+- Uploads validate content. BCA 3MF uploads (task model files, sliced packages, and calibration/source packages) share the 512 MiB calibration package limit and validate ZIP member count, duplicate members, compression ratio, decompressed size, and required files.
 - A model 3MF must pass `.gcode.3mf` validation before native queue handoff.
 
 ### Billing and Providers
 
 - Product UI has no billed-confirmation or issue-acknowledgement gates. Paid POSTs are never automatically retried; callers must inspect session state rather than retry after an ambiguous network outcome.
-- `image_prompt` is Provider-only canonical English input. Browser and embedded clients render only bilingual `presentation_*` / `questions` fields.
+- `brief/prepare` follows the caller's source language and always returns its final prompt bundle for accepted input. It has no clarification/type-choice or presentation-stream gate; compatibility `questions` is empty and `image_prompt_ready` is true.
 - Multicolor calibration reads only active eligible `spool` rows, not `color_catalog`; successful mapping requires non-empty `assignments` and a final artifact.
 - Do not copy real paid credentials or request/response bodies into public reports.
 

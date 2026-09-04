@@ -76,7 +76,7 @@ Do not write credentials to ordinary creator snapshots, tasks, logs, public down
 
 - Product UI has no payment/issue-acknowledgement gate. Billed POSTs are manually initiated by the chosen direct card/API stage, never automatically retried, and routine tests never invoke them.
 - A completed multi-color calibration requires `color_calibration.status == "succeeded"`, non-empty `assignments`, and a final calibrated artifact. Its candidates are eligible active `spool` rows, never `color_catalog`.
-- Changes to Creator presentation must keep canonical English Provider fields separate from bilingual `presentation_*` display fields; stream the selected presentation completely before exposing the next card.
+- Brief/prompt presentation changes must retain source-language final prompts: `prepare()` auto-completes without a clarification or presentation-stream gate, the compatibility `questions` field is empty, and `image_prompt_ready` is true for accepted input.
 - New states update contracts, storage migration, service, API, frontend, tests, and documents together.
 - Cancellation persists failure state before re-raising `CancelledError`.
 

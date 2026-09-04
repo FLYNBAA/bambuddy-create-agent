@@ -20,21 +20,21 @@ Creative presentation (DeepSeek)
   → Bambuddy LibraryFile and native PrintQueueItem
 ```
 
-A task preserves title, user, customer name, phone, address, notes, a nullable price (currently blank), and model/style previews while pending root slicing and queueing. Creator model 3MF files never reach a printer directly. The root-supplied sliced package must contain `Metadata/plate_N.gcode` and `Metadata/slice_info.config` before BCA can hand it to the native queue.
+A task preserves title, user, customer name, phone, address, notes, an optional price supplied by the session push or direct upload, a style image, and its embedded color 3MF snapshot while pending root slicing and queueing. The task UI does not render a full model. Creator model 3MF files never reach a printer directly. The root-supplied sliced package must contain `Metadata/plate_N.gcode` and `Metadata/slice_info.config` before BCA can hand it to the native queue.
 
 ### Source-language prompt contract
 
-The latest creative message determines the entire response language: Chinese input returns Chinese brief values, questions, display copy, and prompt bundle; English input returns English equivalents. Once `subject`, `style`, and `product_type` are complete, BCA derives `positive_prompt`, `negative_prompt`, `print_constraints`, and one deterministic `image2_prompt`. The fixed Image2 clauses explicitly constrain composition, printability, exclusions, and output boundary; the test bench exposes the complete bundle and seeds its Image2 field from `image2_prompt`.
+The latest creative message determines the entire response language: Chinese input returns Chinese brief values, display copy, and prompt bundle; English input returns English equivalents. Brief preparation always auto-completes and returns final prompts; once `subject`, `style`, and `product_type` are complete, BCA derives `positive_prompt`, `negative_prompt`, `print_constraints`, and one deterministic `image2_prompt`. There is no clarification or type-choice path, and the compatibility `questions` field is always empty. The fixed Image2 clauses explicitly constrain composition, printability, exclusions, and output boundary; the test bench exposes the complete bundle and seeds its Image2 field from `image2_prompt`.
 
 ## Creator and task responsibilities
 
 | Area | Responsibility |
 |---|---|
 | Creator API modules | Execute one explicitly requested capability; never create or advance a workflow for the caller. |
-| Creator test bench | Send one module request, show raw response metadata/JSON, and preview returned image or model artifacts. |
-| Calibration | Convert GLB to 1–8-color 3MF, then separately match 3MF colors to Bambuddy material inventory. |
+| Creator test bench | Send one module request, show raw response metadata/JSON, and preview returned images and GLBs interactively; preview a 3MF only through its embedded color snapshot. |
+| Calibration | Convert GLB to 1–8-color 3MF, then separately match 3MF colors to Bambuddy material inventory. The multicolor and calibration artifacts embed a best-effort colored 512×512 `Metadata/plate_1.png` snapshot. |
 | Analysis | Obtain Meshy data and DeepSeek scoring/insights. It does not produce user-facing advice. |
-| BCA task | Legacy handoff retaining title, user, order, and previews until root adds the validated slice and selects a printer. |
+| BCA task | Legacy handoff retaining title, user, order, and previews until root adds the validated slice and selects a printer. The task API keeps `source_3mf_url` for the full 3MF and adds `source_3mf_snapshot_url` for the embedded snapshot; the task UI displays only that snapshot, never rendered 3MF geometry. |
 | Bambuddy | Own Library files, printer selection, queue lifecycle, dispatch, cancellation, and printer state. |
 
 ## API and configuration boundary

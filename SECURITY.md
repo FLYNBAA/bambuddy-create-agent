@@ -51,13 +51,13 @@ Cache-Control: private, no-store
 ### 文件与 3MF
 
 - 路径拼接使用 `safe_join_under` 或显式 resolve/containment 检查。
-- 上传必须验证内容；BCA 3MF 上传限制 100 MB 并检查 ZIP 成员、压缩比、解压大小、重复成员和必需文件。
+- 上传必须验证内容；BCA 3MF 上传限制 512 MiB 并检查 ZIP 成员、压缩比、解压大小、重复成员和必需文件。多色校准与校色接受压缩/源 3MF 包，共用该 512 MiB 包契约和单槽 429 守卫。
 - 模型 3MF 必须经过 `.gcode.3mf` 验证后才能进入原生打印队列。
 
 ### 付费与 Provider
 
 - 产品 UI 没有计费确认门或问题确认门。付费 POST 绝不自动重试；遇到含糊网络结果时调用方必须查询会话状态。
-- `image_prompt` 是仅供 Provider 使用的规范英文输入。浏览器和嵌入客户端只能展示双语 `presentation_*` / `questions` 字段。
+- `brief/prepare` 始终自动补全并返回最终提示词，`image_prompt_ready` 对接受的输入为 true；不存在追问缺项或类型选择的路径，兼容字段 `questions` 保留且恒为空列表。提示词语言跟随调用方源语言。
 - 多色校准只读取符合条件的活动 `spool` 行，不读取 `color_catalog`；成功映射需要非空 `assignments` 和最终产物。
 - 不要把真实付费凭据或请求/响应复制到公开报告。
 

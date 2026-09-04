@@ -18,9 +18,9 @@ Creative presentation (DeepSeek)
   → root slicing and native queue handoff
 ```
 
-BCA operates as an external API capability layer and no longer requires Creator-card workflow orchestration. `/creator` is a one-module test bench: it sends one independent capability request, exposes a data window, and previews returned images, GLBs, or 3MFs. Public clients compose brief, Image2, image-to-model, multicolor conversion, calibration, and analysis as needed; printer handoff remains root's `.gcode.3mf` plus Bambuddy's native queue.
+BCA operates as an external API capability layer and no longer requires Creator-card workflow orchestration. `/creator` is a one-module test bench: it sends one independent capability request, exposes a data window, and previews returned images and GLBs interactively; a returned 3MF is previewed only through its embedded color snapshot. Public clients compose brief, Image2, image-to-model, multicolor conversion, calibration, and analysis as needed; printer handoff remains root's `.gcode.3mf` plus Bambuddy's native queue.
 
-GLB previews preserve native materials. 3MF previews use Three.js' official `ThreeMFLoader` for standard material/color/texture groups and convert its Z-up root to the WebGL Y-up scene. Image2 output is normalized to a 1:1 PNG without stretching the subject.
+GLB previews preserve native materials. 3MF is never rendered with ThreeMFLoader in BCA surfaces: the multicolor and calibration modules embed a best-effort colored 512×512 `Metadata/plate_1.png` in the returned 3MF (announced by the `X-BCA-Color-Snapshot` header, `created|present|skipped`), and the test bench previews the artifact through that snapshot. Image2 output is normalized to a 1:1 PNG without stretching the subject.
 
 A valid sliced package contains both:
 
@@ -33,8 +33,8 @@ Metadata/slice_info.config
 
 | Page | Route | Current responsibility |
 |---|---|---|
-| Creator | `/creator` | Independent API module test bench: request, raw data window, image/model preview. |
-| BCA Tasks | `/tasks` | Legacy task/order context, root slicing attachment, printer selection, and native queue submission. |
+| Creator | `/creator` | Independent API module test bench: request, raw data window, image and interactive GLB preview; 3MF previewed through its embedded color snapshot. |
+| BCA Tasks | `/tasks` | Legacy task/order context, root slicing attachment, printer selection, and native queue submission. The list shows only the embedded color snapshot from `source_3mf_snapshot_url` (`GET /api/v1/bca-tasks/{id}/snapshot`); `source_3mf_url` still downloads the full model 3MF. Direct `POST /api/v1/bca-tasks` accepts a model `.3mf` and rejects GLB and sliced `.gcode.3mf` files. |
 | Creator configuration | `/creator/settings` | Write-only provider credentials, non-secret runtime settings, and provider state. |
 | Native Bambuddy pages | printers, materials, Library, queue | Authoritative printer, material, Library, and queue behavior. |
 

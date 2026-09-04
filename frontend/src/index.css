@@ -683,7 +683,16 @@ body {
 .creator-console-image { display: block; width: min(100%, 520px); aspect-ratio: 1; margin: 1rem auto 0; object-fit: contain; background: var(--bg-primary); }
 .creator-console-model { height: 420px; margin-top: 1rem; overflow: hidden; border-radius: 8px; background: #1a1a1a; }
 .creator-console-model .min-h-\[400px\] { min-height: 420px; }
+.creator-3mf-snapshot { display: grid; place-items: center; min-height: 260px; margin: 1rem 0 0; overflow: hidden; border-radius: 12px; background: var(--bg-primary); color: var(--text-secondary); }
+.creator-3mf-snapshot img { display: block; width: 100%; max-height: 520px; object-fit: contain; background: #171717; }
+.creator-3mf-snapshot figcaption { justify-self: stretch; padding: .6rem .75rem; border-top: 1px solid var(--border-color); color: var(--text-muted); font-size: .75rem; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.creator-3mf-snapshot-loading { gap: .55rem; align-content: center; font-size: .82rem; }
+.creator-3mf-snapshot-empty { grid-template-columns: auto minmax(0, 1fr); gap: .7rem; align-content: center; padding: 1.25rem; text-align: left; }
+.creator-3mf-snapshot-empty strong { color: var(--text-primary); font-size: .85rem; }
+.creator-3mf-snapshot-empty p { max-width: 52ch; margin: .25rem 0 0; font-size: .8rem; line-height: 1.5; }
 .creator-console-download { display: inline-flex; align-items: center; margin-top: .85rem; color: var(--accent); font-size: .8rem; font-weight: 700; text-decoration: underline; text-underline-offset: .18em; }
 .creator-console-download:hover, .creator-console-download:focus-visible { color: var(--accent-light); }
 .creator-console-footer { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; margin-top: 1rem; color: var(--text-muted); font-size: .78rem; }
-@media (max-width: 860px) { .creator-console { padding: .85rem; }.creator-console-workspace { grid-template-columns: 1fr; }.creator-console-heading { display: grid; }.creator-console-model { height: 320px; }.creator-console-model .min-h-\[400px\] { min-height: 320px; } }
+@media (max-width: 860px) { .creator-console { padding: .85rem; }.creator-console-workspace { grid-template-columns: 1fr; }.creator-console-heading { display: grid; }.creator-console-model { height: 320px; }.creator-console-model .min-h-\[400px\] { min-height: 320px; }.creator-3mf-snapshot { min-height: 220px; }.creator-3mf-snapshot img { max-height: 420px; } }
+.bca-task-snapshot-unavailable { display: grid; place-content: center; gap: .45rem; min-height: 160px; color: var(--text-muted); text-align: center; }
+.bca-task-snapshot-unavailable span { font-size: .78rem; }

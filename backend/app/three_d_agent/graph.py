@@ -7,8 +7,8 @@ from typing import Literal
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import NotRequired, TypedDict
 
-from .contracts import BriefEnricher, ClarificationQuestion, CreativeBrief, PromptPackage
-from .prompts import build_display_presentations, build_prompt_package, clarification_questions, response_language
+from .contracts import BriefEnricher, CreativeBrief, PromptPackage
+from .prompts import build_display_presentations, build_prompt_package, response_language
 
 
 class PreparationState(TypedDict):
@@ -19,13 +19,11 @@ class PreparationState(TypedDict):
     has_reference_image: bool
     language: str
     brief: NotRequired[CreativeBrief]
-    questions: NotRequired[list[ClarificationQuestion]]
+    questions: NotRequired[list[object]]
     image_prompt: NotRequired[str | None]
     prompt_package: NotRequired[PromptPackage | None]
     presentation_en: NotRequired[str | None]
     presentation_zh: NotRequired[str | None]
-
-
 
 
 def build_preparation_graph(enricher: BriefEnricher):
@@ -40,21 +38,8 @@ def build_preparation_graph(enricher: BriefEnricher):
             )
         }
 
-    def route_after_enrichment(
-        state: PreparationState,
-    ) -> Literal["clarify", "construct_prompt"]:
-        return "construct_prompt" if state["brief"].is_complete else "clarify"
-
-    def clarify(state: PreparationState) -> dict[str, object]:
-        return {
-            "questions": clarification_questions(state["brief"], state["language"]),
-            "image_prompt": None,
-            "prompt_package": None,
-            "presentation_en": None,
-            "presentation_zh": None,
-        }
-
-    def construct_prompt(state: PreparationState) -> dict[str, object]:
+    async def expand_brief(state: PreparationState) -> dict[str, object]:
+        """Every input expands directly to final prompts; no clarification path."""
         package = build_prompt_package(state["brief"], state["language"])
         presentation_en, presentation_zh = build_display_presentations(state["brief"], state["language"])
         return {
@@ -67,16 +52,10 @@ def build_preparation_graph(enricher: BriefEnricher):
 
     workflow = StateGraph(PreparationState)
     workflow.add_node("enrich_brief", enrich_brief)
-    workflow.add_node("clarify", clarify)
-    workflow.add_node("construct_prompt", construct_prompt)
+    workflow.add_node("expand_brief", expand_brief)
     workflow.add_edge(START, "enrich_brief")
-    workflow.add_conditional_edges(
-        "enrich_brief",
-        route_after_enrichment,
-        {"clarify": "clarify", "construct_prompt": "construct_prompt"},
-    )
-    workflow.add_edge("clarify", END)
-    workflow.add_edge("construct_prompt", END)
+    workflow.add_edge("enrich_brief", "expand_brief")
+    workflow.add_edge("expand_brief", END)
     return workflow.compile()
 
 

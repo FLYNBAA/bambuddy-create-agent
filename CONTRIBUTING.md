@@ -76,7 +76,7 @@ DEPLOYMENT_BCA.md / DEPLOYMENT_BCA.zh-CN.md
 
 - 产品 UI 没有付费/问题确认门。计费 POST 由选定的直接卡片/API 阶段人工发起，绝不自动重试，常规测试不得调用。
 - 成功多色校准必须同时满足 `color_calibration.status == "succeeded"`、非空 `assignments` 和最终校准产物；候选来自符合条件的活动 `spool`，绝不来自 `color_catalog`。
-- Creator 展示层改动必须把规范英文 Provider 字段与双语 `presentation_*` 展示字段分开；所选 presentation 流式完成前不得暴露下一个卡片。
+- brief/提示词展示改动必须保持源语言最终提示词契约：`prepare()` 自动补全，不存在追问或 presentation 流式门槛；兼容字段 `questions` 为空，接受的输入 `image_prompt_ready` 为 true。
 - 新状态必须同步更新 contracts、storage migration、service、API、frontend、测试和文档。
 - 取消必须持久化失败状态再抛出 `CancelledError`。
 
