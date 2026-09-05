@@ -18,9 +18,12 @@ FROM python:3.13-slim-trixie
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies. Debian mirrors can transiently reset individual
+# package downloads during a cold build; use HTTPS and bounded retries so
+# `compose up` survives recoverable mirror connection failures.
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     curl \
     ffmpeg \
     gnupg \
@@ -30,16 +33,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
 # Install the Tailscale CLI only (no tailscaled — the daemon runs on the host).
 # Bambuddy uses the optional host socket only to report tailnet identity and
 # reachability. Enrollment, subnet routing, ACLs, and certificates stay under
 # host/operator control; Virtual Printers continue using Bambuddy's own CA.
-RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
+RUN curl --fail --silent --show-error --location --retry 3 --retry-all-errors https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
         -o /usr/share/keyrings/tailscale-archive-keyring.gpg \
-    && curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list \
+    && curl --fail --silent --show-error --location --retry 3 --retry-all-errors https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list \
         -o /etc/apt/sources.list.d/tailscale.list \
-    && apt-get update && apt-get install -y --no-install-recommends tailscale \
+    && apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends tailscale \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow binding to privileged ports (e.g. 990/FTPS) as non-root user.
