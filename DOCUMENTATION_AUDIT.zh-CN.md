@@ -25,7 +25,7 @@
 - brief 响应全程跟随最新消息语言，并始终自动补全最终 `positive_prompt`、`negative_prompt`、`print_constraints` 和确定性的 `image2_prompt`。不存在追问/类型选择路径；兼容字段 `questions` 为空，直接测试台将 `image2_prompt` 带入 Image2。
 - GLB 只在 Creator 中以原生材质交互式渲染；BCA 3MF 预览使用内嵌的 512×512 彩色 `Metadata/plate_1.png` 快照。多色与校色分别返回 `X-BCA-Color-Snapshot`（`created|present|skipped`、`replaced|skipped`）；快照是 best-effort 且 fail-open。
 - 校准库存是符合条件的活动 `spool` 数据，不是 `color_catalog`。任何“多色校准成功”声明必须同时具备 succeeded、非空 assignments 和最终校准产物。
-- 工作目录的 `BCA_INTEGRATION_GUIDE.md` 是外部 REST 契约，包含任务 source/snapshot URL 与独立模块响应头。
+- 工作目录的 `BCA_INTEGRATION_GUIDE.md` 是 BCA 全部接口与常用原生 Bambuddy 接口的对接说明；原生全量 path、参数、请求体、响应和 security 以目标运行实例 OpenAPI 为准。文中包含任务 source/snapshot URL 与独立模块响应头。
 - Creator 配置可编辑 Provider 请求端点/Base URL，包括 Meshy Base URL，以及凭据与模型设置。显式 `.env.bca` 提供部署初始值；source-project `.env` 与 `.env.local` 不是 BCA 配置输入。
 - Linux Compose 从本地 BCA 源码构建 `bambuddy-bca:local` 并使用显式 `.env.bca`。Linux host networking 保留 SSDP。Windows 与 bridge 部署使用声明的 `BCA_DISCOVERY_SUBNETS` CIDR 和单播扫描。
 - 支持的 Nginx 模板是 [`deploy/nginx/bca.conf`](deploy/nginx/bca.conf)；它保留上游认证，并转发 WebSocket 和 forwarded-request 头。

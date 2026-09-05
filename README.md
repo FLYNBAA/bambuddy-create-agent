@@ -71,5 +71,6 @@ BCA 当前为单进程。不得声称支持多 worker、分布式队列恢复、
 - [English README](README.en.md)
 - [架构说明](BCA_ARCHITECTURE.zh-CN.md)
 - [部署指南](DEPLOYMENT_BCA.zh-CN.md)
+- [接口对接说明](BCA_INTEGRATION_GUIDE.md)
 - [文档审计](DOCUMENTATION_AUDIT.zh-CN.md)
 - [前端说明](frontend/README.zh-CN.md)
